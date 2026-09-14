@@ -1,0 +1,55 @@
+# Build outputs
+build/
+build-*/
+cmake-build-*/
+
+# CMake and compiler artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# CodeGraph local index
+.codegraph/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime data and logs
+logs/
+data/
+tmp/
+*.log
+
+# Test and benchmark outputs
+coverage/
+test-results/
+perf.data*
+flamegraph.svg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js
+node_modules/
+dist/
+.vite/
+
