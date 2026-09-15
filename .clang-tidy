@@ -1,0 +1,36 @@
+# clang-tidy 配置。
+#
+# 本轮只启用低误报、与正确性直接相关的基础检查；-Werror 已由编译器负责。
+# 新增检查项必须同时提交对应修复，避免留下长期未处理的告警。
+#
+# 用法：  clang-tidy -p build/debug <源文件>
+#        或运行 bash scripts/lint.sh
+
+Checks: >-
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  -modernize-use-auto,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions
+
+WarningsAsErrors: ''
+
+HeaderFilterRegex: '.*/(include|src|tests)/.*'
+
+FormatStyle: file
+
+CheckOptions:
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: CamelCase
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.ConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case

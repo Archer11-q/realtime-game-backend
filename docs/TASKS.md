@@ -1,6 +1,7 @@
 # 当前任务
 
-> 状态：Phase 0，TASK-000 已完成，TASK-001 进行中
+> 状态：Phase 0，TASK-000 已完成，TASK-001 待收尾（WSL 正式目录对齐），
+> TASK-002 待验收（CI 结果待合并确认）
 
 ## 当前里程碑
 
@@ -36,27 +37,77 @@
   - `git status` 清晰。
   - CLion 能打开并识别项目。
   - 没有提交 IDE、构建和密钥文件。
-  - 首次提交推送和 CLion WSL Toolchain 最终验证仍待完成。
-  - 已完成：正式项目已迁移到 WSL 路径，构建工具和客户端已安装并通过版本检查。
-  - 已完成：本地 `main` 分支已初始化，`origin` 已连接并可只读访问。
-  - 已完成：Docker Desktop WSL Integration、Engine 和 Compose 已验证可用。
-  - 已完成：GitHub SSH 身份认证成功，`origin` 已切换为 SSH 地址。
+- 已完成：正式项目已迁移到 WSL 路径，构建工具和客户端已安装并通过版本检查。
+- 已完成：本地 `main` 分支已初始化，`origin` 已连接并可只读访问。
+- 已完成：Docker Desktop WSL Integration、Engine 和 Compose 已验证可用。
+- 已完成：GitHub SSH 身份认证成功，`origin` 已切换为 SSH 地址。
+- 已完成：首次提交与推送，`f685be0`，36 个文件，本地与 `origin/main` 无差异；
+  提交内不含 `.idea/`、构建产物和密钥。该提交从 Windows 副本发出，内容可移植。
+- 已完成：CLion WSL Toolchain 经项目所有者确认可用（2026-09-15）。
+- 待完成（唯一剩余项）：WSL 的 `~/workspace/realtime-game-backend` 实测为**无提交
+  的空仓库**，需将其改名封存后从 GitHub 重新 clone，使 WSL 成为唯一正式开发目录；
+  完成后 Windows 目录冻结为备份，不再用于构建和提交。
+- 注意：不得对空仓库执行 `git pull`（无关联历史会失败）；正式构建验收必须在 WSL
+  执行，当前执行环境只能做配置级校验。
 
 ## TASK-002：工程骨架和 CI
 
-- 状态：待开始
-- 依赖：TASK-000、TASK-001
+- 状态：进行中
+- 依赖：TASK-000、TASK-001（WSL 目录对齐可并行完成）
 - 背景问题：需要稳定、可复现的 C++ 开发基线。
 - 本次目标：
   - CMake、CMakePresets、Ninja。
   - Debug、Release、ASan Preset。
   - 代码格式、静态检查和基础测试。
   - GitHub Actions 构建。
-- 非范围：不实现 Gateway 业务。
+- 范围：
+  - 根 `CMakeLists.txt`：项目声明、C++20、严格警告、CTest、安装规则不启用。
+  - `CMakePresets.json`：`debug`、`release`、`asan` 三个 Preset，统一使用 Ninja。
+  - `.clang-format`、`.clang-tidy` 和格式检查脚本。
+  - `include/common/` + `src/common/` 放置最小公共代码，并用 GoogleTest 覆盖。
+  - `tests/unit/` 接入 GoogleTest（CMake `FetchContent`，暂不引入 vcpkg）。
+  - `.github/workflows/ci.yml`：配置、构建、测试。
+- 非范围：
+  - 不实现 Gateway 业务、Proto、brpc、Redis、MySQL、WebSocket。
+  - 不引入 vcpkg manifest、Docker Compose、Kafka、etcd。
+  - 不新建服务目录和业务头文件。
+- 相关 ADR：ADR-0001（技术栈与平台）。本轮不新增 ADR。
+- 涉及目录：仓库根、`include/common/`、`src/common/`、`tests/unit/`、`scripts/`、
+  `.github/workflows/`。以上目录结构调整需在 `01-architecture.md` 中体现。
+- 接口变化：无 Proto 与 HTTP 接口；仅新增构建入口和 `common` 公共库目标。
+- 数据变化：无。
+- 失败场景：
+  - 首次配置需联网下载 GoogleTest；离线或网络受限会导致配置失败。
+  - CMake 4.x 对旧版依赖的 `cmake_minimum_required` 兼容性可能触发配置错误。
+  - Sanitizer Preset 与 Ninja 组合需要保证 `-fsanitize` 同时作用于编译和链接。
+  - `-Werror` 打开后，任何新增警告都会直接失败；第三方依赖产生的警告需隔离。
+  - CI 中的 CMake 与 GCC 版本若低于本地，可能无法满足 C++20 与 CMake 4.x 语法。
+- 验收命令（在 WSL 中执行）：
+  ```bash
+  cmake --preset debug && cmake --build --preset debug && ctest --preset debug --output-on-failure
+  cmake --preset release && cmake --build --preset release && ctest --preset release --output-on-failure
+  cmake --preset asan && cmake --build --preset asan && ctest --preset asan --output-on-failure
+  ```
+- 测试要求：GoogleTest 单元测试覆盖 `common` 公共代码；Debug 与 ASan 构建的测试
+  必须全部通过；无新增编译警告（`-Werror` 生效）。
+- 回退方式：本任务只新增文件，不改动现有代码。回退即删除新增文件并恢复
+  `CMakePresets.json` 等配置；`git revert` 单个提交即可，不影响 `docs/` 既有内容。
+- 负责人：执行者（写入权）— 本轮由当前会话代理承担，项目所有者审阅与验收。
+- 写入权说明：按 `CLAUDE.md`「协作纪律」，写入权按任务授予。本轮写入权授予当前
+  执行会话（DeepSeek 会话代理），范围为 TASK-002 涉及目录；知会类协作者本轮不写入。
 - 验收标准：
   - WSL 中可构建和运行测试。
   - CI 成功。
   - 无编译警告和无关文件。
+- 实施结果（2026-09-15）：
+  - 已完成并实测通过：三个 Preset 的配置、构建与测试；格式检查；静态检查。
+    实测数据见 `docs/devlog.md` 的「TASK-002 实施记录」。
+  - 交付提交：`32ab9bb build: 搭建 CMake/CTest/CI 工程骨架`，分支
+    `feat/task-002-build-skeleton`，已推送。
+  - **未完成**：`CI 成功` 尚无真实运行结果。GitHub 只从默认分支注册工作流，
+    当前 `ci.yml` 仅存在于功能分支，`actions/workflows` 的 `total_count` 为 0。
+    需在合并到 `main` 后确认首次 CI 结果，届时 TASK-002 才能判定完成。
+  - 待项目所有者审阅 Diff 并合并；本任务状态在 CI 通过前不标记为已完成。
 
 ## TASK-003：Docker 开发依赖
 

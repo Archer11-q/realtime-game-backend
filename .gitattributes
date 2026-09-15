@@ -1,0 +1,29 @@
+# 统一行尾与文本属性。
+#
+# Windows 与 WSL 双环境协作时，行尾是最容易悄悄破坏仓库的一类改动：
+# shell 脚本一旦被检出为 CRLF，WSL 中会出现 `bash^M: bad interpreter`。
+# 这里对文本文件强制 LF，并对常见二进制格式关闭差异比较。
+
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.h text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
