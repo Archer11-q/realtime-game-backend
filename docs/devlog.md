@@ -116,10 +116,13 @@
   protoc、pkg-config、vcpkg 均存在；`ccache` 缺失。
 - 结果：`/usr/include/openssl/ssl.h`、`/usr/include/gflags`、`/usr/include/glog`
   均缺失，属 TASK-004（brpc 基线）的前置条件。
-- 结果：WSL 中 `docker` 由 `/mnt/c/.../docker` 解析到 Windows 客户端，但执行
-  `docker info` 报 `The command 'docker' could not be found in this WSL 2 distro`，
-  即 Docker Desktop 的 WSL Integration 当前未对本发行版启用。这条与 2026-09-14
-  日志中“Docker Desktop WSL Integration 已验证可用”的结论**不一致**，列入待确认。
+- 结果（**已更正**）：先前在此记录“Docker Desktop 的 WSL Integration 未对本发行版
+  启用”，该结论**错误**。真实原因是当时 Docker Desktop 未启动，因此 `docker info`
+  无响应。经项目所有者启动 Docker Desktop 后复测：`docker version` 为
+  `29.4.3 / server 29.4.3`（服务端可达）、存储驱动 `overlayfs`、
+  `docker compose version` 为 `v5.1.3`、`docker` 解析到 `/usr/bin/docker`。
+  结论回到 2026-09-14 的原始记录：Docker 在 WSL 中可用。
+  教训：判断环境能力前必须确认被测服务已启动，否则会把“未启动”误判为“未配置”。
 - 结果：同步工作树时发现跨文件系统权限陷阱——从 `/mnt/d`（NTFS）用 tar 读取时，
   所有文件被报为 755，导致 WSL 中每个已跟踪文件都被 git 标记为“已修改”。
   修复方式是对普通文件 `chmod 644`、对 `*.sh` 保留 `chmod 755`。这是“正式目录必须
@@ -193,26 +196,27 @@
 - WSL 侧的功能分支在仓库重置时丢失，提交一度落在 `main` 上；已用
   `git branch -f main origin/main` 复位 `main`，并把提交重建在
   `feat/task-002-build-skeleton` 上。`main` 现与 `origin/main` 完全一致。
-- CI 状态：功能分支已推送为 `e17fdc1`（随后追加共享依赖修正），但 **CI 尚未运行**。
-  经 GitHub API 核实，仓库为 public 且未禁用，`.github/workflows/ci.yml` 确实存在
-  于远程功能分支，然而 `actions/workflows` 的 `total_count` 为 0，即工作流尚未被
-  GitHub 注册。原因是 GitHub 只从默认分支注册工作流，仅存在于功能分支的 `push`
-  事件不会触发。因此本任务未取得任何 CI 运行结果，`TASKS.md` 中“CI 成功”这一
-  验收项仍待验证。
-- `ubuntu-24.04` 上的 CMake 3.28 与 Preset 的 `cmakeMinimumRequired 3.25` 兼容，
-  但 CI 结果仍需以真实运行数据为准。
-- TASK-003 依赖的 Docker 在 WSL 中当前不可用（见上文），需要在 TASK-003 前解决。
-- TASK-004 依赖的 `openssl`、`gflags`、`glog` 开发头文件缺失。
-- `docs/07-open-decisions.md` 第 1 节“AI 分工”和第 3 节风险表中仍保留按厂商名称
-  绑定的旧表述，与已修改的 `CLAUDE.md`、`README.md`、
-  `docs/03-development-workflow.md` 不一致，待项目所有者确认后统一。
+- CI 状态（**已解决**）：合并前经 GitHub API 核实，工作流因只存在于功能分支而
+  未被注册（`actions/workflows` 的 `total_count` 为 0）；原因是 GitHub 只从默认
+  分支注册工作流。项目所有者于 2026-09-15 合并 PR #1 到 `main` 后，工作流被注册
+  （`state: active`），CI 自动运行并**全部通过**：
+  - run #1，分支 `feat/task-002-build-skeleton`，`completed / success`
+  - run #2，分支 `main`，`completed / success`
+  命令：`curl -s "https://api.github.com/repos/Archer11-q/realtime-game-backend/actions/runs?per_page=5"`。
+  因此 TASK-002 的“CI 成功”验收项**已满足**。
+- 结果：`main` 已快进拉取到 `eb67a6c Merge pull request #1 from
+  Archer11-q/feat/task-002-build-skeleton`，与 `origin/main` 差异 `0 0`。
+- TASK-003 依赖的 Docker **已确认可用**（见上文更正条目），TASK-003 无此阻塞。
+- TASK-004 依赖的 `openssl`、`gflags`、`glog` 开发头文件在系统中缺失。这三项是
+  brpc 的编译期依赖，不影响当前骨架；安装方式（系统 apt 还是交由 vcpkg 构建）
+  属于 TASK-004 的范围，届时再决策。另注意 `VCPKG_ROOT` 当前未设置，
+  vcpkg 位于 `/home/archer/tools/vcpkg`，版本 `2026-07-27`，与文档记录的基线一致。
+- 已一并处理 `docs/07-open-decisions.md` 中按厂商绑定分工的旧表述。
 
 ### 下一步
 
-- 由项目所有者审阅 Diff 与验收命令后合并到 `main`。
-- 合并到 `main` 后确认 CI 首次运行结果，这是 TASK-002 最后一项未完成的验收。
-- 处理 `docs/07-open-decisions.md` 中仍未更新的按厂商绑定分工表述。
-- 恢复 Docker WSL Integration，为 TASK-003 做准备。
+- TASK-002 已具备完成条件，由项目所有者确认后标记为已完成。
+- 输出并确认 TASK-003（Docker 开发依赖）任务单。
 
 ## 日志模板
 

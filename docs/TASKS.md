@@ -1,7 +1,7 @@
 # 当前任务
 
 > 状态：Phase 0，TASK-000 已完成，TASK-001 待收尾（WSL 正式目录对齐），
-> TASK-002 待验收（CI 结果待合并确认）
+> TASK-002 待项目所有者最终确认（实测与 CI 均已通过）
 
 ## 当前里程碑
 
@@ -102,12 +102,14 @@
 - 实施结果（2026-09-15）：
   - 已完成并实测通过：三个 Preset 的配置、构建与测试；格式检查；静态检查。
     实测数据见 `docs/devlog.md` 的「TASK-002 实施记录」。
-  - 交付提交：`32ab9bb build: 搭建 CMake/CTest/CI 工程骨架`，分支
-    `feat/task-002-build-skeleton`，已推送。
-  - **未完成**：`CI 成功` 尚无真实运行结果。GitHub 只从默认分支注册工作流，
-    当前 `ci.yml` 仅存在于功能分支，`actions/workflows` 的 `total_count` 为 0。
-    需在合并到 `main` 后确认首次 CI 结果，届时 TASK-002 才能判定完成。
-  - 待项目所有者审阅 Diff 并合并；本任务状态在 CI 通过前不标记为已完成。
+  - 交付提交：`431adf2 build: 搭建 CMake/CTest/CI 工程骨架`（分支
+    `feat/task-002-build-skeleton`），已通过 PR #1 合并到 `main`，合并提交
+    `eb67a6c`。
+  - `CI 成功` 已满足：合并后工作流被注册为 `active`，CI 运行两次均
+    `completed / success`（run #1 功能分支、run #2 `main`）。
+  - 未决风险：系统缺少 brpc 相关开发头文件（`openssl`、`gflags`、`glog`），
+    属 TASK-004 前置条件，安装方式届时决策。
+  - 结论：三项验收标准均已满足，等待项目所有者最终确认后关闭本任务。
 
 ## TASK-003：Docker 开发依赖
 
