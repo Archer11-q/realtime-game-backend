@@ -42,6 +42,18 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "RGBT_ENABLE_SANITIZER": "ON"
       }
+    },
+    {
+      "name": "brpc-debug",
+      "displayName": "brpc Debug (vcpkg, Ninja)",
+      "description": "使用 vcpkg 提供的 brpc 构建 gateway 冒烟目标。需要先执行 vcpkg install brpc。",
+      "inherits": "base",
+      "generator": "Ninja",
+      "toolchainFile": "$env{HOME}/tools/vcpkg/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "RGBT_USE_VCPKG_TOOLCHAIN": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -56,6 +68,10 @@
     {
       "name": "asan",
       "configurePreset": "asan"
+    },
+    {
+      "name": "brpc-debug",
+      "configurePreset": "brpc-debug"
     }
   ],
   "testPresets": [

@@ -37,6 +37,18 @@ option(RGBT_BUILD_TESTS "构建单元测试" ON)
 # 引入 vcpkg 时只需打开此开关并配置 toolchain，测试代码和目标名无需改动。
 option(RGBT_USE_VCPKG_TOOLCHAIN "使用包管理器提供的依赖，而不是 FetchContent" OFF)
 
+# vcpkg 工具链位置。仅在需要 brpc 等 vcpkg 依赖时使用（brpc-debug 预设）。
+#
+# 注意：这里刻意不默认取 $ENV{VCPKG_ROOT}。非交互式 shell（脚本、CI、
+# cmake 被上层工具调用时）不会加载 .profile/.bashrc，VCPKG_ROOT 会是空字符串；
+# 而 vcpkg 的 toolchain 会把 VCPKG_ROOT 写入缓存，一旦第一次配置写入了错误值，
+# 后续重新配置会因为“环境变量与缓存不一致”而直接中止。
+# 因此默认值用本机文档记录的固定路径，需要时用 -DRGBT_VCPKG_TOOLCHAIN_FILE 覆盖。
+set(RGBT_VCPKG_TOOLCHAIN_FILE
+    "$ENV{HOME}/tools/vcpkg/scripts/buildsystems/vcpkg.cmake"
+    CACHE FILEPATH "vcpkg toolchain 文件路径"
+)
+
 # 让 debug / release / asan 三个预设共享同一份依赖下载与构建产物。
 # 默认行为是每个预设各自下载一次（三个预设即三次网络下载），既慢又放大了
 # 网络抖动导致的配置失败概率。共享后只下载一次。

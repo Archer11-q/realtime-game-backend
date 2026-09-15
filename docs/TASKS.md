@@ -178,8 +178,8 @@
 
 ## TASK-004：brpc Gateway 基线
 
-- 状态：待开始
-- 依赖：TASK-002
+- 状态：进行中
+- 依赖：TASK-002（已完成）、TASK-003（已完成）
 - 背景问题：需要验证 brpc/Protobuf 工程集成和服务启动方式。
 - 本次目标：
   - 公共 Proto、错误码、Gateway 健康检查和优雅退出。
@@ -188,6 +188,68 @@
   - Gateway 可启动。
   - 健康检查成功。
   - 测试可通过，错误路径有记录。
+- **本轮实施策略（经项目所有者确认的方案 C）：先验证，再全量。**
+  即先用 vcpkg 装通 brpc 并在本工程中链接运行，确认工具链可用，
+  之后再决定是否把 GTest 等其他依赖一并迁入 vcpkg、以及是否进入完整 Gateway 实现。
+  本轮**不**实现完整 Gateway 业务，只交付“brpc 可用”的可验证证据。
+- 范围：
+  - `vcpkg` 经典模式安装 `brpc`（含 protobuf、gflags、glog、openssl、thrift 等依赖）。
+  - 工程接入 vcpkg toolchain，新增独立的 `brpc` 预设，不影响既有
+    `debug`/`release`/`asan` 三个预设与 CI。
+  - 最小可运行的 brpc 服务与健康检查，作为链接与启动证据。
+  - `scripts/verify-brpc.sh`：本任务的验收入口。
+- 非范围：
+  - 不定义 `api/proto/` 下的正式接口契约（留到业务任务）。
+  - 不把 GTest 迁入 vcpkg manifest（待 brpc 验证通过后单独决策）。
+  - 不引入 etcd、Kafka、多节点。
+- 相关 ADR：ADR-0001。若最终决定全量迁入 vcpkg manifest，需新增 ADR。
+- 涉及目录：`cmake/`（如有）、`src/gateway/`、`scripts/`、根 `CMakeLists.txt`、
+  `CMakePresets.json`。
+- 接口变化：本轮只新增健康检查接口，不改动既有对外契约。
+- 数据变化：无。
+- 失败场景（**以下均已实测确认，非推测**）：
+  - **GitHub release 附件被限速**：实测 34 KB/s，62 MB 的 CMake 需约 31 分钟，
+    且 vcpkg 重试不从断点继续，会反复失败。已通过 `ghfast.top` 加速通道解决
+    （实测 819–931 KB/s）。
+  - **vcpkg 要求自带 CMake 4.4.3，高于本机 4.2.3**：已预先将 CMake 放入
+    `$VCPKG_ROOT/downloads/`，vcpkg 会直接复用而不再下载。
+  - **本机 vcpkg 不是 git 克隆**（无 `.git`），因此**无法使用 manifest 的
+    `builtin-baseline` 固定版本**。本轮采用经典模式安装；若后续要固定版本，
+    需要把 vcpkg 重新克隆为 git 仓库。
+  - **内存限制**：本机 11 GiB，brpc/protobuf/openssl 并行编译有 OOM 风险，
+    已限制 `VCPKG_MAX_CONCURRENCY=4`。
+  - **无法自行安装系统包**：`sudo` 需要密码，因此不能退回 apt 安装方案作为兜底；
+    若 vcpkg 路线失败，需要项目所有者手动执行 apt 安装。
+  - **git clone 无法走加速通道**：实测超时，因此任何需要 git clone 的 port
+    都会失败；brpc 及其依赖均为固定 tag 的 archive 下载，不受影响。
+- 验收命令（在 WSL 中执行）：
+  ```bash
+  bash scripts/verify-brpc.sh
+  ```
+- 测试要求：最小 brpc 服务需能启动并响应健康检查；停止时能优雅退出。
+- 回退方式：删除新增的 vcpkg 预设与源文件，恢复 `CMakeLists.txt`；
+  vcpkg 安装的依赖可保留（不影响既有构建），必要时
+  `rm -rf $VCPKG_ROOT/installed $VCPKG_ROOT/buildtrees` 清理。
+- 负责人：执行者（写入权）— 本轮由当前会话代理承担，项目所有者审阅与验收。
+- 写入权说明：按 `CLAUDE.md`「协作纪律」，本轮写入权授予当前执行会话，范围为
+  TASK-004 涉及目录。
+- 实施结果（2026-09-16，方案 C 的验证目标已达成）：
+  - vcpkg 经典模式安装 brpc 成功：共 73 个包，brpc 1.16.0 本体编译耗时 17 分钟，
+    总计 19 分钟。依赖 protobuf 6.33.4、thrift 0.24.0、openssl 3.6.4、
+    abseil、gflags、glog、leveldb、zlib、libevent、boost 1.92.0 全部就绪。
+  - **工具链可用性已验证**：CMake 4.2.3 + GCC 15.2.0 能编译并链接 brpc，
+    这是本任务的核心目的。
+  - 新增 `brpc-debug` 预设与 `src/gateway/smoke_main.cpp` 冒烟程序。
+  - 验收命令：`bash scripts/verify-brpc.sh`，退出码 0。
+  - 实测结果：配置成功、构建成功、服务启动、`GET /health` 返回 200 且响应体为
+    `OK`、未知路径返回 404（证明路由生效）、brpc 内置 `/status` 返回 200、
+    收到 SIGTERM 后退出码 0 且输出「已优雅退出」。
+  - 回归确认：既有 `debug`/`release`/`asan` 三预设仍各 4/4 通过，格式检查通过，
+    接入 vcpkg 未影响原有构建与 CI。
+  - 未完成（本轮非范围）：未定义 `api/proto/` 正式契约；未实现完整 Gateway；
+    GTest 未迁入 vcpkg；Compose 与 brpc 预设未纳入 CI。
+  - 结论：方案 C 的验证目标（brpc 是否可用）已达成，等待项目所有者确认后再决定
+    是否进入完整 Gateway 实现。
 
 ## TASK-005：登录垂直切片
 

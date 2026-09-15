@@ -349,6 +349,78 @@
 - 项目所有者的 shell 需重新登录或 `source ~/.profile` 后，`VCPKG_ROOT` 才会在
   其当前终端中生效（新开的终端自动生效）。
 
+## TASK-004 实施记录（2026-09-16）
+
+### 完成
+
+- 用 vcpkg 经典模式安装 brpc 1.16.0 及其全部依赖，共 **73 个包**：
+  protobuf 6.33.4、thrift 0.24.0、openssl 3.6.4、abseil、gflags、glog、leveldb、
+  zlib、libevent、boost 1.92.0（40 个子库）等。
+- 新增 `brpc-debug` 预设，通过 `toolchainFile` 指向 vcpkg，仅在需要 brpc 时使用。
+- 新增 `src/gateway/smoke_main.cpp`：启用 brpc 内置服务的最小可运行服务。
+- 新增 `src/gateway/CMakeLists.txt`、`scripts/verify-brpc.sh`。
+- `src/CMakeLists.txt`：仅在 `RGBT_USE_VCPKG_TOOLCHAIN` 为真时加入 gateway 子目录，
+  默认构建与 CI 不受影响。
+- `tests/CMakeLists.txt`：vcpkg 模式下若未安装 gtest 则跳过测试并给出提示，
+  而不是中断配置。
+
+### 决策
+
+- 确认采用方案 C：先用 vcpkg 只验证 brpc 可用，再决定是否全量迁移依赖。
+  本轮不实现完整 Gateway，只交付「brpc 可用」的可验证证据。
+- 本机 vcpkg 不是 git 克隆，**无法使用 manifest 的 `builtin-baseline`**，
+  因此采用经典模式安装。若要固定版本，需把 vcpkg 重新克隆为 git 仓库。
+- brpc 的 HTTP 能力使用其**内置运维服务**（`/health`、`/status`、`/version`），
+  而不是自写 HTTP 服务类。
+
+### 验证
+
+- 命令：`bash scripts/verify-brpc.sh`，退出码 **0**。
+- 结果：配置成功；构建成功并生成 `build/brpc-debug/bin/rgbt_brpc_smoke`。
+- 结果：服务启动；`GET /health` 返回 **200**，响应体为 `OK`；brpc 内置 `/status`
+  返回 200；未知路径返回 **404**，证明路由确实生效。
+- 结果：发送 SIGTERM 后进程退出码 **0**，输出包含「已优雅退出」。
+- 结果：**CMake 4.2.3 + GCC 15.2.0 能编译并链接 brpc 1.16.0**，这是本任务的核心
+  验证目标，此前属未知风险。
+- 结果：既有 `debug`/`release`/`asan` 三预设回归各 4/4 通过，格式检查通过，
+  接入 vcpkg 未破坏原有构建。
+- 结果：以上验收在 `VCPKG_ROOT` **未导出**的非交互式 shell 中同样通过，
+  证明预设不依赖该环境变量。
+
+### 问题与风险（本轮实际踩到并解决的）
+
+- **GitHub 大文件被限速到 34 KB/s 且会中途停滞**，vcpkg 每次重试都从零开始，
+  导致 openssl（53 MB）与 protobuf 下载卡死。解决方式：按 port 声明的 URL 与
+  SHA512，用加速通道预下载并**逐个校验哈希**后放入 `$VCPKG_ROOT/downloads/`。
+  共预置 5 个包（CMake 4.4.3、openssl、zlib、protobuf、libevent、thrift），
+  全部哈希匹配。
+- **vcpkg 要求自带 CMake 4.4.3**（高于本机 4.2.3），需先满足该前置。
+- **vcpkg 不读取 git 的 `insteadOf` 加速配置**，它用自己的下载器，因此 git 层面的
+  加速对 vcpkg 无效。
+- **本地 CONNECT 代理方案对 302 重定向无效**：curl 跟随重定向到
+  `codeload.github.com` 后走直连，绕过代理。该方案已放弃。
+- **thrift 编译需要 flex/bison/autoconf/automake/libtool/m4**，本机最初全缺，
+  且 `sudo` 需要密码。已由项目所有者安装后解决。
+- **踩坑记录（首次出现，避免重犯）**：
+  1. 用 `clang-format` 格式化 `CMakeLists.txt` 会破坏 CMake 语法（产生
+     `Parse error`）。CMake 文件不要交给 clang-format。
+  2. 创建脚本后必须确认已同步到 WSL 再执行，否则会以「文件不存在」（退出码 127）
+     立即退出，表现为“任务在跑”实为“什么都没跑”。
+- 代码层面的三处真实缺陷（均由实际编译暴露并修复）：
+  1. 链接 `unofficial::brpc::brpc` 前缺少 `find_package(unofficial-brpc CONFIG REQUIRED)`。
+  2. 未链接 `rgbt_common`，导致找不到 `common/version.hpp`。
+  3. brpc **不存在 `brpc::HttpService` 类**；HTTP 服务通过 RPC 服务的
+     restful 映射或内置服务提供，且 `AddBuiltinServices()` 是私有方法，
+     内置服务实际由 `ServerOptions::has_builtin_services`（默认 true）控制。
+- 未决：`api/proto/` 正式契约、完整 Gateway、GTest 迁入 vcpkg、
+  CI 中增加 brpc 与 Compose 校验，均属后续任务。
+
+### 下一步
+
+- 由项目所有者审阅 `src/gateway/` 与 `CMakePresets.json` 的改动。
+- 决定后续方向：进入完整 Gateway 实现（含 proto 契约与错误码），
+  或先补齐 CI 覆盖。
+
 ## 日志模板
 
 ```markdown
