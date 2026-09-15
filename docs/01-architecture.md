@@ -257,6 +257,9 @@ Room 发布 MatchFinished
 - 所有客户端输入必须校验，不能信任房间 ID、玩家 ID 和帧号。
 - 日志不输出 Token、密码和完整敏感载荷。
 - 服务配置通过环境变量注入，仓库只保存 `.env.example`。
+- 注意区分两类地址：宿主机的 `REDIS_HOST`/`MYSQL_HOST` 用于 WSL 中直接连接的
+  客户端，容器内互访必须使用 Compose 服务名 `redis`/`mysql` 和容器端口
+  6379/3306；宿主机的 `REDIS_PORT`/`MYSQL_PORT` 只影响端口映射。
 - 后续加入请求限流、连接数限制和异常行为统计。
 
 ## 11. 架构变更规则

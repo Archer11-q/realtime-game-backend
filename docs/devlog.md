@@ -283,6 +283,72 @@
 - 输出 TASK-004（brpc Gateway 基线）任务单，并在其中确定依赖获取方式：
   系统 apt 安装还是交由 vcpkg 构建。
 
+### 补充（同日稍后）：.env 位置修正与 vcpkg 环境准备
+
+#### 决策
+
+- **`.env` 与 `.env.example` 从仓库根目录移到 `deploy/compose/`**。原设计放在根目录
+  是错误判断：Docker Compose 的约定是从“compose 文件所在目录”自动读取 `.env`，
+  放在根目录会强制每条命令都加 `--env-file`，多一个每次操作都可能漏掉的参数。
+  修正后命令简化为
+  `docker compose -f deploy/compose/docker-compose.yml up -d`。
+- **TASK-004 的依赖获取方式选定为“先验证再全量”**：先用 vcpkg 只装 brpc，
+  确认 CMake 4.2.3 + GCC 15.2.0 真能编译，再决定是否把 GTest 等一并迁入
+  vcpkg manifest。理由是本轮已两次遇到“以为兼容、实际不兼容”的情况
+  （CMake 4 与依赖、clang-format 与模板占位符），先花一次构建验证风险最低。
+
+#### 完成
+
+- `deploy/compose/docker-compose.yml`：移除对外部 `--env-file` 的依赖；
+  修正 `migrations` 绑定挂载的路径说明。
+- `deploy/compose/README.md`：同步修正全部命令；新增卷的实际名称
+  （`realtime-game-backend_*`）、`docker volume inspect` 用法、备份文件不得入库的
+  提醒，以及可执行的恢复演练步骤和第 11 节演练记录表。
+- `.gitignore`：新增数据库导出文件忽略规则（`backup-*.sql`、`*_dump.sql`、
+  `*.sql.gz`、`redis-dump-*.rdb`）。
+- `docs/06-operations.md`：明确 Compose 相关 `.env` 必须与 compose 文件同目录。
+- `docs/01-architecture.md`：补充宿主机地址与容器内服务名/端口的使用区别。
+
+#### 验证
+
+- 结果：不传 `--env-file` 时 `docker compose -f deploy/compose/docker-compose.yml
+  config` 退出码为 **0**，确认 compose 能自动发现同目录的 `.env`。
+- 结果：移走 `.env` 后同一命令退出码变为 1 并提示缺少变量，确认配置确实被读取。
+- 结果：配置输出中 `migrations` 的 bind 源路径解析为
+  `/home/archer/workspace/realtime-game-backend/migrations`，`read_only: true`。
+- 结果：`.env`、`.env.example` 均已不在仓库根目录。
+
+#### 项目所有者完成的恢复演练（真实记录）
+
+- 项目所有者按 `deploy/compose/README.md` 第 7 节的步骤，实际执行了 MySQL
+  备份与恢复演练：建表并写入 `before-backup` → `mysqldump` 备份 → 删表 →
+  恢复 → 查询验证。
+- 结果：恢复后 `SELECT k FROM _drill;` 返回 `before-backup`，**恢复链路可用**。
+  这是 `docs/06-operations.md` 第 6 节“Docker 数据卷不能只创建不验证恢复”要求的
+  首次实际验证。
+- 备份产物 `backup-drill.sql`（2.9 KB，含真实数据）一度处于未被忽略状态，
+  已通过 `.gitignore` 规则消除误提交风险。
+
+#### vcpkg 环境准备
+
+- 结果：`VCPKG_ROOT` 此前未设置。已建立单一来源的配置片段 `~/.vcpkg-env.sh`，
+  由 `~/.profile` 与 `~/.bashrc` 共同引入，避免两处内容漂移。
+- 设置内容：`VCPKG_ROOT=$HOME/tools/vcpkg`、
+  `VCPKG_DEFAULT_BINARY_CACHE=$HOME/.cache/vcpkg/archives`（复用已编译 port，
+  减少 brpc 这类重依赖的重复编译成本）、`VCPKG_DISABLE_METRICS=1`。
+- 结果：登录 shell 与交互式 shell 中 `VCPKG_ROOT` 均正确，
+  `$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake` 可达。
+- **已知限制**：非交互式 shell（`bash -c`）不会读取 `.profile`/`.bashrc`，
+  因此不会自动获得 `VCPKG_ROOT`。后续脚本如需该变量，必须显式
+  `. "$HOME/.vcpkg-env.sh"` 或在命令前传 `-DCMAKE_TOOLCHAIN_FILE=...`。
+- 变更前已备份：`~/.bashrc.backup-20260915`、`~/.profile.backup-20260915`。
+  确认环境正常后可自行删除。所有相关文件权限保持 644。
+
+#### 待处理
+
+- 项目所有者的 shell 需重新登录或 `source ~/.profile` 后，`VCPKG_ROOT` 才会在
+  其当前终端中生效（新开的终端自动生效）。
+
 ## 日志模板
 
 ```markdown

@@ -123,7 +123,8 @@
   - `deploy/compose/docker-compose.yml`：Redis 与 MySQL 两个服务。
   - 具名卷 `redis-data`、`mysql-data`；healthcheck；`restart: unless-stopped`。
   - `deploy/compose/README.md`：启动、健康检查、日志、停止、清理、备份与恢复。
-  - `.env.example` 按 `docs/06-operations.md` 补充 Compose 需要的变量并加注释。
+  - `.env.example` 按 `docs/06-operations.md` 补充 Compose 需要的变量并加注释；
+    与 compose 文件同目录放置于 `deploy/compose/`。
   - `migrations/001_create_schema_migrations.sql`：最小建表脚本，验证初始化链路。
   - `scripts/verify-deps.sh`：依赖环境的验收入口（一条命令）。
 - 非范围：
@@ -131,7 +132,7 @@
   - 不实现业务表结构，不接入服务代码。
   - 不引入 Dockerfile、镜像构建和多节点编排。
 - 相关 ADR：ADR-0001。本轮不新增 ADR。
-- 涉及目录：`deploy/compose/`、`migrations/`、`scripts/`、根 `.env.example`。
+- 涉及目录：`deploy/compose/`、`migrations/`、`scripts/`。
 - 接口变化：无。仅新增本地依赖服务的端口与配置约定。
 - 数据变化：新增两个具名 Docker 卷，以及 `realtime_game` 库中的
   `schema_migrations` 表。

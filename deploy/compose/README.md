@@ -21,25 +21,28 @@
 在**仓库根目录**执行：
 
 ```bash
-cp .env.example .env          # 仅首次需要
+cp deploy/compose/.env.example deploy/compose/.env   # 仅首次需要
 bash scripts/verify-deps.sh --keep
 ```
 
 或者直接用 compose：
 
 ```bash
-docker compose --env-file .env -f deploy/compose/docker-compose.yml up -d
+docker compose -f deploy/compose/docker-compose.yml up -d
 ```
 
-> **为什么必须写 `--env-file .env`**：compose 默认从 compose 文件所在目录
-> （`deploy/compose/`）读取 `.env`，而本项目的 `.env` 按 `docs/06-operations.md`
-> 固定放在仓库根目录。不传这个参数会因缺少变量而报错退出——这是刻意的，
-> 目的是避免用空密码/默认值悄悄启动一个错误的环境。
+> **为什么 `.env` 放在 `deploy/compose/` 而不是仓库根目录**：compose 的约定是从
+> “compose 文件所在目录”自动读取 `.env`。把 `.env` 放在同目录，命令就不需要写
+> `--env-file`，少一个每次操作都可能漏掉的参数。真实 `.env` 已被 `.gitignore`
+> 忽略。
+>
+> 变量缺失时仍会立即失败并打印中文提示，这是刻意的：避免用空密码或默认值悄悄
+> 启动一个看似正常的错误环境。
 
 ## 3. 健康检查
 
 ```bash
-docker compose --env-file .env -f deploy/compose/docker-compose.yml ps
+docker compose -f deploy/compose/docker-compose.yml ps
 ```
 
 `STATUS` 列出现 `healthy` 表示就绪。容器名固定为 `rgbt-redis` 和 `rgbt-mysql`。
@@ -55,10 +58,10 @@ docker exec rgbt-mysql mysqladmin ping -h 127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWO
 
 ```bash
 # 全部服务，实时跟随
-docker compose --env-file .env -f deploy/compose/docker-compose.yml logs -f
+docker compose -f deploy/compose/docker-compose.yml logs -f
 
 # 只看 MySQL 最近 50 行
-docker compose --env-file .env -f deploy/compose/docker-compose.yml logs --tail=50 mysql
+docker compose -f deploy/compose/docker-compose.yml logs --tail=50 mysql
 ```
 
 ## 5. 连接方式
@@ -86,7 +89,7 @@ mysql -h 127.0.0.1 -P "${MYSQL_PORT:-3306}" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" 
 
 ```bash
 # 停止并移除容器与网络，数据卷保留（推荐日常使用）
-docker compose --env-file .env -f deploy/compose/docker-compose.yml down
+docker compose -f deploy/compose/docker-compose.yml down
 
 # 等价写法
 bash scripts/verify-deps.sh --down-only
@@ -97,13 +100,28 @@ bash scripts/verify-deps.sh --down-only
 
 ```bash
 # 会删除数据！
-docker compose --env-file .env -f deploy/compose/docker-compose.yml down -v
+docker compose -f deploy/compose/docker-compose.yml down -v
 ```
 
 ## 7. 数据卷备份与恢复
 
-数据卷为具名卷 `redis-data`、`mysql-data`，由 Docker 管理。**卷被创建不等于
-恢复流程被验证过**（`docs/06-operations.md` 第 6 节），因此恢复步骤必须实际演练。
+数据卷为具名卷，Docker 会把项目名前缀加到卷名上，实际名称是：
+
+- `realtime-game-backend_redis-data`
+- `realtime-game-backend_mysql-data`
+
+它们由 Docker 管理，**不要手工修改卷内的文件**。查看卷在宿主机上的位置：
+
+```bash
+docker volume inspect realtime-game-backend_mysql-data
+```
+
+`Mountpoint` 字段是卷的位置。注意 Docker Desktop 的 Engine 运行在独立的 WSL
+虚拟机内，该路径**不在**当前 `archer` 用户的发行版里，直接 `cd` 过去通常不存在，
+这是正常现象。
+
+**卷被创建不等于恢复流程被验证过**（`docs/06-operations.md` 第 6 节），因此恢复
+步骤必须实际演练，并记录恢复点、恢复耗时和数据差异。演练步骤见本节末尾。
 
 ### 备份 MySQL
 
@@ -120,6 +138,9 @@ docker exec -i rgbt-mysql sh -c \
   'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD"' < backup-YYYYmmdd-HHMMSS.sql
 ```
 
+> 备份文件包含真实数据，**不要提交到 Git**。当前 `.gitignore` 未包含 `*.sql`，
+> 因此需要自行注意；如需长期防护可新增忽略规则。
+
 ### 备份 Redis
 
 Redis 本轮使用默认 RDB 快照（`--save 60 1`），快照文件在卷内：
@@ -129,10 +150,48 @@ docker exec rgbt-redis redis-cli save
 docker cp rgbt-redis:/data/dump.rdb ./redis-dump-$(date +%Y%m%d-%H%M%S).rdb
 ```
 
-### 恢复演练要求
+### 恢复演练步骤（必须实际执行）
 
-每次演练需记录：恢复点、恢复耗时、数据差异。`docs/06-operations.md` 要求
-Redis 数据以“可重建缓存”为前提时，也必须验证重建流程。
+`docs/06-operations.md` 第 6 节要求恢复流程必须被验证，并记录恢复点、恢复时间和
+数据差异。`Redis 数据视为可重建缓存时，也必须验证重建流程`。
+
+在**仓库根目录**依次执行，全程约 2 分钟：
+
+```bash
+# 1. 启动依赖
+docker compose -f deploy/compose/docker-compose.yml up -d
+sleep 25
+
+# 2. 造一条可辨认的数据
+docker exec rgbt-mysql mysql -urealtime_game -pchange_me -D realtime_game -e \
+  "CREATE TABLE IF NOT EXISTS _drill(k VARCHAR(16) PRIMARY KEY);
+   INSERT IGNORE INTO _drill VALUES('before-backup');"
+
+# 3. 备份，并确认文件不为 0 字节
+docker exec rgbt-mysql sh -c \
+  'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --databases "$MYSQL_DATABASE"' \
+  > backup-drill.sql
+ls -lh backup-drill.sql
+
+# 4. 故意破坏
+docker exec rgbt-mysql mysql -urealtime_game -pchange_me -D realtime_game -e \
+  "DROP TABLE _drill;"
+
+# 5. 恢复
+docker exec -i rgbt-mysql sh -c \
+  'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD"' < backup-drill.sql
+
+# 6. 验证数据回来了，期望输出 before-backup
+docker exec rgbt-mysql mysql -urealtime_game -pchange_me -D realtime_game -e \
+  "SELECT * FROM _drill;"
+
+# 7. 清理
+docker exec rgbt-mysql mysql -urealtime_game -pchange_me -D realtime_game -e \
+  "DROP TABLE _drill;"
+rm -f backup-drill.sql
+```
+
+把第 3 到第 6 步的实际耗时记到第 11 节的表格里。
 
 ## 8. 数据库初始化脚本
 
@@ -144,9 +203,10 @@ Redis 数据以“可重建缓存”为前提时，也必须验证重建流程�
 
 ## 9. 常见问题
 
-### 启动时报“缺少 xxx，请先执行 cp .env.example .env”
+### 启动时报“缺少 xxx，请先执行 cp deploy/compose/.env.example deploy/compose/.env”
 
-没有传 `--env-file .env`，或者仓库根目录没有 `.env`。按第 2 节执行。
+`deploy/compose/.env` 不存在。按第 2 节生成即可。文件存在时不会出现此错误，
+因为 compose 会自动发现同目录的 `.env`。
 
 ### 端口被占用
 
@@ -159,7 +219,7 @@ ss -ltnp | grep -E ':(6379|3306)'
 ### 改过 `MYSQL_PASSWORD` 后连不上
 
 MySQL 的账号密码只在**首次初始化**时创建。已有数据卷不会因为改 `.env` 而更新
-密码。处理方式二选一：
+密码。处理方式三选一：
 
 1. 改回原来的密码；
 2. 修改数据库中的密码：
@@ -174,7 +234,7 @@ MySQL 的账号密码只在**首次初始化**时创建。已有数据卷不会�
 MySQL 首次初始化通常需要 30 秒以上。若超过 3 分钟仍未 healthy：
 
 ```bash
-docker compose --env-file .env -f deploy/compose/docker-compose.yml logs --tail=100 mysql
+docker compose -f deploy/compose/docker-compose.yml logs --tail=100 mysql
 ```
 
 常见原因是数据卷被旧版本写坏，此时只能 `down -v` 重建。
@@ -184,12 +244,22 @@ docker compose --env-file .env -f deploy/compose/docker-compose.yml logs --tail=
 先确认 **Docker Desktop 已启动**。2026-09-15 曾因此产生一次误判，参见
 `docs/devlog.md`。
 
-## 10. 使用 `--env-file` 之外的推荐做法
+## 10. 简化日常命令
 
 如果不想每次都写长命令，可在 shell 中加一个别名（不进入仓库）：
 
 ```bash
-alias rgbt-deps='docker compose --env-file .env -f deploy/compose/docker-compose.yml'
+alias rgbt-deps='docker compose -f deploy/compose/docker-compose.yml'
 ```
+
+之后 `rgbt-deps up -d`、`rgbt-deps ps`、`rgbt-deps down` 即可。
+
+## 11. 恢复演练记录
+
+本节用于记录实际演练过的时间和数据差异。**未演练前本表为空**，不要填写推测值。
+
+| 日期 | 对象 | 恢复点 | 耗时 | 数据差异 | 执行人 |
+|---|---|---|---|---|---|
+| （待填写） | | | | | |
 
 之后 `rgbt-deps up -d`、`rgbt-deps ps`、`rgbt-deps down` 即可。

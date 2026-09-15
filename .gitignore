@@ -58,3 +58,10 @@ dist/
 # 误同步到其他环境。需要长期保留的脚本请改用不带下划线前缀的名字。
 scripts/_*.sh
 
+# Database dumps and backups
+# 数据库导出文件包含真实数据，绝不能进入版本库。
+*.sql.gz
+backup-*.sql
+*_dump.sql
+redis-dump-*.rdb
+

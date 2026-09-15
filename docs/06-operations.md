@@ -64,6 +64,9 @@ Docker Desktop 的 Ubuntu WSL Integration 已于 2026-09-14 验证生效。
 
 - 配置通过环境变量注入。
 - 仓库保存 `.env.example`，不保存真实 `.env`。
+- 与 Docker Compose 相关的 `.env` 和 `.env.example` 与 compose 文件同目录放置
+  （`deploy/compose/`），因为 compose 的约定是从 compose 文件所在目录自动读取
+  `.env`。放在其他位置会导致每次执行都需要额外传 `--env-file`，容易漏写。
 - 禁止把 Token、数据库密码和私钥提交到 Git。
 - 配置项必须有默认值、类型、单位和取值范围说明。
 - 服务启动时校验关键配置，缺失时快速失败并输出明确错误。

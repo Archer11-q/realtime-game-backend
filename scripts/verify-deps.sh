@@ -14,7 +14,10 @@
 #
 # 前置条件：
 #   * Docker Desktop 已启动，`docker info` 能返回服务端版本。
-#   * 仓库根目录存在 .env；缺失时本脚本会用 .env.example 生成一份。
+#   * deploy/compose/.env 存在；缺失时本脚本会用同目录的 .env.example 生成一份。
+#
+# 说明：.env 与 docker-compose.yml 同目录，compose 会自动发现，因此本脚本
+# 不需要传 --env-file。
 #
 # 退出码：0 全部通过；非 0 表示失败，失败原因会打印在末尾。
 # 本脚本不会执行 `down -v`，因此不会删除数据卷。
@@ -24,8 +27,10 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 repo_root="$(pwd)"
 
-compose_file="deploy/compose/docker-compose.yml"
-env_file=".env"
+compose_dir="deploy/compose"
+compose_file="$compose_dir/docker-compose.yml"
+env_file="$compose_dir/.env"
+env_example="$compose_dir/.env.example"
 keep_running=0
 down_only=0
 
@@ -34,7 +39,7 @@ for arg in "$@"; do
     --keep) keep_running=1 ;;
     --down-only) down_only=1 ;;
     -h | --help)
-      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -54,7 +59,7 @@ fail() {
 ok() { echo "v  $1"; }
 
 compose() {
-  docker compose --env-file "$env_file" -f "$compose_file" "$@"
+  docker compose -f "$compose_file" "$@"
 }
 
 echo "工作目录: $repo_root"
@@ -75,11 +80,15 @@ fi
 ok "Docker 可用: $(docker version --format '{{.Server.Version}}' 2>/dev/null)"
 
 if ! [ -f "$env_file" ]; then
-  echo "未找到 .env，将从 .env.example 生成（.env 已被 git 忽略）。"
-  cp .env.example .env
-  ok "已生成 .env"
+  if ! [ -f "$env_example" ]; then
+    echo "未找到 $env_example，无法生成配置。" >&2
+    exit 1
+  fi
+  echo "未找到 $env_file，将从 $env_example 生成（.env 已被 git 忽略）。"
+  cp "$env_example" "$env_file"
+  ok "已生成 $env_file"
 else
-  ok ".env 已存在"
+  ok "$env_file 已存在"
 fi
 
 # shellcheck disable=SC1090
@@ -103,7 +112,7 @@ fi
 
 # ---------- 1. 一条命令启动 ----------
 echo "===== 1. 启动依赖 ====="
-echo "命令: docker compose --env-file .env -f $compose_file up -d"
+echo "命令: docker compose -f $compose_file up -d"
 if compose up -d; then
   ok "启动命令执行成功"
 else
@@ -212,7 +221,7 @@ echo
 echo "===== 6. 收尾 ====="
 if [ "$keep_running" -eq 1 ]; then
   ok "按 --keep 要求保持容器运行"
-  echo "   查看状态: docker compose --env-file .env -f $compose_file ps"
+  echo "   查看状态: docker compose -f $compose_file ps"
   echo "   停止:     bash scripts/verify-deps.sh --down-only"
 else
   if compose down >/dev/null 2>&1; then
@@ -229,8 +238,8 @@ if [ ${#failures[@]} -ne 0 ]; then
   echo
   echo "排查提示："
   echo "  1. 端口占用:  ss -ltnp | grep -E ':(6379|3306)'"
-  echo "  2. 容器日志:  docker compose --env-file .env -f $compose_file logs --tail=50"
-  echo "  3. 容器状态:  docker compose --env-file .env -f $compose_file ps"
+  echo "  2. 容器日志:  docker compose -f $compose_file logs --tail=50"
+  echo "  3. 容器状态:  docker compose -f $compose_file ps"
   exit 1
 fi
 

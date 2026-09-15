@@ -1,11 +1,12 @@
 # 本地开发依赖：Redis 与 MySQL
 #
 # 用法（在仓库根目录执行）：
-#   cp .env.example .env
-#   docker compose --env-file .env -f deploy/compose/docker-compose.yml up -d
+#   cp deploy/compose/.env.example deploy/compose/.env
+#   docker compose -f deploy/compose/docker-compose.yml up -d
 #
-# 说明：compose 默认从 compose 文件所在目录读取 .env，而本项目的 .env 固定放在
-# 仓库根目录，因此命令中必须显式传 --env-file .env。
+# 关于 .env 的位置：compose 的约定是从“compose 文件所在目录”自动读取 .env。
+# 本文件位于 deploy/compose/，因此 .env 也放在同一目录，命令中无需再传
+# --env-file，减少每次操作忘记参数的出错机会。
 #
 # 需要显式传值的变量使用 ${VAR:?错误提示} 形式，缺失时 compose 会立即失败并
 # 打印提示，避免用空密码悄悄启动一个错误的环境。
@@ -19,7 +20,7 @@ services:
     restart: unless-stopped
     # 绑定到 127.0.0.1，避免把本地开发数据库暴露到局域网。
     ports:
-      - "127.0.0.1:${REDIS_PORT:?缺少 REDIS_PORT，请先执行 cp .env.example .env}:6379"
+      - "127.0.0.1:${REDIS_PORT:?缺少 REDIS_PORT，请先执行 cp deploy/compose/.env.example deploy/compose/.env}:6379"
     command: ["redis-server", "--appendonly", "no", "--save", "60", "1"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -36,7 +37,7 @@ services:
     restart: unless-stopped
     ports:
       # MySQL 端口映射到宿主机的 MYSQL_PORT，容器内固定 3306。
-      - "127.0.0.1:${MYSQL_PORT:?缺少 MYSQL_PORT，请先执行 cp .env.example .env}:3306"
+      - "127.0.0.1:${MYSQL_PORT:?缺少 MYSQL_PORT，请先执行 cp deploy/compose/.env.example deploy/compose/.env}:3306"
     environment:
       # 注意：变量名 MYSQL_DATABASE/MYSQL_USER/MYSQL_PASSWORD 是官方镜像约定，
       # 不可改用 MYSQL_DB 之类的名字，否则初始化不会生效。
@@ -65,6 +66,8 @@ services:
       - mysql-data:/var/lib/mysql
       # 该目录下的 *.sql 只在数据目录为空（首次初始化）时执行一次。
       # 修改已有数据卷的 schema 需要新的迁移脚本，不能依赖重跑这里。
+      # 路径相对本文件所在目录（deploy/compose/），../../migrations 即仓库的
+      # migrations/。不要写成相对于仓库根目录的路径，否则会挂载到错误位置。
       - ../../migrations:/docker-entrypoint-initdb.d:ro
 
 volumes:
