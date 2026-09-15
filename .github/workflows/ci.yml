@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+# 构建基线检查：配置、构建、测试、格式。
+# 构建失败时保留日志，避免只看到“红叉”而无法定位。
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_GENERATOR: Ninja
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  # 让 CMake 使用 ccache，否则缓存目录不会被写入，缓存步骤形同虚设。
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [debug, release, asan]
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache clang-format
+
+      - name: 缓存编译产物
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ matrix.preset }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ matrix.preset }}-
+
+      - name: 显示工具版本
+        run: |
+          cmake --version | head -1
+          g++ --version | head -1
+          ninja --version
+
+      - name: 配置
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: 构建
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: 测试
+        run: ctest --preset ${{ matrix.preset }}
+
+      - name: 格式检查
+        run: bash scripts/check-format.sh
+
+      - name: 失败时上传测试日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.preset }}
+          path: |
+            build/${{ matrix.preset }}/Testing/
+          if-no-files-found: ignore
+          retention-days: 7
