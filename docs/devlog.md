@@ -218,6 +218,71 @@
 - TASK-002 已具备完成条件，由项目所有者确认后标记为已完成。
 - 输出并确认 TASK-003（Docker 开发依赖）任务单。
 
+## TASK-003 实施记录（2026-09-15）
+
+### 完成
+
+- `deploy/compose/docker-compose.yml`：Redis 与 MySQL 两个服务，具名卷
+  `redis-data`、`mysql-data`，healthcheck，`restart: unless-stopped`，
+  端口仅绑定 `127.0.0.1`。
+- `deploy/compose/README.md`：前置依赖、启动、健康检查、日志、停止、清理、
+  备份与恢复、初始化脚本说明、常见问题。
+- `.env.example`：按 `docs/06-operations.md` 补齐 Compose 所需变量，每项附
+  取值范围说明；新增 `MYSQL_ROOT_PASSWORD`。
+- `migrations/001_create_schema_migrations.sql`：最小建表脚本，使用
+  `CREATE TABLE IF NOT EXISTS` 与 `ON DUPLICATE KEY UPDATE` 保证幂等。
+- `scripts/verify-deps.sh`：依赖环境验收入口，支持 `--keep` 与 `--down-only`。
+
+### 决策
+
+- 镜像固定为 `redis:8.0` 与 `mysql:8.4`，与本机 redis-cli 8.0.5、
+  mysql 客户端 8.4.11 的大版本一致。
+- Redis 本轮使用默认 RDB 快照，未开启 AOF。理由是 `CLAUDE.md` 规定 Redis 不作为
+  唯一真相，现在引入 AOF 属于提前引入能力，留到 Phase 2。
+- Compose 变量使用 `${VAR:?提示}` 形式，缺少变量时立即失败并打印中文提示，
+  避免用空密码启动一个看似正常的错误环境。
+- 数据库端口只绑定 `127.0.0.1`，不暴露到局域网。
+- `migrations/` 只读挂载到 `/docker-entrypoint-initdb.d`，且文档明确说明该目录下的
+  脚本只在数据目录为空时执行一次。
+
+### 验证
+
+- 命令：`docker compose --env-file .env.example -f deploy/compose/docker-compose.yml config`
+- 结果：退出码 0；确认 `migrations` 绑定挂载解析为仓库内绝对路径，且
+  `read_only: true`。
+- 结果：故意不传 `--env-file` 时退出码为 1，并输出 `缺少 REDIS_PORT`，
+  快速失败行为符合设计。
+- 命令：`bash scripts/verify-deps.sh --keep`
+- 结果：一条命令启动成功；`redis` 与 `mysql` 均变为 `healthy`。
+- 结果：`redis-cli ping` 返回 PONG；MySQL 业务账号连接成功，服务端版本 `8.4.11`。
+- 结果：初始化脚本已执行，`schema_migrations` 可访问且迁移数为 1，证明
+  `migrations` 挂载链路有效。
+- 结果：写入测试数据后执行 `compose restart`（不删卷），Redis 键与 MySQL 行
+  均保留，验证“重启后数据卷保留”。
+- 结果：测试键与测试表已删除，未在数据库中留下验证残留。
+- 命令：`bash scripts/verify-deps.sh --down-only`
+- 结果：容器与网络已移除，两个数据卷仍存在（`realtime-game-backend_mysql-data`、
+  `realtime-game-backend_redis-data`），验证“停止不等于删数据”。
+- 备注：首次运行需要拉取镜像（Redis 约 40 MB、MySQL 约 200 MB），本次实测网络
+  可用，拉取耗时较长但不影响结论。
+
+### 问题与风险
+
+- 修改 `.env` 中的 `MYSQL_PASSWORD` 不会更新已有数据卷中的密码，会导致认证失败。
+  该场景已写入 `deploy/compose/README.md` 并给出两种处理方式。
+- `down -v` 会永久删除数据，已在文档中以危险命令标注并加警告。
+- 本任务未在 CI 中验证 Compose 配置。CI 当前只构建和测试 C++ 代码；是否增加
+  `docker compose config` 校验留到后续按需决定，不扩大本次范围。
+- 系统仍缺少 brpc 相关开发头文件（`openssl`、`gflags`、`glog`），属 TASK-004
+  前置条件。
+- `VCPKG_ROOT` 仍未设置。
+
+### 下一步
+
+- 由项目所有者审阅并合并本任务改动。
+- 输出 TASK-004（brpc Gateway 基线）任务单，并在其中确定依赖获取方式：
+  系统 apt 安装还是交由 vcpkg 构建。
+
 ## 日志模板
 
 ```markdown

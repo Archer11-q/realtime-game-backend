@@ -1,0 +1,74 @@
+# 本地开发依赖：Redis 与 MySQL
+#
+# 用法（在仓库根目录执行）：
+#   cp .env.example .env
+#   docker compose --env-file .env -f deploy/compose/docker-compose.yml up -d
+#
+# 说明：compose 默认从 compose 文件所在目录读取 .env，而本项目的 .env 固定放在
+# 仓库根目录，因此命令中必须显式传 --env-file .env。
+#
+# 需要显式传值的变量使用 ${VAR:?错误提示} 形式，缺失时 compose 会立即失败并
+# 打印提示，避免用空密码悄悄启动一个错误的环境。
+
+name: realtime-game-backend
+
+services:
+  redis:
+    image: redis:8.0
+    container_name: rgbt-redis
+    restart: unless-stopped
+    # 绑定到 127.0.0.1，避免把本地开发数据库暴露到局域网。
+    ports:
+      - "127.0.0.1:${REDIS_PORT:?缺少 REDIS_PORT，请先执行 cp .env.example .env}:6379"
+    command: ["redis-server", "--appendonly", "no", "--save", "60", "1"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    volumes:
+      - redis-data:/data
+
+  mysql:
+    image: mysql:8.4
+    container_name: rgbt-mysql
+    restart: unless-stopped
+    ports:
+      # MySQL 端口映射到宿主机的 MYSQL_PORT，容器内固定 3306。
+      - "127.0.0.1:${MYSQL_PORT:?缺少 MYSQL_PORT，请先执行 cp .env.example .env}:3306"
+    environment:
+      # 注意：变量名 MYSQL_DATABASE/MYSQL_USER/MYSQL_PASSWORD 是官方镜像约定，
+      # 不可改用 MYSQL_DB 之类的名字，否则初始化不会生效。
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?缺少 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?缺少 MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER:?缺少 MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?缺少 MYSQL_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      # 默认 caching_sha2_password 与部分旧客户端不兼容，这里保留默认值，
+      # 若后续出现认证问题再评估改用 mysql_native_password（需 ADR）。
+    healthcheck:
+      # 用 root 密码做存活探测，避免与业务账号混淆；密码不是新增秘密，
+      # 它已经存在于 .env 中，此处只是把它交给容器内的探测命令。
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 该目录下的 *.sql 只在数据目录为空（首次初始化）时执行一次。
+      # 修改已有数据卷的 schema 需要新的迁移脚本，不能依赖重跑这里。
+      - ../../migrations:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  redis-data:
+    driver: local
+  mysql-data:
+    driver: local

@@ -1,7 +1,7 @@
 # 当前任务
 
 > 状态：Phase 0，TASK-000 已完成，TASK-001 待收尾（WSL 正式目录对齐），
-> TASK-002 待项目所有者最终确认（实测与 CI 均已通过）
+> TASK-002 实测与 CI 均已通过（待最终确认），TASK-003 进行中
 
 ## 当前里程碑
 
@@ -113,17 +113,67 @@
 
 ## TASK-003：Docker 开发依赖
 
-- 状态：待开始
-- 依赖：TASK-002
+- 状态：进行中
+- 依赖：TASK-002（已完成）；Docker Desktop 已实测可用
 - 背景问题：本地需要可重复启动的 Redis/MySQL 环境。
 - 本次目标：
   - Redis、MySQL Docker Compose。
   - 健康检查、持久化卷、初始化脚本和 `.env.example`。
-- 非范围：不启动 Kafka、etcd 和全部服务。
+- 范围：
+  - `deploy/compose/docker-compose.yml`：Redis 与 MySQL 两个服务。
+  - 具名卷 `redis-data`、`mysql-data`；healthcheck；`restart: unless-stopped`。
+  - `deploy/compose/README.md`：启动、健康检查、日志、停止、清理、备份与恢复。
+  - `.env.example` 按 `docs/06-operations.md` 补充 Compose 需要的变量并加注释。
+  - `migrations/001_create_schema_migrations.sql`：最小建表脚本，验证初始化链路。
+  - `scripts/verify-deps.sh`：依赖环境的验收入口（一条命令）。
+- 非范围：
+  - 不启动 Kafka、etcd 和任何 C++ 服务。
+  - 不实现业务表结构，不接入服务代码。
+  - 不引入 Dockerfile、镜像构建和多节点编排。
+- 相关 ADR：ADR-0001。本轮不新增 ADR。
+- 涉及目录：`deploy/compose/`、`migrations/`、`scripts/`、根 `.env.example`。
+- 接口变化：无。仅新增本地依赖服务的端口与配置约定。
+- 数据变化：新增两个具名 Docker 卷，以及 `realtime_game` 库中的
+  `schema_migrations` 表。
+- 失败场景：
+  - 首次启动需要拉取镜像（Redis 约 40 MB、MySQL 约 200 MB），网络受限会失败。
+  - 宿主机 6379 或 3306 端口被占用会导致启动失败。
+  - 修改 `.env` 中的 MySQL 密码后，既有数据卷仍使用旧密码，会出现认证失败；
+    需要 `down -v` 重建或改回原密码。
+  - 数据卷被 `down -v` 删除会导致数据丢失，文档必须显式警告。
+  - MySQL 初始化脚本只在空数据目录执行一次，重复启动不会重跑。
+- 验收命令（在 WSL 中执行）：
+  ```bash
+  bash scripts/verify-deps.sh
+  ```
+  该脚本内部覆盖：一条命令启动、等待健康、连通性验证、重启后数据保留、
+  停止，并输出每一项的真实结果。
+- 测试要求：不适用单元测试（本任务只涉及 Compose 配置与脚本）；以
+  `verify-deps.sh` 的连通性与持久化验证作为验收依据。
+- 回退方式：`docker compose -f deploy/compose/docker-compose.yml down` 停止容器；
+  如需彻底回退，`down -v` 删除具名卷，并 `git revert` 本次提交。只新增文件，
+  不改动既有代码，回退不影响 TASK-002 成果。
+- 负责人：执行者（写入权）— 本轮由当前会话代理承担，项目所有者审阅与验收。
+- 写入权说明：按 `CLAUDE.md`「协作纪律」，本轮写入权授予当前执行会话，范围为
+  TASK-003 涉及目录。
 - 验收标准：
   - 一条命令启动依赖。
   - 重启后数据卷保留。
   - 连接配置和停止方式有文档。
+- 待确认选择（实施前由项目所有者过目）：
+  - 镜像版本：`redis:8.0`（对应本机 redis-cli 8.0.5）、`mysql:8.4`
+    （对应本机 mysql 客户端 8.4.11），均用 Docker 官方镜像。
+  - Redis 持久化：本轮使用默认 RDB 快照。AOF 留到 Phase 2 引入，理由是
+    `CLAUDE.md` 规定 Redis 不作为唯一真相，现在开启 AOF 属提前引入能力。
+- 实施结果（2026-09-15）：
+  - 已完成并实测通过：一条命令启动、健康检查、连通性、初始化脚本生效、
+    重启后数据保留、停止后数据卷保留。实测数据见 `docs/devlog.md` 的
+    「TASK-003 实施记录」。
+  - 验收命令：`bash scripts/verify-deps.sh`（`--keep` 保留容器，`--down-only` 只停止）。
+  - 服务端实测版本：MySQL `8.4.11`；迁移脚本执行成功，`schema_migrations` 计数为 1。
+  - 未决风险：修改 `.env` 密码不影响已有数据卷；`down -v` 会删数据（文档已警告）；
+    Compose 配置未纳入 CI 校验。
+  - 结论：三项验收标准均已满足，等待项目所有者审阅与合并。
 
 ## TASK-004：brpc Gateway 基线
 
