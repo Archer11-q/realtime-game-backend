@@ -253,18 +253,66 @@
 
 ## TASK-005：登录垂直切片
 
-- 状态：待开始
-- 依赖：TASK-003、TASK-004
+- 状态：进行中
+- 依赖：TASK-003（已完成）、TASK-004（brpc 工具链验证部分已完成）
 - 背景问题：需要验证从客户端请求到持久化会话的最小链路。
 - 本次目标：
   - 登录接口。
   - Session 创建和 Redis 存储。
   - 返回玩家信息。
 - 非范围：不做注册、第三方登录、匹配。
+- **范围调整（经项目所有者确认，2026-09-16）**：
+  TASK-004 只完成了「brpc 工具链可用性验证」，其原始范围中的公共 Proto、
+  错误码、健康检查与优雅退出尚未实现。经确认，这些剩余项**并入本任务**，
+  避免两轮重复搭建 Gateway 骨架。因此本任务的实际范围是
+  「Gateway 最小可运行服务 + 登录切片」。
+- 范围：
+  - `api/proto/gateway.proto`：登录、查询当前玩家、登出三个接口与统一错误体。
+  - `include/common/token.hpp` + `src/common/token.cpp`：Token 生成与格式校验。
+  - `src/gateway/`：服务实现、测试账号目录、Redis 会话存储、服务入口、错误码映射。
+  - HTTP 状态码映射：错误语义必须体现在传输层，而不只是 JSON 体。
+  - `scripts/verify-login.sh`：端到端验收入口。
+- 非范围：
+  - 不实现注册系统，不把账号密码写入 MySQL。
+  - 不实现 Token 刷新（只做短期会话）。
+  - 不实现匹配、房间、WebSocket。
+- 相关 ADR：本轮不新增 ADR，但落地了 `docs/07-open-decisions.md` 的 D-002 决策。
+- 涉及目录：`api/proto/`、`include/common/`、`src/common/`、`src/gateway/`、
+  `scripts/`、`tests/`、根 `CMakeLists.txt`、`CMakePresets.json`。
+- 接口变化：新增 3 个 HTTP 接口，路径依 `docs/05-api-and-data.md` 第 2 节
+  （`POST /api/v1/login`、`GET /api/v1/players/me`、`POST /api/v1/logout`）。
+- 数据变化：Redis 新增两类 Key，均带 `<env>:gateway:` 前缀并设置 TTL：
+  - `<env>:gateway:session:<token>`：会话 Hash
+  - `<env>:gateway:idem:login:<request_id>`：登录幂等映射
+- 失败场景：
+  - Redis 不可用：返回 503 UNAVAILABLE，不伪装成功；服务不退出，Redis 恢复后
+    无需重启即可继续服务。
+  - 无效输入（空账号、超长字段、非法 client_type）：返回 400，不访问依赖。
+  - 凭据错误或账号禁用：返回 401；账号不存在与密码错误返回同一 reason，
+    避免泄露账号是否存在。
+  - 重复 request_id：返回同一 Token，不重复创建会话。
+  - 并发同 request_id：`SET NX` 保证只有一个胜出，失败方清理自己写入的会话
+    并返回胜出者 Token。
+- 验收命令（在 WSL 中执行）：
+  ```bash
+  bash scripts/verify-login.sh
+  ```
+- 测试要求：单元测试用内存假存储覆盖全部错误路径；端到端测试覆盖正常登录、
+  幂等、无效输入与 Redis 故障恢复。
+- 回退方式：删除新增文件并恢复 `CMakeLists.txt`、`CMakePresets.json`；
+  Redis 中的 Key 有 TTL，无需手工清理。
+- 负责人：执行者（写入权）— 本轮由当前会话代理承担，项目所有者审阅与验收。
+- 写入权说明：按 `CLAUDE.md`「协作纪律」，本轮写入权授予当前执行会话。
 - 验收标准：
   - 正常登录成功。
   - 无效输入、重复登录和 Redis 不可用路径有测试。
   - 形成 `v0.1-bootstrap` 里程碑。
+
+## TASK-006（Backlog）：后续待办
+
+- 将 brpc 预设与 Compose 配置纳入 CI 覆盖。
+- 实现 `docs/05-api-and-data.md` 中其余接口（匹配、房间、结果）。
+- Token 刷新与长期会话策略（Phase 2）。
 
 ## 任务完成定义
 

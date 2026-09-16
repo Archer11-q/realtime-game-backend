@@ -81,6 +81,26 @@ function(rgbt_set_project_warnings target)
   endif()
 endfunction()
 
+function(rgbt_set_test_warnings target)
+  # 测试代码的告警策略与产品代码不同。
+  #
+  # 原因：GTest 的 TEST / TEST_F 宏展开出的静态函数只通过框架内部注册表引用，
+  # GCC 在 -Wunused-function 下会误报为「未被使用」。这是框架的固有形态，
+  # 不是代码缺陷，因此测试目标保留基础告警，但不把警告视为错误。
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /W4)
+  else()
+    target_compile_options(
+      ${target}
+      PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wno-unused-function
+    )
+  endif()
+endfunction()
+
 function(rgbt_apply_sanitizer target)
   if(NOT RGBT_ENABLE_SANITIZER)
     return()
@@ -93,11 +113,65 @@ function(rgbt_apply_sanitizer target)
   target_link_options(${target} PRIVATE -fsanitize=address)
 endfunction()
 
+# 测试框架必须在 src 之前准备完毕。
+#
+# 原因：src/gateway 需要根据「GTest 是否可用」决定是否加入自己的测试目标，
+# 而 CMake 按 add_subdirectory 的顺序处理，且子目录之间不共享普通变量作用域。
+# 因此在顶层统一解析好依赖并写入缓存变量，再处理 src 与 tests。
+include(CTest)
+
+set(RGBT_TESTS_AVAILABLE
+    ON
+    CACHE INTERNAL "GoogleTest 是否可用"
+    FORCE
+)
+
+if(BUILD_TESTING AND RGBT_BUILD_TESTS)
+  if(RGBT_USE_VCPKG_TOOLCHAIN)
+    # vcpkg 模式下优先使用包管理器提供的 GTest；没有就跳过测试并说明原因，
+    # 而不是中断配置，因为 brpc 预设的主要目的是验证服务可用性。
+    find_package(GTest CONFIG QUIET)
+    if(NOT GTest_FOUND)
+      set(RGBT_TESTS_AVAILABLE
+          OFF
+          CACHE INTERNAL "GoogleTest 是否可用"
+          FORCE
+      )
+      message(
+        STATUS
+          "vcpkg 中未安装 gtest，跳过单元测试。"
+          " 需要测试时执行: vcpkg install gtest"
+      )
+    else()
+      message(STATUS "使用 vcpkg 提供的 GoogleTest，单元测试已启用")
+    endif()
+  else()
+    include(FetchContent)
+    # 固定到 tag 以保证可复现；升级依赖需要单独提交并记录原因。
+    # SYSTEM 让第三方头文件的警告不污染本项目的 -Werror。
+    FetchContent_Declare(
+      googletest
+      SYSTEM
+      URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz
+    )
+    # Windows 上避免 googletest 覆盖父工程的运行时库设置。
+    set(gtest_force_shared_crt
+        ON
+        CACHE BOOL "" FORCE
+    )
+    FetchContent_MakeAvailable(googletest)
+  endif()
+else()
+  set(RGBT_TESTS_AVAILABLE
+      OFF
+      CACHE INTERNAL "GoogleTest 是否可用"
+      FORCE
+  )
+endif()
+
 add_subdirectory(src)
 
-# 测试骨架：使用标准 CTest 模块提供的 BUILD_TESTING 开关。
-include(CTest)
-if(BUILD_TESTING AND RGBT_BUILD_TESTS)
+if(RGBT_TESTS_AVAILABLE)
   enable_testing()
   add_subdirectory(tests)
 endif()

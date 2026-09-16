@@ -421,6 +421,97 @@
 - 决定后续方向：进入完整 Gateway 实现（含 proto 契约与错误码），
   或先补齐 CI 覆盖。
 
+## TASK-005 实施记录（2026-09-16）
+
+### 背景修正
+
+TASK-004 只交付了「brpc 工具链可用性验证」，其原始目标中的公共 Proto、错误码、
+健康检查与优雅退出并未实现（`api/proto/` 当时只有 `.gitkeep`）。而 TASK-005 的
+登录接口需要挂在 Gateway 上，Gateway 此前只有一个冒烟程序，属硬阻塞。
+经项目所有者确认，将 TASK-004 剩余项并入 TASK-005，一次完成
+「Gateway 最小可运行服务 + 登录切片」。
+
+### 完成
+
+- `api/proto/gateway.proto`：`GatewayService` 定义 `Login`、`GetCurrentPlayer`、
+  `Logout` 三个 RPC，以及 `PlayerInfo`、`Error`、`ErrorCode` 公共结构。
+  字段只追加，符合 `docs/05-api-and-data.md` 第 7 节的演进规则。
+- `include/common/token.hpp` + `src/common/token.cpp`：Token 生成与格式校验。
+- `src/gateway/error.{hpp,cpp}`：错误码到 HTTP 状态码的映射。
+- `src/gateway/player_directory.{hpp,cpp}`：测试身份目录（内置 3 个账号，
+  含一个 disabled 账号用于覆盖失败路径）。
+- `src/gateway/session_store.hpp`：会话存储接口，便于测试注入。
+- `src/gateway/redis_session_store.{hpp,cpp}`：基于 hiredis 的实现，含连接超时、
+  断线重连与幂等写入。
+- `src/gateway/gateway_service.{hpp,cpp}`：三个接口的服务实现。
+- `src/gateway/gateway_main.cpp`：服务入口，用 restful 映射暴露 HTTP 路径。
+- `src/gateway/unit/gateway_service_test.cpp`：25 个单元测试。
+- `scripts/verify-login.sh`：端到端验收入口。
+
+### 决策
+
+- 落地 `docs/07-open-decisions.md` D-002（经项目所有者确认）：
+  - Token 使用**不透明随机串**而非 JWT：第一版不需要自包含性，会话集中在
+    Redis，便于统一吊销与过期控制。
+  - **不把账号密码存入 MySQL**，使用内置测试身份。
+  - **不实现 Token 刷新**，只做短期会话。
+- HTTP 状态码必须在传输层体现。brpc 默认把 protobuf 响应序列化为 JSON body，
+  但 HTTP 状态恒为 200，因此显式调用
+  `cntl->http_response().set_status_code(...)`。
+- Redis Key 带环境和服务前缀并设置 TTL，符合 `docs/05-api-and-data.md` 第 4 节。
+- Redis 不可用时服务**不退出**，请求返回 503；恢复后无需重启。避免依赖抖动
+  导致服务反复重启。
+- 测试代码使用独立告警策略（`rgbt_set_test_warnings`）：GTest 的 `TEST_F`
+  宏生成静态函数，在 `-Werror -Wunused-function` 下会误报。
+
+### 验证
+
+- 命令：`cmake --preset brpc-debug && cmake --build --preset brpc-debug`
+- 结果：配置与构建均成功，生成 `bin/rgbt_gateway` 与 `rgbt_gateway_tests`。
+- 结果：proto 代码由 vcpkg 的 `protoc 33.4.0` 生成成功。
+- 命令：`ctest --test-dir build/brpc-debug --output-on-failure`
+- 结果：**29 个测试全部通过**（gateway 25 个 + common 4 个）。
+- 命令：启动网关并对各 HTTP 路径发请求（此时 Redis 未启动）
+- 结果：HTTP 状态码与设计一致：
+  - 错误密码 -> **401**
+  - 正确凭据但 Redis 不可用 -> **503**，`reason=session_store_unavailable`
+  - 无 Token -> **400**
+  - 非法 Token -> **400**
+  - `/health` -> 200，`/status` -> 200（brpc 内置）
+  - 不存在的路径 -> 404
+- 结果：收到 SIGTERM 后退出码 0，输出「已优雅退出」。
+- 结果：网关启动日志正确报告 Redis 当前不可用，且进程保持存活。
+
+### 未验证（缺 Docker）
+
+- 以下端到端路径需要在 Redis 可用时验证，本次因 Docker Desktop 未启动而**未运行**：
+  正常登录、登录幂等（同 request_id 返回同一 Token）、不同 request_id 得到不同
+  Token、有效 Token 查询玩家、登出后 Token 失效、Redis 停止时返回 503、
+  Redis 恢复后无需重启即可登录。
+- 结论：`scripts/verify-login.sh` 已具备覆盖以上全部场景的能力，
+  但**必须实际运行通过后才能判定 TASK-005 完成**。
+
+### 问题与风险（本轮实际踩到并解决的）
+
+- `player_directory` 只有显式构造函数而无默认构造，导致测试夹具把它当成员声明时
+  产生「默认构造被删除」并级联出 20 条报错。已补默认构造并注释原因。
+- `error` 模块原本放在 `src/common/`，却需要 include gateway 的生成代码，
+  造成公共库反向依赖网关契约。已移到 `src/gateway/`。
+- 忘记把 `token.cpp` 加入 `src/common/CMakeLists.txt`，导致链接期
+  `undefined reference`。
+- `find_package(GTest)` 原本放在 `tests/` 子目录，而 `src/gateway` 在其之前被
+  处理，且子目录间不共享普通变量作用域，导致 gateway 测试目标未生成。
+  已把依赖解析提到顶层 `CMakeLists.txt`。
+- protobuf 生成的枚举含 sentinel 值，`switch` 未覆盖时触发 `-Werror=switch`。
+- `verify-login.sh` 最初用 `ctest -R gateway` 过滤，但测试名为
+  `GatewayServiceTest.*`（不含小写 gateway），过滤不到，已改为跑完整套件。
+
+### 下一步
+
+- 项目所有者启动 Docker Desktop，运行 `bash scripts/verify-login.sh` 完成验收。
+- 通过后形成 `v0.1-bootstrap` 里程碑。
+- 将 brpc 预设与 Compose 纳入 CI（已记入 TASK-006 Backlog）。
+
 ## 日志模板
 
 ```markdown

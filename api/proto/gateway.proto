@@ -1,0 +1,146 @@
+// Gateway 对外接口契约。
+//
+// 说明：
+//   * 浏览器通过 Gateway 的 HTTP 接口访问，本文件同时是 HTTP 接口与内部
+//     RPC 的契约来源。路径与字段依据 docs/05-api-and-data.md 第 2 节。
+//   * 字段只追加，不修改既有标签号；删除字段必须先标记 reserved。
+//   * TASK-005 只包含登录切片：登录、查询当前玩家、登出。
+//     匹配与房间接口在后续任务中追加。
+
+syntax = "proto3";
+
+package rgbt.gateway.v1;
+
+option cc_generic_services = true;
+
+// ---------------------------------------------------------------------------
+// 公共结构
+// ---------------------------------------------------------------------------
+
+// 玩家公开信息。不包含密码、Token 等敏感字段。
+message PlayerInfo {
+  // 玩家唯一标识。
+  string player_id = 1;
+
+  // 展示名。
+  string display_name = 2;
+
+  // 账号状态。取值：active / disabled。
+  string status = 3;
+}
+
+// 错误码。与 docs/05-api-and-data.md 第 3 节的分类对应：
+//   INVALID_ARGUMENT  输入错误，调用方不应重试
+//   UNAUTHENTICATED   凭证缺失或无效
+//   NOT_FOUND         资源不存在
+//   UNAVAILABLE       依赖暂时失败，可有限重试
+//   INTERNAL          未分类内部错误
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  INVALID_ARGUMENT = 1;
+  UNAUTHENTICATED = 2;
+  NOT_FOUND = 3;
+  UNAVAILABLE = 4;
+  INTERNAL = 5;
+}
+
+// 统一错误体。
+message Error {
+  ErrorCode code = 1;
+
+  // 稳定可判定的错误标识，例如 invalid_credential。
+  string reason = 2;
+
+  // 面向开发者的描述，不包含敏感信息。
+  string message = 3;
+
+  // 请求追踪 ID，与请求中的 request_id 对应。
+  string request_id = 4;
+}
+
+// ---------------------------------------------------------------------------
+// 登录
+// ---------------------------------------------------------------------------
+
+message LoginRequest {
+  // 玩家账号名。长度 1..64。
+  string account = 1;
+
+  // 玩家密码。长度 1..128。仅用于校验，不写入日志。
+  string password = 2;
+
+  // 幂等键。同一 request_id 重复登录返回同一会话，不重复创建。
+  string request_id = 3;
+
+  // 客户端类型，用于会话记录。取值：web / bot。
+  string client_type = 4;
+}
+
+message LoginResponse {
+  // HTTP 状态码语义。200 成功；其余与 error.code 对应。
+  int32 status_code = 1;
+
+  // 成功时返回。
+  string token = 2;
+
+  // Token 有效期（秒）。
+  int32 expires_in_seconds = 3;
+
+  PlayerInfo player = 4;
+
+  // 失败时返回。
+  Error error = 5;
+}
+
+// ---------------------------------------------------------------------------
+// 当前玩家
+// ---------------------------------------------------------------------------
+
+message GetCurrentPlayerRequest {
+  // 会话 Token。缺失或无效返回 UNAUTHENTICATED。
+  string token = 1;
+
+  string request_id = 2;
+}
+
+message GetCurrentPlayerResponse {
+  int32 status_code = 1;
+
+  PlayerInfo player = 2;
+
+  Error error = 3;
+}
+
+// ---------------------------------------------------------------------------
+// 登出
+// ---------------------------------------------------------------------------
+
+message LogoutRequest {
+  string token = 1;
+
+  string request_id = 2;
+}
+
+message LogoutResponse {
+  int32 status_code = 1;
+
+  Error error = 2;
+}
+
+// ---------------------------------------------------------------------------
+// 服务定义
+// ---------------------------------------------------------------------------
+
+service GatewayService {
+  // 使用测试身份登录，创建会话并返回 Token。
+  // HTTP: POST /api/v1/login
+  rpc Login(LoginRequest) returns (LoginResponse);
+
+  // 查询当前 Token 对应的玩家信息。
+  // HTTP: GET /api/v1/players/me
+  rpc GetCurrentPlayer(GetCurrentPlayerRequest) returns (GetCurrentPlayerResponse);
+
+  // 主动结束会话。
+  // HTTP: POST /api/v1/logout
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+}
