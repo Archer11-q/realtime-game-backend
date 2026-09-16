@@ -4,8 +4,11 @@
 #include <brpc/controller.h>
 #include <brpc/http_status_code.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "common/token.hpp"
 #include "error.hpp"
@@ -29,6 +32,51 @@ void ApplyHttpStatus(::google::protobuf::RpcController* controller, std::int32_t
         return;
     }
     cntl->http_response().set_status_code(status_code);
+}
+
+/// 从 HTTP 请求中取出 Token。
+///
+/// 为什么需要这个函数：brpc 只把 HTTP body（JSON）映射到 protobuf 字段，
+/// **不会**把 HTTP 头映射进任何字段（见官方文档 http_service.md 中 headers 与
+/// query string 的说明）。因此 `Authorization` 头必须由服务自己读取，否则请求中的
+/// token 字段永远是空字符串，表现为「所有携带 Token 的请求都报 token_required」。
+///
+/// 取值顺序：
+///   1. 请求体中的 token 字段（纯 RPC 调用或显式传参时使用）；
+///   2. `Authorization: Bearer <token>`，HTTP 客户端的标准做法；
+///   3. query string 的 `token`，便于用浏览器或 curl 直接调试。
+///
+/// 无 HTTP 上下文时（例如单元测试直接调用服务）只使用请求体字段。
+std::string ExtractToken(::google::protobuf::RpcController* controller,
+                         const std::string& body_token) {
+    if (!body_token.empty()) {
+        return body_token;
+    }
+    auto* cntl = static_cast<brpc::Controller*>(controller);
+    if (cntl == nullptr || !cntl->has_http_request()) {
+        return {};
+    }
+    const brpc::HttpHeader& header = cntl->http_request();
+
+    if (const std::string* auth = header.GetHeader("Authorization"); auth != nullptr) {
+        // 接受 "Bearer <token>" 与直接给出 token 两种形式，前缀大小写不敏感。
+        constexpr std::string_view kBearer = "bearer ";
+        if (auth->size() > kBearer.size()) {
+            std::string prefix = auth->substr(0, kBearer.size());
+            std::transform(prefix.begin(), prefix.end(), prefix.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (prefix == kBearer) {
+                return auth->substr(kBearer.size());
+            }
+        }
+        return *auth;
+    }
+
+    if (const std::string* query_token = header.uri().GetQuery("token"); query_token != nullptr) {
+        return *query_token;
+    }
+
+    return {};
 }
 
 /// 校验登录请求的输入。返回空字符串表示通过，否则返回失败原因。
@@ -158,7 +206,9 @@ void GatewayServiceImpl::GetCurrentPlayer(::google::protobuf::RpcController* con
                                           ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
 
-    const std::string token = request->token();
+    // 注意：Token 不能只从 request->token() 取。brpc 不把 HTTP 头映射进 protobuf
+    // 字段，携带 Authorization 头的请求在这里会是空字符串。
+    const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
 
     const std::string token_error = ValidateToken(token);
@@ -212,7 +262,8 @@ void GatewayServiceImpl::Logout(::google::protobuf::RpcController* controller,
                                 ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
 
-    const std::string token = request->token();
+    // 同 GetCurrentPlayer：Token 需要从 HTTP 头或 query string 中提取。
+    const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
 
     const std::string token_error = ValidateToken(token);

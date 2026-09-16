@@ -98,6 +98,23 @@ if [ "$manage_docker" -eq 1 ]; then
   else
     fail "redis 未达到 healthy"
   fi
+
+  # 清理上一次运行留下的 Key。
+  #
+  # 为什么需要：本脚本使用的是固定的 env_prefix（dev），上一次运行创建的会话与
+  # 幂等映射会残留 7 天。不清理会导致结果不可复现——例如某个 request_id 已存在
+  # 幂等映射时，本次登录会直接返回旧 Token，而该 Token 对应的会话可能已被登出
+  # 或从未创建，表现为「刚拿到的 Token 查询失败」这类难以定位的偶发问题。
+  stale=$(docker exec rgbt-redis redis-cli --scan --pattern 'dev:gateway:*' 2>/dev/null | wc -l)
+  if [ "$stale" -gt 0 ]; then
+    docker exec rgbt-redis redis-cli --scan --pattern 'dev:gateway:*' 2>/dev/null \
+      | while IFS= read -r key; do
+          [ -n "$key" ] && docker exec rgbt-redis redis-cli del "$key" >/dev/null 2>&1
+        done
+    ok "已清理上次运行残留的 $stale 个 dev:gateway:* Key"
+  else
+    ok "无残留 Key"
+  fi
   echo
 fi
 
@@ -240,7 +257,14 @@ if [ "$code" = "200" ] && grep -q '"player_id":"p-0001"' /tmp/resp.json; then
   ok "有效 Token 查询返回 200 与正确玩家"
 else
   fail "有效 Token 查询失败：HTTP $code"
-  cat /tmp/resp.json; echo
+  # 失败时打印用于诊断的关键信息：Token 本身、Redis 中实际存在的会话 Key。
+  echo "   使用的 Token: [$token]（长度 ${#token}）"
+  echo "   响应体: $(cat /tmp/resp.json)"
+  if [ "$manage_docker" -eq 1 ]; then
+    echo "   Redis 中的 session Key:"
+    docker exec rgbt-redis redis-cli --scan --pattern 'dev:gateway:session:*' 2>/dev/null | sed 's/^/     /'
+    echo "   期望的 Key: dev:gateway:session:$token"
+  fi
 fi
 
 code=$(http_get "/api/v1/players/me?token=invalid-token-with-bad-chars!")
