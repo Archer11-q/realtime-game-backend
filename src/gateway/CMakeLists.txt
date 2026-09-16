@@ -81,17 +81,6 @@ set_target_properties(
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# ---------------------------------------------------------------------------
-# 单元测试
-# ---------------------------------------------------------------------------
-
-if(RGBT_BUILD_TESTS AND RGBT_TESTS_AVAILABLE)
-  add_executable(rgbt_gateway_tests unit/gateway_service_test.cpp)
-  target_link_libraries(rgbt_gateway_tests PRIVATE rgbt_gateway_lib GTest::gtest_main)
-  target_include_directories(rgbt_gateway_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/unit")
-  rgbt_set_test_warnings(rgbt_gateway_tests)
-  rgbt_apply_sanitizer(rgbt_gateway_tests)
-  rgbt_apply_sanitizer(rgbt_gateway_lib)
-  include(GoogleTest)
-  gtest_discover_tests(rgbt_gateway_tests)
-endif()
+# 本目录不定义测试目标，也不判断 GoogleTest 是否可用：测试放在
+# tests/unit/gateway/，由 tests 目录自行解析测试依赖。这样服务目录只负责
+# 编译服务本身。
