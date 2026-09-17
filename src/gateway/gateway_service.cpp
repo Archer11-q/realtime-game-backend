@@ -120,7 +120,7 @@ std::string ValidateToken(const std::string& token) {
 
 }  // namespace
 
-GatewayServiceImpl::GatewayServiceImpl(SessionStore* sessions, const PlayerDirectory* players,
+GatewayServiceImpl::GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* players,
                                        std::int32_t session_ttl_seconds)
     : sessions_(sessions),
       players_(players),
@@ -173,6 +173,16 @@ void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
     if (credential == CredentialStatus::kAccountDisabled) {
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAUTHENTICATED,
                                               "account_disabled", "账号已被禁用", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+    if (credential == CredentialStatus::kUnavailable) {
+        // 玩家档案来自 MySQL：依赖不可用时返回 503。该判断必须排在凭据判断之后，
+        // 避免用依赖故障掩盖「密码错误」这类确定性结果。
+        const std::int32_t status =
+            FillError(response->mutable_error(), ErrorCode::UNAVAILABLE, "player_store_unavailable",
+                      "玩家档案暂时不可用，请稍后重试", request_id);
         response->set_status_code(status);
         ApplyHttpStatus(controller, status);
         return;

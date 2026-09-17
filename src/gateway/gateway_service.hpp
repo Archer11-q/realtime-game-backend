@@ -34,7 +34,7 @@ inline constexpr std::size_t kMaxTokenLength = 256;
 
 class GatewayServiceImpl : public rgbt::gateway::v1::GatewayService {
 public:
-    GatewayServiceImpl(SessionStore* sessions, const PlayerDirectory* players,
+    GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* players,
                        std::int32_t session_ttl_seconds = kDefaultSessionTtlSeconds);
 
     void Login(::google::protobuf::RpcController* controller,
@@ -62,7 +62,9 @@ private:
                                   const std::string& message, const std::string& request_id);
 
     SessionStore* sessions_;
-    const PlayerDirectory* players_;
+    // 不加 const：接口方法本身不是 const（实现需要查询外部依赖），
+    // 与 sessions_ 的写法保持一致。
+    PlayerDirectory* players_;
     std::int32_t session_ttl_seconds_;
 };
 

@@ -98,13 +98,19 @@ etcd：服务注册、发现、租约
 
 ## 当前状态
 
-当前处于 `Phase 0：项目基线和环境建设`。项目方向、服务边界、任务流程和验收标准
-已于 2026-09-14 确认，代码尚未实现。仓库已连接
-`git@github.com:Archer11-q/realtime-game-backend.git`，首次提交为
-`f685be0 chore: 初始化仓库基础框架`。
+当前处于 `Phase 1：最小业务闭环`。Phase 0 已完成（2026-09-17），其退出标准均已
+验证：CI 在功能分支与 main 上均为 success，登录链路的单元测试与端到端验收全部通过。
 
-TASK-001 尚有一个收尾项：WSL 正式目录需要与 GitHub 对齐后，作为唯一正式开发
-环境。当前任务见 [TASKS.md](docs/TASKS.md)，开发过程见
+已完成的能力：
+
+- Gateway 提供登录、查询当前玩家、登出三个接口，会话存于 Redis。
+- 玩家档案存于 MySQL，登录时从 `players` 表读取（Phase 1 临时安排，见 ADR-0002）。
+- brpc + Protobuf 的构建与运行链路已验证（vcpkg 提供依赖）。
+- Redis 与 MySQL 通过 Docker Compose 启动，含健康检查与数据卷。
+- 两者的不可用路径均返回 503，且恢复后无需重启服务。
+- CI 覆盖三个构建预设与代码格式检查。
+
+当前任务见 [TASKS.md](docs/TASKS.md)，开发过程见
 [devlog.md](docs/devlog.md)。
 
 ## 仓库结构

@@ -1,7 +1,7 @@
-# gateway 服务：TASK-005 登录切片。
+# gateway 服务：TASK-005 登录切片 + TASK-006 玩家档案走数据库。
 #
-# 依赖 vcpkg 提供的 brpc 与 hiredis，因此本目录只在启用 vcpkg 工具链时加入
-# （见 src/CMakeLists.txt），保证默认构建与 CI 不受影响。
+# 依赖 vcpkg 提供的 brpc、hiredis 与 libmariadb，因此本目录只在启用 vcpkg
+# 工具链时加入（见 src/CMakeLists.txt），保证默认构建与 CI 不受影响。
 #
 # 本目录还负责生成 api/proto 下的 Protobuf 代码：契约是接口真相来源，
 # 生成物放在构建目录，不进入版本库。
@@ -15,6 +15,11 @@ find_package(Protobuf REQUIRED)
 # 必须先 find_package，否则链接时找不到该 IMPORTED 目标。
 find_package(unofficial-brpc CONFIG REQUIRED)
 find_package(hiredis CONFIG REQUIRED)
+# MySQL 客户端。TASK-006 起用于读取玩家档案（Phase 1 临时安排，见 ADR-0002）。
+find_package(unofficial-libmariadb CONFIG REQUIRED)
+# 密码摘要使用 OpenSSL 的 EVP 接口。openssl 已由 brpc 与 libmariadb 引入，
+# 这里显式声明以便直接使用其头文件，不新增组件。
+find_package(OpenSSL REQUIRED)
 
 set(RGBT_PROTO_DIR "${PROJECT_SOURCE_DIR}/api/proto")
 set(RGBT_PROTO_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto-gen")
@@ -48,10 +53,15 @@ endif()
 
 add_library(
   rgbt_gateway_lib STATIC
+  database_player_directory.cpp
   error.cpp
   gateway_service.cpp
-  player_directory.cpp
+  in_memory_player_directory.cpp
+  mysql_connection.cpp
+  mysql_player_reader.cpp
+  password_hash.cpp
   redis_session_store.cpp
+  test_credentials.cpp
 )
 
 target_include_directories(rgbt_gateway_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -64,6 +74,8 @@ target_link_libraries(
   PRIVATE
     unofficial::brpc::brpc
     hiredis::hiredis
+    unofficial::libmariadb
+    OpenSSL::Crypto
 )
 
 rgbt_set_project_warnings(rgbt_gateway_lib)

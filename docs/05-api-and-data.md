@@ -125,6 +125,44 @@
 - 战绩和结算使用唯一约束保护幂等。
 - 不使用 MySQL 保存高频帧日志。
 
+#### 已实现的表（截至 TASK-006）
+
+**`players` — 玩家档案**
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `player_id` | `VARCHAR(64)` | 主键，玩家唯一标识，如 `p-0001` |
+| `account` | `VARCHAR(64)` | 登录账号名，`uk_players_account` 唯一约束 |
+| `display_name` | `VARCHAR(64)` | 展示名 |
+| `status` | `VARCHAR(16)` | `active` / `disabled`，默认 `active` |
+| `created_at` | `TIMESTAMP` | 创建时间 |
+| `updated_at` | `TIMESTAMP` | 更新时间，自动刷新 |
+
+- 所有者：Player/State（正式归属）。
+- 访问方式：Phase 1 期间由 Gateway **只读**，依据
+  [ADR-0002](adr/0002-gateway-temporary-player-ownership.md)；其余服务不得直接读写。
+- **不含密码列**：第一版账号密码保留在代码中作为测试数据，见
+  `docs/07-open-decisions.md` 的 D-002。
+
+**`match_results` — 对局结果**
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `match_id` | `VARCHAR(64)` | 主键，同时是结算幂等业务键 |
+| `room_id` | `VARCHAR(64)` | 来源房间，可空 |
+| `winner_id` | `VARCHAR(64)` | 胜者 `player_id`，平局为 NULL |
+| `player_count` | `INT` | 参战人数 |
+| `started_at` | `TIMESTAMP` | 开局时间，可空 |
+| `finished_at` | `TIMESTAMP` | 结束时间，默认当前时间 |
+
+- 所有者：Settlement（正式归属）。
+- 访问方式：Phase 1 不写入，仅建表；Settlement Worker 在 Phase 5 落地后写入。
+
+迁移文件位于 `migrations/`，按 `NNN_描述.sql` 命名且必须幂等。
+注意：`/docker-entrypoint-initdb.d` 只在数据目录为空时执行一次，
+因此新增迁移需显式应用（`scripts/verify-login.sh` 会做这件事）。
+`004_seed_test_players.sql` 含测试数据，**仅用于开发环境**，文件头已标注。
+
 ### Kafka
 
 建议事件：

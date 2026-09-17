@@ -2,15 +2,18 @@
 #
 # verify-login.sh - TASK-005 登录切片验收入口
 #
-# 覆盖 TASK-005 的三条验收标准：
-#   1. 正常登录成功，且同一 request_id 重复登录返回同一会话（幂等）
-#   2. 无效输入被拒绝
-#   3. Redis 不可用时返回 503 而非假成功，且恢复后无需重启服务
+# 覆盖 TASK-005 与 TASK-006 的验收标准：
+#   1. 迁移可重复执行，players 与 match_results 表结构正确（TASK-006）
+#   2. 正常登录成功，且同一 request_id 重复登录返回同一会话（幂等）
+#   3. 无效输入被拒绝
+#   4. 玩家档案确实来自 MySQL：停掉 MySQL 时登录返回 503 而不是成功
+#   5. Redis 或 MySQL 不可用时返回 503 而非假成功，且恢复后无需重启服务
 #
 # 用法：
-#   bash scripts/verify-login.sh              # 完整验收
-#   bash scripts/verify-login.sh --keep       # 结束后保留网关进程
-#   bash scripts/verify-login.sh --no-docker  # 复用已启动的 Redis（不做启停）
+#   bash scripts/verify-login.sh                # 完整验收
+#   bash scripts/verify-login.sh --schema-only  # 只验证迁移与表结构
+#   bash scripts/verify-login.sh --keep         # 结束后保留网关进程
+#   bash scripts/verify-login.sh --no-docker    # 复用已启动的依赖（不做启停）
 #
 # 前置：Docker Desktop 已启动；deploy/compose/.env 存在（缺失时由本脚本生成）。
 
@@ -22,18 +25,25 @@ repo_root="$(pwd)"
 compose_file="deploy/compose/docker-compose.yml"
 env_file="deploy/compose/.env"
 env_example="deploy/compose/.env.example"
-gateway_port=8080
+# 网关端口。候选列表以约定端口 8080 开头，被占用时依次尝试其它端口。
+# 为什么必须自动挑选并显式预检：端口冲突时网关会启动失败，而所有 HTTP 请求会打到
+# 占用端口的那个服务上，表现为莫名其妙的 404，而不是「端口冲突」这种可定位的错误。
+# 注意这是**环境问题，不是默认值问题**：进程默认端口仍与 .env.example 保持一致。
+gateway_port=""
+port_candidates=(8080 18080 18081 18082 18090 28080)
 preset="brpc-debug"
 binary="build/$preset/bin/rgbt_gateway"
 keep_running=0
 manage_docker=1
+schema_only=0
 
 for arg in "$@"; do
   case "$arg" in
     --keep) keep_running=1 ;;
     --no-docker) manage_docker=0 ;;
+    --schema-only) schema_only=1 ;;
     -h | --help)
-      sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "未知参数: $arg" >&2; exit 2 ;;
@@ -70,6 +80,36 @@ if [ ! -f "$env_file" ]; then
 else
   ok "$env_file 已存在"
 fi
+
+# 加载配置。
+#
+# 必须在使用 MYSQL_* 等变量之前完成：脚本启用了 set -u，未定义变量会直接终止。
+# 这些变量用于以业务账号连接数据库（与应用运行时的配置保持一致）。
+# shellcheck disable=SC1090
+set -a
+. "./$env_file"
+set +a
+ok "配置已加载（库: ${MYSQL_DATABASE} 账号: ${MYSQL_USER}）"
+
+# 挑选一个空闲端口。
+# 必须显式预检：若端口被占用，网关会启动失败，而所有 HTTP 请求会打到占用端口的
+# 那个服务上（表现为莫名其妙的 404），而不是给出「端口冲突」这种可定位的错误。
+port_in_use() {
+  ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+}
+for candidate in "${port_candidates[@]}"; do
+  if ! port_in_use "$candidate"; then
+    gateway_port="$candidate"
+    break
+  fi
+done
+if [ -z "$gateway_port" ]; then
+  echo "以下候选端口均被占用，无法启动网关：${port_candidates[*]}" >&2
+  echo "正在监听的端口：" >&2
+  ss -ltnp 2>/dev/null | grep -E ':(8080|18080|18081|18082)' >&2 || true
+  exit 1
+fi
+ok "选用空闲端口 $gateway_port"
 
 if [ "$manage_docker" -eq 1 ]; then
   if ! docker info >/dev/null 2>&1; then
@@ -118,7 +158,88 @@ if [ "$manage_docker" -eq 1 ]; then
   echo
 fi
 
-# ---------- 2. 构建 ----------
+# ---------- 1b. 启动 MySQL 并应用迁移 ----------
+mysql_query() {
+  docker exec rgbt-mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -D "$MYSQL_DATABASE" \
+    -N -B -e "$1" 2>/dev/null
+}
+
+if [ "$manage_docker" -eq 1 ]; then
+  echo "===== 1b. 启动 MySQL 并应用迁移 ====="
+  if compose up -d mysql >/dev/null 2>&1; then
+    ok "compose 启动 mysql 成功"
+  else
+    fail "compose 启动 mysql 失败"
+  fi
+  for _ in $(seq 1 60); do
+    state="$(docker inspect -f '{{.State.Health.Status}}' rgbt-mysql 2>/dev/null)"
+    [ "$state" = "healthy" ] && break
+    sleep 3
+  done
+  if [ "$(docker inspect -f '{{.State.Health.Status}}' rgbt-mysql 2>/dev/null)" = "healthy" ]; then
+    ok "mysql 健康"
+  else
+    fail "mysql 未达到 healthy"
+  fi
+
+  # 显式应用迁移。
+  #
+  # 为什么不能只依赖容器的 /docker-entrypoint-initdb.d：该目录只在数据目录为空
+  # （首次启动或删除数据卷后）执行一次。已有数据卷不会重跑，因此新增迁移必须
+  # 显式应用。这也顺带验证了迁移脚本可重复执行（幂等）。
+  applied=0
+  for migration in migrations/*.sql; do
+    [ -f "$migration" ] || continue
+    if docker exec -i rgbt-mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" \
+        -D "$MYSQL_DATABASE" <"$migration" 2>/tmp/migration-error.txt; then
+      applied=$((applied + 1))
+    else
+      fail "迁移失败: $migration"
+      head -5 /tmp/migration-error.txt
+    fi
+  done
+  ok "已应用 $applied 个迁移脚本（幂等，可重复执行）"
+
+  # 结构断言：两张表必须存在。
+  for table in players match_results schema_migrations; do
+    if [ "$(mysql_query "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$MYSQL_DATABASE' AND table_name='$table';")" = "1" ]; then
+      ok "表存在: $table"
+    else
+      fail "表缺失: $table"
+    fi
+  done
+
+  # 种子数据断言：3 个测试玩家，且与代码内测试身份一致。
+  seed_count=$(mysql_query "SELECT COUNT(*) FROM players;")
+  if [ "$seed_count" = "3" ]; then
+    ok "players 有 3 行种子数据"
+  else
+    fail "players 行数为 $seed_count（期望 3）"
+  fi
+  if [ "$(mysql_query "SELECT status FROM players WHERE account='carol';")" = "disabled" ]; then
+    ok "禁用账号 carol 的状态正确"
+  else
+    fail "carol 的状态不符合预期"
+  fi
+  if mysql_query "SHOW COLUMNS FROM players LIKE '%password%';" | grep -q .; then
+    fail "players 表出现密码列，与 D-002 不符"
+  else
+    ok "players 表无密码列（符合 D-002）"
+  fi
+  echo
+fi
+
+# --schema-only：只验证迁移与表结构，不启动网关。
+if [ "$schema_only" -eq 1 ]; then
+  echo "===== --schema-only：跳过构建与运行时验证 ====="
+  if [ ${#failures[@]} -ne 0 ]; then
+    echo "===== 验收失败 ====="
+    for f in "${failures[@]}"; do echo " - $f"; done
+    exit 1
+  fi
+  echo "===== 结构验收通过：迁移可重复执行，表与种子数据符合预期 ====="
+  exit 0
+fi
 echo "===== 2. 构建 Gateway ====="
 if cmake --preset "$preset" >/tmp/login-config.log 2>&1; then
   ok "配置成功"
@@ -164,7 +285,10 @@ echo
 
 # ---------- 4. 启动网关 ----------
 echo "===== 4. 启动 Gateway ====="
-"$binary" -port "$gateway_port" -env_prefix dev >/tmp/gateway.out 2>&1 &
+"$binary" -port "$gateway_port" -env_prefix dev \
+  -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
+  -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
+  -mysql_database "$MYSQL_DATABASE" >/tmp/gateway.out 2>&1 &
 gateway_pid=$!
 echo "进程号: $gateway_pid"
 
@@ -345,6 +469,51 @@ if [ "$manage_docker" -eq 1 ]; then
     fail "网关进程意外退出"
   fi
   echo
+
+  # ---------- 9b. MySQL 不可用与恢复 ----------
+  echo "===== 9b. MySQL 不可用与恢复 ====="
+  compose stop mysql >/dev/null 2>&1
+  ok "已停止 MySQL"
+
+  # 说明：鉴权顺序是「先读玩家档案（MySQL），再创建会话（Redis）」，
+  # 因此 MySQL 不可用时登录应返回 player_store_unavailable，
+  # 而不是 session_store_unavailable。
+  code=$(http_post /api/v1/login '{"account":"alice","password":"alice_dev_pw","request_id":"verify-mysql-down"}')
+  if [ "$code" = "503" ]; then
+    ok "MySQL 不可用时登录返回 503（未伪装成功）"
+  else
+    fail "MySQL 不可用时返回 $code（期望 503）"
+    cat /tmp/resp.json; echo
+  fi
+  if grep -q 'player_store_unavailable' /tmp/resp.json; then
+    ok "错误原因为 player_store_unavailable（证明鉴权确实读取了 MySQL）"
+  else
+    fail "错误原因不符合预期，实际响应: $(cat /tmp/resp.json)"
+  fi
+
+  compose start mysql >/dev/null 2>&1
+  for _ in $(seq 1 60); do
+    state="$(docker inspect -f '{{.State.Health.Status}}' rgbt-mysql 2>/dev/null)"
+    [ "$state" = "healthy" ] && break
+    sleep 3
+  done
+  ok "已重启 MySQL"
+
+  # 关键：服务不重启，MySQL 恢复后应自动可用
+  code=$(http_post /api/v1/login '{"account":"alice","password":"alice_dev_pw","request_id":"verify-mysql-recover"}')
+  if [ "$code" = "200" ]; then
+    ok "MySQL 恢复后无需重启网关即可登录（自愈）"
+  else
+    fail "MySQL 恢复后登录仍失败：HTTP $code"
+    cat /tmp/resp.json; echo
+  fi
+
+  if kill -0 "$gateway_pid" 2>/dev/null; then
+    ok "网关进程未因 MySQL 抖动退出"
+  else
+    fail "网关进程在 MySQL 故障期间退出"
+  fi
+  echo
 fi
 
 # ---------- 10. 优雅退出 ----------
@@ -379,4 +548,4 @@ if [ ${#failures[@]} -ne 0 ]; then
   exit 1
 fi
 
-echo "===== 验收通过：登录切片可用，无效输入与 Redis 故障路径均已验证 ====="
+echo "===== 验收通过：登录切片可用；迁移幂等；无效输入、Redis 与 MySQL 故障路径均已验证 ====="

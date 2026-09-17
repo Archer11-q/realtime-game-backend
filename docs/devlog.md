@@ -605,6 +605,143 @@ Redis 中存在的 session Key。实测清理时报告残留 9 个与 5 个 Key�
   且当前只有一个 proto 文件，规则重复问题尚未出现。建议加入 TASK-006 Backlog，
   待出现第二个 proto 时再评估。
 
+## TASK-006 实施记录（2026-09-17）
+
+### 背景
+
+TASK-005 的登录使用代码内的明文测试身份，`players` 表不存在。Phase 1 需要可恢复的
+数据基线，且「数据模型是否合理」必须靠真实读写验证，而不是只建空表。本任务把玩家
+档案的读取链路接到 MySQL，同时确认「Gateway 直接读 `players` 表」这一临时越界的
+边界与退出条件。
+
+### 完成
+
+- `migrations/002_create_players.sql`：`players` 表，主键 `player_id`，
+  `uk_players_account` 唯一约束，`status` 默认 `active`，**无 password 列**。
+- `migrations/003_create_match_results.sql`：`match_results` 表，主键 `match_id`
+  （幂等业务键），`winner_id` 可空（平局）。
+- `migrations/004_seed_test_players.sql`：3 行种子数据（alice/p-0001/active、
+  bob/p-0002/active、carol/p-0003/disabled），文件头标注**仅用于开发环境**。
+- 三个脚本均幂等：`CREATE TABLE IF NOT EXISTS` + `INSERT ... ON DUPLICATE KEY
+  UPDATE`，并各自写入 `schema_migrations` 一行。
+- 新增 `libmariadb` vcpkg 依赖；`src/gateway/CMakeLists.txt` 增加
+  `find_package(unofficial-libmariadb CONFIG REQUIRED)` 与 `OpenSSL`。
+- `src/gateway/mysql_connection.{hpp,cpp}`：连接选项（含连接/读/写超时）、
+  参数化查询、断线重试。
+- `src/gateway/player_reader.hpp` + `mysql_player_reader.{hpp,cpp}`：`PlayerReader`
+  接口与 MySQL 实现。
+- `src/gateway/player_directory.{hpp,cpp}` 改为**接口**，并拆出
+  `in_memory_player_directory.{hpp,cpp}`（原实现）与
+  `database_player_directory.{hpp,cpp}`（新实现），结构对齐既有 `SessionStore`。
+- `src/gateway/password_hash.{hpp,cpp}`：OpenSSL EVP SHA-256，输出 64 位小写十六
+  进制；`ConstantTimeEquals()` 做定长比较。
+- `src/gateway/test_credentials.{hpp,cpp}`：测试身份的单一来源。
+- `src/gateway/gateway_service.{hpp,cpp}`：新增 `kUnavailable` 分支，返回
+  503 `player_store_unavailable`。
+- `src/gateway/gateway_main.cpp`：装配 MySQL 连接、新增 `-mysql_*` gflags。
+- `tests/unit/gateway/player_directory_test.cpp`：17 个新用例（假 `PlayerReader`
+  覆盖读取失败、禁用、不存在、哈希一致性等）。
+- `docs/adr/0002-gateway-temporary-player-ownership.md`：记录临时越界、3 个备选
+  方案与退出条件。
+- `docs/05-api-and-data.md` 增补两表结构与访问约定；`docs/07-open-decisions.md`
+  的 D-002、D-003 移入「已确认」。
+- `scripts/verify-login.sh`：新增 `--schema-only`、自动选择空闲端口、迁移与表结构
+  断言、MySQL 停机与自愈断言。
+
+### 决策
+
+- **D-003 定为最小状态同步**（服务端权威快照 + 广播）：第一版不需要帧同步级别的
+  带宽与回放能力，快照同步可验证性更高，后续如需帧同步再走 ADR。
+- **密码用 SHA-256 摘要比较，不引入 bcrypt/Argon2**：这是测试身份的防明文措施，
+  不是真实密码体系。真实注册与口令哈希留到有真实用户体系时再决策，避免现在引入
+  未验证的密码学方案。
+- **建表范围只做 `players` + `match_results`**：`player_stats`、`room_records`、
+  `processed_events` 没有 Phase 1 的写入者，提前建表等于建空壳。
+- **`match_results` 只建表不写入**：所有者是 Settlement（Phase 5），Phase 1 没有
+  实现它的理由。
+- **接受 ADR-0002 的临时越界**：Phase 1 若先实现 Player/State 服务，会把范围从
+  「最小闭环」扩大成「多一个服务」，代价高于收益。ADR 已写明退出条件。
+
+### 验证（均在 WSL 的 `~/workspace/realtime-game-backend` 执行）
+
+- 命令：`cmake --preset brpc-debug && cmake --build --preset brpc-debug`
+- 结果：配置与构建成功，退出码 0，无新增编译警告（`-Werror` 全程生效）。
+- 命令：`ctest --test-dir build/brpc-debug --output-on-failure`
+- 结果：**46/46 通过**（TASK-005 时为 29 个，本次新增 17 个）。
+- 命令：`bash scripts/check-format.sh`
+- 结果：通过，检查 29 个文件。
+- 命令：`bash scripts/verify.sh`
+- 结果：`debug`/`release`/`asan` 三预设全部配置、构建、测试通过，各 4/4，
+  未破坏既有骨架。
+- 命令：`bash scripts/verify-login.sh`（需 Docker 与 `deploy/compose/.env`）
+- 结果：**48/48 通过，退出码 0**。覆盖：迁移可重复执行且幂等、`schema_migrations`
+  记录 3 条、`players` 有 3 行种子且 carol 为 `disabled`、`players` 表确认无
+  password 列、登录成功、登录幂等、有效/非法/不存在 Token、登出失效、账号禁用
+  返回 401、Redis 停机与自愈、MySQL 停机返回 503 与自愈、网关进程全程存活、
+  SIGTERM 后退出码 0。
+- 结果：文件权限为 70 个 `100644` + 6 个 `100755`，无误改权限。
+- 复验（端口处理方式纠正后重跑，2026-09-17）：重新构建通过，`ctest` 仍为
+  **46/46**；`bash scripts/verify-login.sh` **48/48 通过，退出码 0**。本轮 8080 被
+  无关进程占用，脚本按预期选用 **18080**，说明端口选择不依赖程序默认值。
+- 注：首次提交（以及一次 amend）时新增文件被记为 `100755`，原因是权限归一化脚本
+  只遍历了 `git ls-files`（已跟踪文件），未覆盖新文件。修正为
+  `git ls-files --cached --others --exclude-standard` 后，提交内权限为
+  87 个 `100644` + 6 个 `100755`（仅 `scripts/*.sh`）。
+
+### 问题与风险（本轮实际踩到并解决的）
+
+- **MySQL 重启后不自动恢复（5/5 次返回 503）**。日志显示 `[mysql] connected ...`
+  之后紧跟 `Query failed: connect failed: ... (115)`：`mysql_ping` 对已被服务端关闭
+  的连接仍返回成功，真正的失败要到第一条语句才暴露，而旧代码把它当作终止性错误。
+  修复：把 `Query` 拆为 `QueryOnce` + 「死连接重试一次」（`IsConnectionLostError`
+  匹配 2006/2013/2003/2002），重试前先 `Disconnect()`。修复后 MySQL 重启的**第一次**
+  登录即返回 200。这是「自愈必须实测、不能靠推断」的又一例证。
+- **端到端全部 404 `{"detail":"Not Found"}`**。真实原因是 8080 被另一个无关项目
+  （`zsvirt-observability` 的 uvicorn）临时占用，网关启动失败（`Fail to listen
+  0.0.0.0:8080`），请求打到了那个服务上。**未**终止他人进程。
+  停顿点：第一反应是把网关默认端口改成 18080，这是**修错了地方**——端口被谁占用是
+  环境状态，不是程序的默认值问题；把非约定端口硬编码进程序，会让代码与
+  `.env.example` 的约定值不一致，且下次占用另外的端口还会复发。
+  最终处理：进程默认端口与 `.env.example` 保持约定值 **8080**，改由验收脚本在启动前
+  用 `ss` 显式预检，从候选列表（8080 起）挑选空闲端口并用 `-port` 传入；同时把
+  「端口冲突会表现为 404」这一现象写进 `.env.example` 与脚本注释，避免下次再被
+  同一个现象误导。这是本轮**唯一一次在错误层面修问题并被纠正**的记录。
+  复验时的实测证据：8080 仍被 `uvicorn app.main:app`（另一个无关项目，
+  `pid=70938`）监听，脚本按预期跳过 8080 并选用 18080，全程无需修改程序默认值，
+  证明「把冲突留给环境、把选择交给脚本」这个做法成立。
+- **`MYSQL_USER: unbound variable`（退出码 1，脚本在 1b 段中止）**：脚本在读取
+  `MYSQL_*` 之前从未加载 `deploy/compose/.env`。修复：在第 0 段加入
+  `set -a; . ./deploy/compose/.env; set +a`。
+- **文档改动被静默回滚（两次）**：上次会话直接在 WSL 侧编辑 `docs/`，随后同步脚本
+  从 Windows 侧 tar 覆盖，改动无声丢失。已确立约定：**Windows 侧为编辑来源**，
+  改完再同步进 WSL；反之必丢。发现后已重新核对 TASKS、07-open-decisions、
+  ADR-0002、01-architecture、02-roadmap、README、CLAUDE 的实际内容。
+- **`mysql/mariadb_stmt.h` 重复包含导致枚举重定义**：`mysql.h` 已包含
+  `mariadb_stmt.h`，只需 include 前者。
+- **`clang-format` 陷阱复发**：`clang-format -i CMakeLists.txt`
+  会破坏 CMake 语法（`Parse error. Expected a newline`）。CMake 文件永远不交给
+  clang-format。
+- 测试身份的账号/密码分布在两处，必须保持同步：`src/gateway/test_credentials.cpp`
+  与 `migrations/004_seed_test_players.sql`。已核对一致（alice/p-0001、bob/p-0002、
+  carol/p-0003 disabled）。这是当前设计的已知重复点，不是缺陷但需在改动时注意。
+- 风险：ADR-0002 允许 Gateway 直接读 `players` 表，属**有期限的例外**。若 Phase 1
+  结束时 Player/State 仍未落地，必须回到 ADR 重新决策，不能让例外变成默认架构。
+
+### 未做 / 留给后续
+
+- 未实现真实注册与口令哈希（bcrypt/Argon2），仍为测试身份。
+- 未建 `player_stats`、`room_records`、`processed_events`。
+- 未实现匹配、房间、WebSocket、前端、Settlement。
+- 未增加 MySQL 连接池；每个请求当前走一次查询路径，Phase 1 的并发量下够用，
+  是否引入连接池留到有实测瓶颈时决策。
+- CI 仍不覆盖 brpc 预设与 Compose（CI 无 vcpkg），已记入 Backlog。
+
+### 下一步
+
+- 由项目所有者审阅 Diff 并运行验收命令；确认后提交到
+  `feat/task-006-schema-and-migrations` 并开 PR。
+- TASK-006 验收通过后再输出 TASK-007（Match Service）任务单。
+
 ## 日志模板
 
 ```markdown
