@@ -1,36 +1,86 @@
-# brpc 冒烟验证（TASK-004 方案 C）
+# gateway 服务：TASK-005 登录切片。
 #
-# 只用于验证 vcpkg 提供的 brpc 能否在本工程中编译、链接、启动并优雅退出。
-# 默认构建（debug / release / asan 预设）不会包含本目录，因为 vcpkg 只在
-# brpc-debug 预设中生效。
+# 依赖 vcpkg 提供的 brpc 与 hiredis，因此本目录只在启用 vcpkg 工具链时加入
+# （见 src/CMakeLists.txt），保证默认构建与 CI 不受影响。
 #
-# 等 brpc 验证通过后，Gateway 正式实现会取代本目录的内容。
+# 本目录还负责生成 api/proto 下的 Protobuf 代码：契约是接口真相来源，
+# 生成物放在构建目录，不进入版本库。
 
+# ---------------------------------------------------------------------------
+# Protobuf 代码生成
+# ---------------------------------------------------------------------------
+
+find_package(Protobuf REQUIRED)
 # vcpkg 的 brpc 以 unofficial-brpc 为包名导出，目标名是 unofficial::brpc::brpc。
 # 必须先 find_package，否则链接时找不到该 IMPORTED 目标。
 find_package(unofficial-brpc CONFIG REQUIRED)
+find_package(hiredis CONFIG REQUIRED)
 
-add_executable(
-  rgbt_brpc_smoke
-  smoke_main.cpp
+set(RGBT_PROTO_DIR "${PROJECT_SOURCE_DIR}/api/proto")
+set(RGBT_PROTO_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto-gen")
+
+file(MAKE_DIRECTORY "${RGBT_PROTO_OUT_DIR}")
+
+add_custom_command(
+  OUTPUT "${RGBT_PROTO_OUT_DIR}/gateway.pb.cc" "${RGBT_PROTO_OUT_DIR}/gateway.pb.h"
+  COMMAND protobuf::protoc
+  ARGS
+    --cpp_out "${RGBT_PROTO_OUT_DIR}"
+    --proto_path "${RGBT_PROTO_DIR}"
+    "${RGBT_PROTO_DIR}/gateway.proto"
+  DEPENDS "${RGBT_PROTO_DIR}/gateway.proto"
+  COMMENT "生成 gateway.proto 的 C++ 代码"
+  VERBATIM
 )
 
-target_link_libraries(
-  rgbt_brpc_smoke
-  PRIVATE
-    unofficial::brpc::brpc
-    # 链接公共库：它不仅提供符号，也把 include/ 以 PUBLIC 方式传递给使用者。
-    rgbt_common
-)
+add_library(rgbt_gateway_proto STATIC "${RGBT_PROTO_OUT_DIR}/gateway.pb.cc")
+target_include_directories(rgbt_gateway_proto PUBLIC "${RGBT_PROTO_OUT_DIR}")
+target_link_libraries(rgbt_gateway_proto PUBLIC protobuf::libprotobuf)
 
-# brpc 与 vcpkg 依赖的告警不在本项目控制范围内，因此这里只开基础告警，
-# 不使用 rgbt_set_project_warnings（它带 -Werror，会因第三方头文件失败）。
+# 生成代码属于第三方产出，不使用 -Werror 以免因 protoc 版本差异导致构建失败。
 if(NOT MSVC)
-  target_compile_options(rgbt_brpc_smoke PRIVATE -Wall -Wextra)
+  target_compile_options(rgbt_gateway_proto PRIVATE -w)
 endif()
 
+# ---------------------------------------------------------------------------
+# 服务实现
+# ---------------------------------------------------------------------------
+
+add_library(
+  rgbt_gateway_lib STATIC
+  error.cpp
+  gateway_service.cpp
+  player_directory.cpp
+  redis_session_store.cpp
+)
+
+target_include_directories(rgbt_gateway_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+
+target_link_libraries(
+  rgbt_gateway_lib
+  PUBLIC
+    rgbt_common
+    rgbt_gateway_proto
+  PRIVATE
+    unofficial::brpc::brpc
+    hiredis::hiredis
+)
+
+rgbt_set_project_warnings(rgbt_gateway_lib)
+
+# ---------------------------------------------------------------------------
+# 可执行文件
+# ---------------------------------------------------------------------------
+
+add_executable(rgbt_gateway gateway_main.cpp)
+target_link_libraries(rgbt_gateway PRIVATE rgbt_gateway_lib unofficial::brpc::brpc)
+
 set_target_properties(
-  rgbt_brpc_smoke
+  rgbt_gateway
   PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# 本目录不定义测试目标，也不判断 GoogleTest 是否可用：测试放在
+# tests/unit/gateway/，由 tests 目录自行解析测试依赖。这样服务目录只负责
+# 编译服务本身。

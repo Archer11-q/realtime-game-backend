@@ -81,6 +81,26 @@ function(rgbt_set_project_warnings target)
   endif()
 endfunction()
 
+function(rgbt_set_test_warnings target)
+  # 测试代码的告警策略与产品代码不同。
+  #
+  # 原因：GTest 的 TEST / TEST_F 宏展开出的静态函数只通过框架内部注册表引用，
+  # GCC 在 -Wunused-function 下会误报为「未被使用」。这是框架的固有形态，
+  # 不是代码缺陷，因此测试目标保留基础告警，但不把警告视为错误。
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /W4)
+  else()
+    target_compile_options(
+      ${target}
+      PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wno-unused-function
+    )
+  endif()
+endfunction()
+
 function(rgbt_apply_sanitizer target)
   if(NOT RGBT_ENABLE_SANITIZER)
     return()
@@ -93,10 +113,14 @@ function(rgbt_apply_sanitizer target)
   target_link_options(${target} PRIVATE -fsanitize=address)
 endfunction()
 
+# 子目录顺序：先 src 再 tests。
+#
+# 服务目录只负责编译自己，不判断测试依赖是否可用——那是 tests 的职责。
+# tests/CMakeLists.txt 自行解析 GoogleTest 并决定是否加入测试目标。
 add_subdirectory(src)
 
-# 测试骨架：使用标准 CTest 模块提供的 BUILD_TESTING 开关。
 include(CTest)
+
 if(BUILD_TESTING AND RGBT_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)

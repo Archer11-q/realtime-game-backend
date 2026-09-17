@@ -113,14 +113,14 @@ TASK-001 尚有一个收尾项：WSL 正式目录需要与 GitHub 对齐后，�
 realtime-game-backend/
 ├── api/proto/                 # Protobuf 接口契约
 ├── src/
-│   ├── gateway/               # HTTP/WebSocket 网关
+│   ├── gateway/               # HTTP/WebSocket 网关（含本服务内部头文件）
 │   ├── match/                 # 匹配服务
 │   ├── room/                  # 房间和战斗服务
 │   ├── player/                # 玩家和状态服务
 │   └── settlement/            # 异步结算 Worker
 ├── include/common/            # 跨服务公共基础设施
 ├── tests/
-│   ├── unit/
+│   ├── unit/                  # 单元测试，按服务分子目录（unit/<service>/）
 │   ├── integration/
 │   └── e2e/
 ├── bench/                     # 压测和容量工具
@@ -133,6 +133,11 @@ realtime-game-backend/
 ├── scripts/                   # 开发和运维脚本
 └── docs/                      # 设计、ADR、任务与运行文档
 ```
+
+> **放置规则**：只有被两个及以上服务使用的代码才放 `include/common/`；
+> 服务内部头文件与实现一起放在 `src/<service>/`，单元测试放
+> `tests/unit/<service>/`。判断依据是依赖方向，不是“它是不是头文件”。
+> 完整规则见[架构设计](docs/01-architecture.md)第 11 节。
 
 ## 目录与环境约定
 

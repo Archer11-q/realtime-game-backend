@@ -262,7 +262,47 @@ Room 发布 MatchFinished
   6379/3306；宿主机的 `REDIS_PORT`/`MYSQL_PORT` 只影响端口映射。
 - 后续加入请求限流、连接数限制和异常行为统计。
 
-## 11. 架构变更规则
+## 11. 代码与测试的放置规则
+
+### 头文件
+
+本项目只有一处集中头文件目录 `include/common/`，它的定义是**用途**而非**位置**：
+
+| 位置 | 放什么 | 判断依据 |
+|---|---|---|
+| `include/common/` | 被两个及以上服务使用的公共代码 | 有多方依赖 |
+| `src/<service>/` | 只属于该服务的头文件，与实现放在一起 | 只有本服务依赖 |
+
+判断依据是**依赖方向**，不是“它是不是头文件”：
+
+- 只有一个服务使用的头文件提升到 `include/`，会让公共目录逐渐变成无归属的
+  杂物间，因此**不因整齐而提升**。
+- 反过来，若某个头文件被第二个服务使用时，**必须**移入 `include/common/`，
+  避免服务之间通过源码目录互相依赖。
+
+示例（截至 TASK-005）：
+
+- `include/common/token.hpp`：会话 Token 生成。Gateway 使用，Player、Settlement
+  后续也会使用，故放在公共目录。
+- `src/gateway/error.hpp`：只服务 Gateway，且依赖 `gateway.pb.h`。放进 `include/`
+  会诱导其他服务反向依赖 Gateway 的契约，故留在服务目录内。
+
+### 测试
+
+- 单元测试统一放在 `tests/unit/<service>/`，与 `src/<service>/` 一一对应。
+- 集成测试与端到端测试分别放 `tests/integration/` 和 `tests/e2e/`。
+- 测试**不放在 `src/` 内**：`src/<service>/` 只负责编译该服务本身，
+  不判断测试依赖是否可用，也不定义测试目标。
+- 测试文件使用与实现相同的 include 路径，因为实现所在的库已把自身目录以
+  `PUBLIC` 方式暴露。
+
+### 构建顺序
+
+- `CMakeLists.txt` 先处理 `src`，再处理 `tests`。
+- GoogleTest 的解析由 `tests/` 自行完成；未启用 vcpkg 时跳过依赖 vcpkg 的服务测试，
+  通过 `if(TARGET <lib>)` 判断，而不是让服务目录感知测试依赖。
+
+## 12. 架构变更规则
 
 以下变化必须先写 ADR：
 

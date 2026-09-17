@@ -421,6 +421,190 @@
 - 决定后续方向：进入完整 Gateway 实现（含 proto 契约与错误码），
   或先补齐 CI 覆盖。
 
+## TASK-005 实施记录（2026-09-16）
+
+### 背景修正
+
+TASK-004 只交付了「brpc 工具链可用性验证」，其原始目标中的公共 Proto、错误码、
+健康检查与优雅退出并未实现（`api/proto/` 当时只有 `.gitkeep`）。而 TASK-005 的
+登录接口需要挂在 Gateway 上，Gateway 此前只有一个冒烟程序，属硬阻塞。
+经项目所有者确认，将 TASK-004 剩余项并入 TASK-005，一次完成
+「Gateway 最小可运行服务 + 登录切片」。
+
+### 完成
+
+- `api/proto/gateway.proto`：`GatewayService` 定义 `Login`、`GetCurrentPlayer`、
+  `Logout` 三个 RPC，以及 `PlayerInfo`、`Error`、`ErrorCode` 公共结构。
+  字段只追加，符合 `docs/05-api-and-data.md` 第 7 节的演进规则。
+- `include/common/token.hpp` + `src/common/token.cpp`：Token 生成与格式校验。
+- `src/gateway/error.{hpp,cpp}`：错误码到 HTTP 状态码的映射。
+- `src/gateway/player_directory.{hpp,cpp}`：测试身份目录（内置 3 个账号，
+  含一个 disabled 账号用于覆盖失败路径）。
+- `src/gateway/session_store.hpp`：会话存储接口，便于测试注入。
+- `src/gateway/redis_session_store.{hpp,cpp}`：基于 hiredis 的实现，含连接超时、
+  断线重连与幂等写入。
+- `src/gateway/gateway_service.{hpp,cpp}`：三个接口的服务实现。
+- `src/gateway/gateway_main.cpp`：服务入口，用 restful 映射暴露 HTTP 路径。
+- `src/gateway/unit/gateway_service_test.cpp`：25 个单元测试。
+- `scripts/verify-login.sh`：端到端验收入口。
+
+### 决策
+
+- 落地 `docs/07-open-decisions.md` D-002（经项目所有者确认）：
+  - Token 使用**不透明随机串**而非 JWT：第一版不需要自包含性，会话集中在
+    Redis，便于统一吊销与过期控制。
+  - **不把账号密码存入 MySQL**，使用内置测试身份。
+  - **不实现 Token 刷新**，只做短期会话。
+- HTTP 状态码必须在传输层体现。brpc 默认把 protobuf 响应序列化为 JSON body，
+  但 HTTP 状态恒为 200，因此显式调用
+  `cntl->http_response().set_status_code(...)`。
+- Redis Key 带环境和服务前缀并设置 TTL，符合 `docs/05-api-and-data.md` 第 4 节。
+- Redis 不可用时服务**不退出**，请求返回 503；恢复后无需重启。避免依赖抖动
+  导致服务反复重启。
+- 测试代码使用独立告警策略（`rgbt_set_test_warnings`）：GTest 的 `TEST_F`
+  宏生成静态函数，在 `-Werror -Wunused-function` 下会误报。
+
+### 验证
+
+- 命令：`cmake --preset brpc-debug && cmake --build --preset brpc-debug`
+- 结果：配置与构建均成功，生成 `bin/rgbt_gateway` 与 `rgbt_gateway_tests`。
+- 结果：proto 代码由 vcpkg 的 `protoc 33.4.0` 生成成功。
+- 命令：`ctest --test-dir build/brpc-debug --output-on-failure`
+- 结果：**29 个测试全部通过**（gateway 25 个 + common 4 个）。
+- 命令：启动网关并对各 HTTP 路径发请求（此时 Redis 未启动）
+- 结果：HTTP 状态码与设计一致：
+  - 错误密码 -> **401**
+  - 正确凭据但 Redis 不可用 -> **503**，`reason=session_store_unavailable`
+  - 无 Token -> **400**
+  - 非法 Token -> **400**
+  - `/health` -> 200，`/status` -> 200（brpc 内置）
+  - 不存在的路径 -> 404
+- 结果：收到 SIGTERM 后退出码 0，输出「已优雅退出」。
+- 结果：网关启动日志正确报告 Redis 当前不可用，且进程保持存活。
+
+### 未验证（缺 Docker）
+
+- 以下端到端路径需要在 Redis 可用时验证，本次因 Docker Desktop 未启动而**未运行**：
+  正常登录、登录幂等（同 request_id 返回同一 Token）、不同 request_id 得到不同
+  Token、有效 Token 查询玩家、登出后 Token 失效、Redis 停止时返回 503、
+  Redis 恢复后无需重启即可登录。
+- 结论：`scripts/verify-login.sh` 已具备覆盖以上全部场景的能力，
+  但**必须实际运行通过后才能判定 TASK-005 完成**。
+
+### 问题与风险（本轮实际踩到并解决的）
+
+- `player_directory` 只有显式构造函数而无默认构造，导致测试夹具把它当成员声明时
+  产生「默认构造被删除」并级联出 20 条报错。已补默认构造并注释原因。
+- `error` 模块原本放在 `src/common/`，却需要 include gateway 的生成代码，
+  造成公共库反向依赖网关契约。已移到 `src/gateway/`。
+- 忘记把 `token.cpp` 加入 `src/common/CMakeLists.txt`，导致链接期
+  `undefined reference`。
+- `find_package(GTest)` 原本放在 `tests/` 子目录，而 `src/gateway` 在其之前被
+  处理，且子目录间不共享普通变量作用域，导致 gateway 测试目标未生成。
+  已把依赖解析提到顶层 `CMakeLists.txt`。
+- protobuf 生成的枚举含 sentinel 值，`switch` 未覆盖时触发 `-Werror=switch`。
+- `verify-login.sh` 最初用 `ctest -R gateway` 过滤，但测试名为
+  `GatewayServiceTest.*`（不含小写 gateway），过滤不到，已改为跑完整套件。
+
+### 下一步
+
+- 项目所有者启动 Docker Desktop，运行 `bash scripts/verify-login.sh` 完成验收。
+- 通过后形成 `v0.1-bootstrap` 里程碑。
+- 将 brpc 预设与 Compose 纳入 CI（已记入 TASK-006 Backlog）。
+
+### 补充（同日稍后）：项目所有者端到端验收发现的问题与修复
+
+#### 问题（由项目所有者实际运行 `verify-login.sh` 发现，共 3 项）
+
+- 有效 Token 查询 `/api/v1/players/me` 返回 **400**，原因 `token_required`。
+- 不存在的 Token 查询返回 **400**，而预期为 401。
+- 登出接口返回 **200**，但原 Token 仍能通过鉴权。
+
+**根因是同一个，不是三个**：brpc 只把 HTTP body（JSON）映射到 protobuf 字段，
+**不会**把 HTTP 头映射进任何字段（见 brpc 官方文档 `http_service.md` 中 headers
+与 query string 的说明）。因此 `Authorization: Bearer <token>` 里的 Token 从未
+进入 `request->token()`，该字段恒为空字符串：
+
+- 查询接口因 Token 为空报 `token_required`；
+- 登出接口拿到空 Token，删除的是一个不存在的 key（no-op），于是返回 200
+  而会话**实际未被删除**，后续请求仍然通过。
+
+**这属于「依赖未经验证的框架行为」这一类错误**，与 TASK-004 中误以为 brpc 存在
+`brpc::HttpService` 是同一类问题。
+
+#### 修复
+
+- 新增 `ExtractToken()`：按「请求体字段 -> `Authorization` 头 -> query string」
+  顺序取值，`Bearer` 前缀大小写不敏感。`GetCurrentPlayer` 与 `Logout` 改用它。
+- 实测验证三种取 Token 方式均可用：`Authorization: Bearer` 头、`?token=` 查询
+  参数、请求体 JSON。
+
+#### 同时修复的验收脚本缺陷
+
+`verify-login.sh` 运行前不清理 Redis 残留。脚本使用固定的 `env_prefix`（`dev`）
+与固定 `request_id`，上次运行留下的幂等映射会让本次登录返回旧 Token，而该 Token
+对应的会话可能已被登出，表现为「刚拿到的 Token 查询失败」这种难以定位的偶发失败。
+第一次失败后重跑即通过，即由此引起。
+
+修复：运行前清理 `dev:gateway:*`，并在有效 Token 查询失败时打印实际 Token 与
+Redis 中存在的 session Key。实测清理时报告残留 9 个与 5 个 Key。
+
+#### 同时修复的仓库污染
+
+因同步脚本中的 `chmod` 处理不当，**68 个文件的权限位**被从 `100644` 改为
+`100755`（整个仓库被标成可执行）并一并提交。已纠正为「脚本 755、其余 644」，
+并 amend 到原提交，避免留下一次纯噪音提交。
+
+#### 结构调整（经项目所有者确认）
+
+按项目所有者意见，测试位置与构建耦合做了如下调整：
+
+- `src/gateway/unit/gateway_service_test.cpp`
+  → `tests/unit/gateway/gateway_service_test.cpp`（内容零改动，git 识别为重命名）。
+- `src/gateway/CMakeLists.txt` 删除测试块。该文件此前需要判断
+  `RGBT_TESTS_AVAILABLE`，使**服务目录耦合了测试基础设施**，而出问题的只是
+  CMake 作用域组织方式。
+- 根 `CMakeLists.txt` 删除 `RGBT_TESTS_AVAILABLE` 缓存变量及判定分支。
+- `tests/CMakeLists.txt` 自行解析 GoogleTest；`tests/unit/CMakeLists.txt` 用
+  `if(TARGET rgbt_gateway_lib)` 判断是否加入 gateway 测试，因为该目标只在启用
+  vcpkg 时存在。
+- 头文件位置**未改动**：服务内部头文件继续与实现同目录。
+
+新增文档规则：
+
+- `docs/01-architecture.md` 第 11 节「代码与测试的放置规则」（原第 11 节顺延为
+  第 12 节）。核心判据是**依赖方向**而非「它是不是头文件」：只有被两个及以上
+  服务使用的代码进 `include/common/`；只有一个服务使用的留在 `src/<service>/`。
+- `README.md` 目录图补充放置规则说明与指引。
+
+#### 验证
+
+- 命令：`bash scripts/verify-login.sh`
+- 结果：**连续两次 31/31 通过**，零失败。覆盖正常登录、登录幂等、不同
+  `request_id` 得到不同 Token、无效输入（400/401）、有效 Token 查询、非法与
+  不存在的 Token、登出失效、Redis 停止时返回 503、Redis 恢复后无需重启网关
+  即可登录、网关进程全程存活、SIGTERM 后退出码 0。
+- 结果：`ctest --test-dir build/brpc-debug` 为 **29/29 通过**，与结构调整前
+  数量完全一致。
+- 结果：测试可执行文件位于 `build/brpc-debug/tests/unit/{gateway,common}/`，
+  `src/` 下已无任何测试文件。
+- 结果：既有 `debug`/`release`/`asan` 三预设回归通过。
+- 结果：`cmake --preset brpc-debug` 全新配置与构建通过；`grep` 确认
+  `src/gateway/CMakeLists.txt` 已无任何 GTest 相关判断。
+
+#### 提交
+
+- `556c7e2` 实现 Gateway 登录切片
+- `da7245f` 从 HTTP 头提取 Token，并隔离验收脚本状态
+- `fac9798` 测试归位到 `tests/unit/gateway` 并消除服务目录对测试依赖的耦合
+
+#### 待确认
+
+- 方案 C（把 proto 代码生成从 `src/gateway/CMakeLists.txt` 移到顶层或
+  `api/proto/`）本轮**未做**，理由是与测试归位混在一起会降低可审阅性，
+  且当前只有一个 proto 文件，规则重复问题尚未出现。建议加入 TASK-006 Backlog，
+  待出现第二个 proto 时再评估。
+
 ## 日志模板
 
 ```markdown

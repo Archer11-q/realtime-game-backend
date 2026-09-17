@@ -1,9 +1,13 @@
 # common：跨服务共享的最小基础设施。
 #
-# 当前只包含版本信息，用于验证构建、测试和 CI 基线可用。
+# 当前包含版本信息与 Token 生成，两者都被多个服务复用。
 # 每个新增的公共模块都必须有对应测试，避免 common 变成无测试的杂物间。
 
-add_library(rgbt_common STATIC version.cpp)
+add_library(
+  rgbt_common STATIC
+  token.cpp
+  version.cpp
+)
 
 target_include_directories(rgbt_common PUBLIC "${PROJECT_SOURCE_DIR}/include")
 
