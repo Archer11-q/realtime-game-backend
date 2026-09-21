@@ -1,7 +1,7 @@
 # 当前任务
 
-> 状态：Phase 0，TASK-000 已完成，TASK-001 待收尾（WSL 正式目录对齐），
-> TASK-002 实测与 CI 均已通过（待最终确认），TASK-003 进行中
+> 状态：Phase 1 进行中。TASK-000 至 TASK-005 已完成，TASK-006 进行中。
+> 阶段推进依据见 docs/02-roadmap.md 与 docs/devlog.md。
 
 ## 当前里程碑
 
@@ -178,7 +178,7 @@
 
 ## TASK-004：brpc Gateway 基线
 
-- 状态：进行中
+- 状态：已完成（2026-09-17）
 - 依赖：TASK-002（已完成）、TASK-003（已完成）
 - 背景问题：需要验证 brpc/Protobuf 工程集成和服务启动方式。
 - 本次目标：
@@ -253,7 +253,7 @@
 
 ## TASK-005：登录垂直切片
 
-- 状态：进行中
+- 状态：已完成（2026-09-17，已通过 PR #2 合并到 main）
 - 依赖：TASK-003（已完成）、TASK-004（brpc 工具链验证部分已完成）
 - 背景问题：需要验证从客户端请求到持久化会话的最小链路。
 - 本次目标：
@@ -307,12 +307,78 @@
   - 正常登录成功。
   - 无效输入、重复登录和 Redis 不可用路径有测试。
   - 形成 `v0.1-bootstrap` 里程碑。
+- 验收结果（2026-09-17）：
+  - 单元测试 29 项全部通过；端到端 `scripts/verify-login.sh` 连续两次 31/31 通过。
+  - CI run #7（功能分支）与 run #8（main）均为 `success`。
+  - 项目所有者实际执行验收脚本，发现 3 项失败（HTTP 头中的 Token 未被映射进
+    protobuf 字段），已修复并复验通过，详见 `docs/devlog.md`。
+  - 结论：**完成**，`v0.1-bootstrap` 里程碑达成。已通过 PR #2 合并到 `main`。
 
-## TASK-006（Backlog）：后续待办
+## TASK-006：数据模型与 MySQL 迁移
+
+- 状态：进行中
+- 依赖：TASK-003（Redis/MySQL 容器，已完成）
+- 背景问题：登录此前使用代码内的明文测试身份，`players` 表不存在。Phase 1 需要
+  一个可恢复的数据基线，且「数据模型是否合理」必须靠真实读写验证，而不是只建空表。
+- 本次目标：
+  - 建立 `players` 与 `match_results` 两张表。
+  - 让 Gateway 的玩家档案从数据库读取；密码仍留在代码中作为测试数据。
+- 范围：
+  - `migrations/002_create_players.sql`、`003_create_match_results.sql`、
+    `004_seed_test_players.sql`（后者含测试数据，仅开发环境）。
+  - 新增 `libmariadb` vcpkg 依赖并接入 CMake。
+  - `src/gateway/`：把 `PlayerDirectory` 拆为「接口 + 内存实现 + 数据库实现」，
+    结构对齐现有 `SessionStore`，便于单元测试注入假实现。
+  - 测试密码改为 SHA-256 摘要比较，不再留明文常量（复用已有 openssl 依赖）。
+  - 新增 ADR-0002：记录「Gateway 暂时直接读 `players` 表」及退出条件。
+  - `docs/05-api-and-data.md` 补充两表结构与访问约定。
+  - `docs/07-open-decisions.md`：D-002 与 D-003 移入「已确认」。
+  - `scripts/verify-login.sh`：新增 `--schema-only`；增加 MySQL 故障与迁移验证。
+- 非范围：
+  - 不引入真实密码体系（不做注册、不做 bcrypt/Argon2）。
+  - 不建 `player_stats`、`room_records`、`processed_events`。
+  - 不实现 Match / Room / WebSocket / 前端。
+  - 不实现 Player/State 服务（ADR-0002 记录其为正式归属）。
+- 相关 ADR：ADR-0002。
+- 涉及目录：`migrations/`、`src/gateway/`、`tests/unit/gateway/`、`scripts/`、`docs/`。
+- 接口变化：对外 HTTP 接口不变；内部新增 `PlayerReader` 接口。
+- 数据变化：
+  - `players`：主键 `player_id`，`uk_players_account(account)` 唯一约束，
+    **无 password 列**。
+  - `match_results`：主键 `match_id`（幂等业务键），`winner_id` 可空（平局）。
+- 失败场景：
+  - MySQL 不可用：返回 503 `player_store_unavailable`，不伪装成功；恢复后无需重启。
+  - 账号禁用：401 `account_disabled`。
+  - 账号不存在或档案缺失：401 `invalid_credential`，不泄露账号是否存在。
+  - 迁移脚本重复执行：幂等，不产生重复行。
+- 验收命令（在 WSL 中执行）：
+  ```bash
+  bash scripts/verify-login.sh                # 完整：迁移 + 建表 + 端到端
+  bash scripts/verify-login.sh --schema-only  # 只验证迁移与表结构
+  ```
+- 测试要求：单元测试用假 `PlayerReader` 覆盖读取失败、禁用、不存在等路径；
+  端到端使用真实 MySQL 验证读取链路与故障自愈。
+- 回退方式：`git revert` 单次提交；数据库层用 `down -v` 重建（仅开发环境）。
+- 负责人：执行者（写入权）— 本轮由当前会话代理承担，项目所有者审阅与验收。
+- 写入权说明：按 `CLAUDE.md`「协作纪律」，本轮写入权授予当前执行会话。
+- 验收标准：
+  - 迁移脚本可重复执行且幂等。
+  - `players` 表含 3 行种子数据，`match_results` 表存在。
+  - 登录链路改为从数据库读取档案后，端到端验收全项通过。
+  - MySQL 不可用返回 503，且恢复后无需重启即可登录。
+- 提交边界：允许改动 `migrations/`、`src/gateway/`、`tests/unit/gateway/`、
+  `scripts/verify-login.sh`、`docs/`；禁止改动 `src/match/`、`src/room/`、
+  `web/`、`deploy/compose/` 的服务定义。
+
+## Backlog：后续待办
 
 - 将 brpc 预设与 Compose 配置纳入 CI 覆盖。
 - 实现 `docs/05-api-and-data.md` 中其余接口（匹配、房间、结果）。
 - Token 刷新与长期会话策略（Phase 2）。
+- 把 proto 代码生成从 `src/gateway/CMakeLists.txt` 移到顶层或 `api/proto/`
+  （理由见 `docs/devlog.md` 的 TASK-005 记录，待出现第二个 proto 时评估）。
+- 为 Gateway 增加区分存活与就绪的健康检查端点（`/health/ready`），
+  同时检查 Redis 与 MySQL。
 
 ## 任务完成定义
 

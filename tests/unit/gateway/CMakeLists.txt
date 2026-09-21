@@ -6,7 +6,11 @@
 # 头文件路径来自 rgbt_gateway_lib 的 PUBLIC include 声明，因此这里不需要额外
 # 指定 include 目录。
 
-add_executable(rgbt_gateway_tests gateway_service_test.cpp)
+add_executable(
+  rgbt_gateway_tests
+  gateway_service_test.cpp
+  player_directory_test.cpp
+)
 
 target_link_libraries(rgbt_gateway_tests PRIVATE rgbt_gateway_lib GTest::gtest_main)
 

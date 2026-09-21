@@ -194,6 +194,11 @@ Room 发布 MatchFinished
 
 任何模块不得绕过所有者直接修改数据。
 
+**已知例外（Phase 1）**：`players` 表由 Gateway 直接**读取**，用于玩家档案校验。
+这是带退出条件的临时安排，依据
+[ADR-0002](adr/0002-gateway-temporary-player-ownership.md)；Player/State 服务落地后
+必须收敛。Gateway 对该表只读不写，测试数据由迁移脚本写入。
+
 ## 6. 一致性和幂等
 
 - 登录和匹配请求使用 `request_id` 作为幂等键。

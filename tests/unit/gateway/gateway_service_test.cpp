@@ -101,8 +101,9 @@ private:
 class GatewayServiceTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        // PlayerDirectory 现在是接口，需要以指针持有（内存实现，不访问数据库）。
         players_ = PlayerDirectory::WithBuiltinTestAccounts();
-        service_ = std::make_unique<GatewayServiceImpl>(&sessions_, &players_);
+        service_ = std::make_unique<GatewayServiceImpl>(&sessions_, players_.get());
     }
 
     /// 构造一个只填写必填字段的合法登录请求。
@@ -117,7 +118,7 @@ protected:
     }
 
     FakeSessionStore sessions_;
-    PlayerDirectory players_;
+    std::unique_ptr<PlayerDirectory> players_;
     std::unique_ptr<GatewayServiceImpl> service_;
 };
 
