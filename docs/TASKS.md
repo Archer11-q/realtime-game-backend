@@ -1,6 +1,6 @@
 # 当前任务
 
-> 状态：Phase 1 进行中。TASK-000 至 TASK-005 已完成，TASK-006 进行中。
+> 状态：Phase 1 进行中。TASK-000 至 TASK-006 已完成，TASK-007 任务单待确认。
 > 阶段推进依据见 docs/02-roadmap.md 与 docs/devlog.md。
 
 ## 当前里程碑
@@ -314,9 +314,26 @@
     protobuf 字段），已修复并复验通过，详见 `docs/devlog.md`。
   - 结论：**完成**，`v0.1-bootstrap` 里程碑达成。已通过 PR #2 合并到 `main`。
 
+## Phase 1 任务拆分（建议，待项目所有者确认）
+
+Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于对话中、未落到文档，
+此处补记。**下面 2~6 项的边界尚未经项目所有者逐条确认**，如与你的预期不符请直接改。
+
+| 序号 | 任务 | 交付物 | 依赖 |
+|---|---|---|---|
+| 1 | TASK-006 | 数据模型与 MySQL 迁移 | TASK-003 |
+| 2 | TASK-007 | Match Service：匹配队列与配对 | TASK-006 |
+| 3 | TASK-008 | Room/Battle Service：房间生命周期与权威状态 | TASK-007 |
+| 4 | TASK-009 | Gateway WebSocket 路由与房间消息 | TASK-008 |
+| 5 | TASK-010 | Vue 演示页面：登录、大厅、对战、结算 | TASK-009 |
+| 6 | TASK-011 | 集成验收：一条命令启动并双客户端完成对局 | TASK-010 |
+
+拆分原则：每个任务都要有**可独立运行的验收命令**，且不引入下一个任务的组件。
+这也是 TASK-007 中「房间只分配 ID、不产生房间状态」的原因——房间真实状态属于 TASK-008。
+
 ## TASK-006：数据模型与 MySQL 迁移
 
-- 状态：进行中
+- 状态：已完成（2026-09-22）
 - 依赖：TASK-003（Redis/MySQL 容器，已完成）
 - 背景问题：登录此前使用代码内的明文测试身份，`players` 表不存在。Phase 1 需要
   一个可恢复的数据基线，且「数据模型是否合理」必须靠真实读写验证，而不是只建空表。
@@ -369,6 +386,97 @@
 - 提交边界：允许改动 `migrations/`、`src/gateway/`、`tests/unit/gateway/`、
   `scripts/verify-login.sh`、`docs/`；禁止改动 `src/match/`、`src/room/`、
   `web/`、`deploy/compose/` 的服务定义。
+- 验收结果（2026-09-22）：
+  - 项目所有者实际执行 `ctest`（46/46）与 `bash scripts/verify-login.sh`（48/48），
+    均通过；`cmake --build --preset brpc-debug` 退出码 0。
+  - CI 对功能分支与 `main` 均为 `success`。
+  - 已通过 PR #3 合并到 `main`，合并提交 `0e58a2f`。
+  - 结论：**完成**。
+  - 遗留：`.env.example` 的端口默认值维持约定值 8080，端口冲突由
+    `scripts/verify-login.sh` 预检并自动挑空闲端口解决（不改程序默认值）。
+    `src/gateway/test_credentials.{hpp,cpp}` 命名易被误解为测试文件，改名事项
+    已记入 Backlog。
+
+## TASK-007：Match Service 匹配队列与配对
+
+- 状态：进行中（2026-09-22 起，任务单已由项目所有者确认）
+- 依赖：TASK-006（数据模型与 MySQL 迁移，已完成并合并，`0e58a2f`）
+- 背景问题：Phase 1 的最小闭环要求「两个客户端能匹配进同一房间」。当前只有 Gateway
+  的登录切片：没有匹配队列、没有配对逻辑，而且**至今没有任何一次服务间 brpc 调用**
+  ——此前的 brpc 只用来把 Gateway 自己暴露成 HTTP 服务。因此本任务同时是「第一个
+  服务间调用」的落地，必须先把「Gateway -> Match」的契约和失败语义建起来。
+- 本次目标：
+  - 建立 `MatchService` 的 Protobuf 契约与独立 brpc 服务进程。
+  - 实现入队、取消、查询当前匹配状态、超时淘汰。
+  - 实现 Phase 1 的最小配对规则：FIFO、两人一局、不比分数。
+  - 配对成功后产生 `match_id`，并通过房间分配接口取得 `room_id`。
+  - Gateway 新增三个 HTTP 接口，把请求转发给 Match，不自己保存队列状态。
+- 范围：
+  - `api/proto/match.proto`：`MatchService` 契约。
+  - `src/match/`：服务实现、匹配队列、配对器、房间分配接口、进程入口。
+  - `src/match/CMakeLists.txt` + 顶层 `CMakeLists.txt` 接入 `rgbt_match` 与
+    `rgbt_match_lib`。
+  - `src/gateway/`：三个 HTTP 接口；brpc channel 客户端与不可用处理。
+  - `tests/unit/match/`：队列、配对、取消、超时的单元测试。
+  - `scripts/verify-match.sh`：端到端验收入口。
+- 非范围：
+  - 不实现 Room/Battle Service（TASK-008）；房间只分配 ID，不产生房间状态。
+  - 不实现 WebSocket（TASK-009）；匹配结果由客户端轮询获得。
+  - 不实现分差/MMR、不实现多实例分片、不引入 etcd。
+  - 不实现队列的 Redis 快照与进程重启恢复（Phase 2）。
+  - 不做前端页面（TASK-010）。
+  - 不新增 MySQL 表。
+- **已确认决策（项目所有者于 2026-09-22 全部选择 A）**：
+  1. 队列存放位置：**A) 放在 Match 进程内存**。Redis 只用于可观测性镜像，
+     队列快照与重启恢复留 Phase 2。
+  2. 配对规则：**A) Phase 1 只做 FIFO 两人一局**，不实现分差放宽与等待时间放宽。
+     理由：当前没有任何分数体系，先实现会把未验证的评分模型固化进契约。
+  3. 房间分配：**A) 抽象 `RoomAllocator` 接口**，Phase 1 用「生成 room_id 并登记」的
+     占位实现，TASK-008 替换为真实调用。Room 的契约由拥有它的 TASK-008 定型。
+  4. 客户端获取匹配结果：**A) 轮询 `GET /api/v1/matches/current`**。
+     WebSocket 属 TASK-009 范围；轮询接口在 WebSocket 落地后仍作为兜底保留。
+  5. 监听端口与配置变量：**`MATCH_HTTP_PORT=8082`**，同步写入
+     `deploy/compose/.env.example` 与 `docs/06-operations.md` 的配置清单。
+- 相关 ADR：本任务**不修改服务边界或数据所有权**（决策 1、3 均选 A），因此不需要新 ADR。
+- 涉及目录：`api/proto/`、`src/match/`、`src/gateway/`、`tests/unit/match/`、
+  `scripts/`、顶层 `CMakeLists.txt`、`deploy/compose/.env.example`、`docs/`。
+- 接口变化：Gateway 新增 `POST /api/v1/matches`、`GET /api/v1/matches/current`、
+  `DELETE /api/v1/matches/current`；新增服务间 `MatchService` 契约。
+  实现前必须同步更新 `docs/05-api-and-data.md` 第 2 节的接口表。
+- 数据变化：无 MySQL 变更。若采用内存队列，Redis **不新增**匹配相关键；
+  若需要可观测性，只加只读镜像键 `dev:match:queue_size`（带 TTL）。
+- 失败场景：
+  - Match 不可用：入队返回 503 `match_unavailable`，不伪装成功；恢复后无需重启。
+  - 玩家已在队列：返回 200 与当前状态（幂等），不视为错误。
+  - 玩家不在队列却取消：返回 200（幂等成功），理由与登出保持一致。
+  - 队列已满：返回 429 `match_queue_full`，属限流类错误，调用方退避重试。
+  - 请求超时：惰性淘汰，查询返回「未匹配」，不返回错误。
+  - **不可信任客户端传入的 player_id**：一律使用会话中的 player_id，
+    请求体里的同名字段一律忽略，否则可被用来冒充他人入队。
+  - 同一玩家不允许同时出现在两个未结束的匹配结果中（架构文档明确要求），
+    配对时必须做一次原子性检查。
+- 验收命令（在 WSL 中执行）：
+  ```bash
+  cmake --preset brpc-debug && cmake --build --preset brpc-debug
+  ctest --test-dir build/brpc-debug
+  bash scripts/verify-match.sh
+  ```
+- 测试要求：单元测试覆盖入队顺序、两人配对、重复入队幂等、取消、超时淘汰、
+  队列上限、同一玩家不可重复配对；端到端覆盖两个账号入队后被配成同一
+  `match_id` 与 `room_id`、取消后不再被配对、Match 停机时 Gateway 返回 503、
+  Match 恢复后无需重启即可匹配。
+- 回退方式：`git revert` 单次提交；Match 为新增进程，回退不影响 Gateway 既有接口。
+- 负责人：执行者（写入权）— 本轮由当前会话代理承担，项目所有者审阅与验收。
+- 写入权说明：按 `CLAUDE.md`「协作纪律」，本轮写入权授予当前执行会话。
+- 验收标准：
+  - 两个不同账号入队后被配成同一局，`match_id` 与 `room_id` 在两侧一致。
+  - 第三个玩家不会被并入一个已配满的局。
+  - 取消后不再被配对；重复取消不报错。
+  - Match 不可用时 Gateway 返回 503，恢复后无需重启即可匹配。
+  - 单元测试与 `scripts/verify-match.sh` 全部实际运行通过。
+- 提交边界：允许改动 `api/proto/`、`src/match/`、`src/gateway/`、`tests/unit/`、
+  `scripts/`、顶层 `CMakeLists.txt`、`deploy/compose/.env.example`、`docs/`；
+  禁止改动 `src/room/`、`web/`、`migrations/`、`deploy/compose/docker-compose.yml`。
 
 ## Backlog：后续待办
 
@@ -379,6 +487,11 @@
   （理由见 `docs/devlog.md` 的 TASK-005 记录，待出现第二个 proto 时评估）。
 - 为 Gateway 增加区分存活与就绪的健康检查端点（`/health/ready`），
   同时检查 Redis 与 MySQL。
+- 把 `src/gateway/test_credentials.{hpp,cpp}` 改名为 `dev_accounts.{hpp,cpp}`。
+  它与测试无关：里面是**开发期固定测试身份**（账号 + 口令摘要），被产品代码在登录时
+  调用并编入 `rgbt_gateway_lib`，只因名字带 `test` 而容易被误认为测试文件，也容易
+  被误认为「测试代码不该进产品二进制」。改名需同步 CMake、测试与文档三处；
+  等出现第二个调用方（Player 服务）时，连同「提升到 `include/common/`」一起做。
 
 ## 任务完成定义
 
