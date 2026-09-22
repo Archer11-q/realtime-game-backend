@@ -136,13 +136,23 @@ Match Service      Room/Battle    Player/State
 
 ```text
 浏览器
-  -> Gateway 发起匹配
-  -> Match 入队
-  -> 匹配成功
-  -> Match 请求 Room 创建房间
-  -> Match/Gateway 通知玩家
+  -> Gateway 发起匹配（HTTP）
+  -> Gateway 从会话取出 player_id，调用 MatchService.EnqueueMatch
+  -> Match 入队并尝试配对（FIFO，两人一局）
+  -> 匹配成功，分配 room_id
+  -> Gateway 返回当前状态；客户端轮询 /api/v1/matches/current 领取结果
   -> 玩家通过 WebSocket 进入房间
 ```
+
+Phase 1 的落地差异（TASK-007 记录，避免把计划当成已实现）：
+
+- 「Match 请求 Room 创建房间」这一步**尚未发生**。Room/Battle Service 属 TASK-008，
+  因此匹配成功只分配一个 `room_id`（由 `match_id` 派生），不产生任何房间状态。
+  接口已抽象为 `RoomAllocator`，TASK-008 替换实现即可。
+- 「通知玩家」当前用**轮询**实现，WebSocket 推送属 TASK-009。轮询接口在
+  WebSocket 落地后仍作为兜底保留。
+- 配对规则只有 FIFO 两人一局，**没有分差放宽**：当前没有任何分数体系，
+  先实现等于把未验证的评分模型固化进契约。
 
 ### 4.3 对战
 
@@ -186,7 +196,7 @@ Room 发布 MatchFinished
 |---|---|---|---|
 | WebSocket 连接 | Gateway | 内存 | 客户端重连后重建 |
 | 玩家会话 | Gateway/Player | Redis + MySQL | 使用 Session 映射恢复 |
-| 匹配队列 | Match | 内存 + Redis 快照 | 单节点重建，后续再评估分片 |
+| 匹配队列 | Match | 内存（Phase 1）；Redis 快照属 Phase 2 | 当前重启即丢失；快照与重建在 Phase 2 定义 |
 | 房间权威状态 | Room | 内存 + 快照 | 从最近快照和事件恢复 |
 | 玩家档案和战绩 | Player/Settlement | MySQL | 数据库恢复 |
 | 排行榜 | Player/State | Redis | 数据可从 MySQL 重建 |

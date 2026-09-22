@@ -14,6 +14,7 @@
 
 #include "common/token.hpp"
 #include "error.hpp"
+#include "match_client.hpp"
 #include "player_directory.hpp"
 #include "session_store.hpp"
 
@@ -21,13 +22,23 @@ namespace {
 
 using rgbt::gateway::CredentialStatus;
 using rgbt::gateway::GatewayServiceImpl;
+using rgbt::gateway::MatchCallStatus;
+using rgbt::gateway::MatchClient;
+using rgbt::gateway::MatchSnapshot;
+using rgbt::gateway::MatchState;
 using rgbt::gateway::PlayerDirectory;
 using rgbt::gateway::SessionRecord;
 using rgbt::gateway::SessionStore;
 using rgbt::gateway::StoreStatus;
+using rgbt::gateway::v1::CancelMatchRequest;
+using rgbt::gateway::v1::CancelMatchResponse;
+using rgbt::gateway::v1::EnqueueMatchRequest;
+using rgbt::gateway::v1::EnqueueMatchResponse;
 using rgbt::gateway::v1::ErrorCode;
 using rgbt::gateway::v1::GetCurrentPlayerRequest;
 using rgbt::gateway::v1::GetCurrentPlayerResponse;
+using rgbt::gateway::v1::GetMatchStatusRequest;
+using rgbt::gateway::v1::GetMatchStatusResponse;
 using rgbt::gateway::v1::LoginRequest;
 using rgbt::gateway::v1::LoginResponse;
 using rgbt::gateway::v1::LogoutRequest;
@@ -97,13 +108,67 @@ private:
     std::map<std::string, std::string> idempotency_;
 };
 
+/// 内存匹配客户端。
+///
+/// 存在的意义是让「Match 不可用」「队列已满」这类依赖错误可以在单元测试里稳定
+/// 复现——这些路径在集成环境里要靠停掉一个进程才能造出来。
+class FakeMatchClient : public MatchClient {
+public:
+    /// 下一次（以及之后所有）调用的返回值。
+    MatchCallStatus next_status = MatchCallStatus::kOk;
+
+    /// GetStatus/Enqueue 返回的快照。
+    MatchSnapshot snapshot;
+
+    /// 记录最近一次调用传入的 player_id，用于验证「player_id 来自会话」。
+    std::string last_player_id;
+    std::string last_request_id;
+    int enqueue_calls = 0;
+    int status_calls = 0;
+    int cancel_calls = 0;
+
+    MatchCallStatus Enqueue(const std::string& player_id, const std::string& request_id,
+                            MatchSnapshot* out_snapshot) override {
+        ++enqueue_calls;
+        last_player_id = player_id;
+        last_request_id = request_id;
+        if (out_snapshot != nullptr) {
+            *out_snapshot = snapshot;
+        }
+        return next_status;
+    }
+
+    MatchCallStatus GetStatus(const std::string& player_id, MatchSnapshot* out_snapshot) override {
+        ++status_calls;
+        last_player_id = player_id;
+        if (out_snapshot != nullptr) {
+            *out_snapshot = snapshot;
+        }
+        return next_status;
+    }
+
+    MatchCallStatus Cancel(const std::string& player_id, const std::string& request_id,
+                           MatchSnapshot* out_snapshot) override {
+        ++cancel_calls;
+        last_player_id = player_id;
+        last_request_id = request_id;
+        if (out_snapshot != nullptr) {
+            *out_snapshot = snapshot;
+        }
+        return next_status;
+    }
+
+    [[nodiscard]] bool IsHealthy() override { return true; }
+};
+
 /// 测试夹具：构造服务与依赖。
 class GatewayServiceTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // PlayerDirectory 现在是接口，需要以指针持有（内存实现，不访问数据库）。
+        // PlayerDirectory 与 MatchClient 都是接口，需要以指针持有。
+        // 两者都使用不访问外部依赖的实现，因此这些用例不需要 Redis/MySQL/Match。
         players_ = PlayerDirectory::WithBuiltinTestAccounts();
-        service_ = std::make_unique<GatewayServiceImpl>(&sessions_, players_.get());
+        service_ = std::make_unique<GatewayServiceImpl>(&sessions_, players_.get(), &match_);
     }
 
     /// 构造一个只填写必填字段的合法登录请求。
@@ -117,7 +182,16 @@ protected:
         return request;
     }
 
+    /// 登录 alice 并返回 Token，供需要已认证会话的用例使用。
+    std::string LoginAlice(const std::string& request_id = "") {
+        LoginRequest request = MakeValidLogin("alice", "alice_dev_pw", request_id);
+        LoginResponse response;
+        service_->Login(nullptr, &request, &response, nullptr);
+        return response.token();
+    }
+
     FakeSessionStore sessions_;
+    FakeMatchClient match_;
     std::unique_ptr<PlayerDirectory> players_;
     std::unique_ptr<GatewayServiceImpl> service_;
 };
@@ -431,10 +505,17 @@ TEST(ErrorCodeMappingTest, MapsToExpectedHttpStatus) {
     EXPECT_EQ(rgbt::gateway::HttpStatusOf(ErrorCode::ERROR_CODE_UNSPECIFIED), 500);
 }
 
-TEST(ErrorCodeMappingTest, OnlyUnavailableIsRetryable) {
+TEST(ErrorCodeMappingTest, RetryableCoversUnavailableAndThrottling) {
+    // 依赖暂时失败与限流都可以重试（限流需退避）；输入错误与未认证重试无意义。
     EXPECT_TRUE(rgbt::gateway::IsRetryable(ErrorCode::UNAVAILABLE));
+    EXPECT_TRUE(rgbt::gateway::IsRetryable(ErrorCode::RESOURCE_EXHAUSTED));
     EXPECT_FALSE(rgbt::gateway::IsRetryable(ErrorCode::INVALID_ARGUMENT));
     EXPECT_FALSE(rgbt::gateway::IsRetryable(ErrorCode::UNAUTHENTICATED));
+}
+
+TEST(ErrorCodeMappingTest, ResourceExhaustedMapsToTooManyRequests) {
+    // 队列已满必须是 429 而不是 503：请求本身没错，是当前容量不足。
+    EXPECT_EQ(rgbt::gateway::HttpStatusOf(ErrorCode::RESOURCE_EXHAUSTED), 429);
 }
 
 TEST(TokenTest, GeneratesUniqueAndWellFormedTokens) {
@@ -451,6 +532,264 @@ TEST(TokenTest, RejectsMalformedTokens) {
     EXPECT_FALSE(rgbt::common::IsValidTokenFormat("has space"));
     EXPECT_FALSE(rgbt::common::IsValidTokenFormat("has/slash"));
     EXPECT_FALSE(rgbt::common::IsValidTokenFormat(std::string(257, 'a')));
+}
+
+// ---------------------------------------------------------------------------
+// 匹配：进入队列（TASK-007）
+// ---------------------------------------------------------------------------
+
+TEST_F(GatewayServiceTest, EnqueueMatchRequiresToken) {
+    EnqueueMatchRequest request;
+    request.set_token("");
+    EnqueueMatchResponse response;
+    service_->EnqueueMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 400);
+    EXPECT_EQ(response.error().reason(), "token_required");
+    // 未通过鉴权时不应触碰 Match。
+    EXPECT_EQ(match_.enqueue_calls, 0);
+}
+
+TEST_F(GatewayServiceTest, EnqueueMatchRejectsUnknownToken) {
+    EnqueueMatchRequest request;
+    // 格式合法但从未签发过的 Token。
+    request.set_token(rgbt::common::GenerateToken());
+    EnqueueMatchResponse response;
+    service_->EnqueueMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 401);
+    EXPECT_EQ(response.error().reason(), "session_not_found");
+    EXPECT_EQ(match_.enqueue_calls, 0);
+}
+
+TEST_F(GatewayServiceTest, EnqueueMatchUsesPlayerIdFromSessionNotRequest) {
+    const std::string token = LoginAlice();
+
+    match_.snapshot.state = MatchState::kQueued;
+    match_.snapshot.queue_size = 1;
+
+    EnqueueMatchRequest request;
+    request.set_token(token);
+    request.set_request_id("req-match-1");
+    EnqueueMatchResponse response;
+    service_->EnqueueMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 200);
+    EXPECT_EQ(response.match().state(), "queued");
+    EXPECT_EQ(response.match().queue_size(), 1);
+    // 关键安全断言：传给 Match 的 player_id 来自会话（alice = p-0001），
+    // 请求体里没有这个字段，也没有任何途径让客户端指定它。
+    EXPECT_EQ(match_.last_player_id, "p-0001");
+    EXPECT_EQ(match_.last_request_id, "req-match-1");
+}
+
+TEST_F(GatewayServiceTest, EnqueueMatchReturnsMatchedSnapshot) {
+    const std::string token = LoginAlice();
+
+    match_.snapshot.state = MatchState::kMatched;
+    match_.snapshot.match_id = "m-abc";
+    match_.snapshot.room_id = "room-m-abc";
+    match_.snapshot.player_ids = {"p-0001", "p-0002"};
+    match_.snapshot.queued_at_ms = 1234;
+
+    EnqueueMatchRequest request;
+    request.set_token(token);
+    EnqueueMatchResponse response;
+    service_->EnqueueMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 200);
+    EXPECT_EQ(response.match().state(), "matched");
+    EXPECT_EQ(response.match().match_id(), "m-abc");
+    EXPECT_EQ(response.match().room_id(), "room-m-abc");
+    ASSERT_EQ(response.match().player_ids_size(), 2);
+    EXPECT_EQ(response.match().player_ids(0), "p-0001");
+    EXPECT_EQ(response.match().player_ids(1), "p-0002");
+    EXPECT_EQ(response.match().queued_at_ms(), 1234);
+}
+
+TEST_F(GatewayServiceTest, EnqueueMatchUnavailableReturns503) {
+    const std::string token = LoginAlice();
+    match_.next_status = MatchCallStatus::kUnavailable;
+
+    EnqueueMatchRequest request;
+    request.set_token(token);
+    EnqueueMatchResponse response;
+    service_->EnqueueMatch(nullptr, &request, &response, nullptr);
+
+    // Match 未启动时必须返回 503 而不是 500，也不允许伪装成功。
+    EXPECT_EQ(response.status_code(), 503);
+    EXPECT_EQ(response.error().reason(), "match_unavailable");
+    EXPECT_TRUE(rgbt::gateway::IsRetryable(response.error().code()));
+}
+
+TEST_F(GatewayServiceTest, EnqueueMatchQueueFullReturns429) {
+    const std::string token = LoginAlice();
+    match_.next_status = MatchCallStatus::kQueueFull;
+
+    EnqueueMatchRequest request;
+    request.set_token(token);
+    EnqueueMatchResponse response;
+    service_->EnqueueMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 429);
+    EXPECT_EQ(response.error().reason(), "match_queue_full");
+    EXPECT_EQ(response.error().code(), ErrorCode::RESOURCE_EXHAUSTED);
+}
+
+TEST_F(GatewayServiceTest, EnqueueMatchInvalidArgumentReturns400) {
+    const std::string token = LoginAlice();
+    match_.next_status = MatchCallStatus::kInvalidArgument;
+
+    EnqueueMatchRequest request;
+    request.set_token(token);
+    EnqueueMatchResponse response;
+    service_->EnqueueMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 400);
+    EXPECT_EQ(response.error().reason(), "match_invalid_argument");
+}
+
+TEST_F(GatewayServiceTest, EnqueueMatchInternalReturns500) {
+    const std::string token = LoginAlice();
+    match_.next_status = MatchCallStatus::kInternal;
+
+    EnqueueMatchRequest request;
+    request.set_token(token);
+    EnqueueMatchResponse response;
+    service_->EnqueueMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 500);
+    EXPECT_EQ(response.error().reason(), "match_internal");
+}
+
+// ---------------------------------------------------------------------------
+// 匹配：查询状态
+// ---------------------------------------------------------------------------
+
+TEST_F(GatewayServiceTest, GetMatchStatusRequiresToken) {
+    GetMatchStatusRequest request;
+    GetMatchStatusResponse response;
+    service_->GetMatchStatus(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 400);
+    EXPECT_EQ(response.error().reason(), "token_required");
+    EXPECT_EQ(match_.status_calls, 0);
+}
+
+TEST_F(GatewayServiceTest, GetMatchStatusReturnsIdleForNewPlayer) {
+    const std::string token = LoginAlice();
+    match_.snapshot.state = MatchState::kIdle;
+
+    GetMatchStatusRequest request;
+    request.set_token(token);
+    GetMatchStatusResponse response;
+    service_->GetMatchStatus(nullptr, &request, &response, nullptr);
+
+    // 「刚登录还没匹配过」是正常情形，不是错误：客户端不必为它写错误分支。
+    EXPECT_EQ(response.status_code(), 200);
+    EXPECT_FALSE(response.has_error());
+    EXPECT_EQ(response.match().state(), "idle");
+    EXPECT_EQ(match_.last_player_id, "p-0001");
+}
+
+TEST_F(GatewayServiceTest, GetMatchStatusReturnsTimeoutState) {
+    const std::string token = LoginAlice();
+    match_.snapshot.state = MatchState::kTimeout;
+
+    GetMatchStatusRequest request;
+    request.set_token(token);
+    GetMatchStatusResponse response;
+    service_->GetMatchStatus(nullptr, &request, &response, nullptr);
+
+    // 超时必须与 idle 区分：前者提示「重新匹配」，后者是「可以开始匹配」。
+    EXPECT_EQ(response.status_code(), 200);
+    EXPECT_EQ(response.match().state(), "timeout");
+}
+
+TEST_F(GatewayServiceTest, GetMatchStatusUnavailableReturns503) {
+    const std::string token = LoginAlice();
+    match_.next_status = MatchCallStatus::kUnavailable;
+
+    GetMatchStatusRequest request;
+    request.set_token(token);
+    GetMatchStatusResponse response;
+    service_->GetMatchStatus(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 503);
+    EXPECT_EQ(response.error().reason(), "match_unavailable");
+}
+
+// ---------------------------------------------------------------------------
+// 匹配：取消
+// ---------------------------------------------------------------------------
+
+TEST_F(GatewayServiceTest, CancelMatchIsIdempotentWhenNotQueued) {
+    const std::string token = LoginAlice();
+    // 玩家本来就不在队列中：Match 返回空闲状态，Gateway 按幂等成功处理。
+    match_.snapshot.state = MatchState::kIdle;
+
+    CancelMatchRequest request;
+    request.set_token(token);
+    CancelMatchResponse response;
+    service_->CancelMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 200);
+    EXPECT_FALSE(response.has_error());
+    EXPECT_EQ(response.match().state(), "idle");
+    EXPECT_EQ(match_.cancel_calls, 1);
+}
+
+TEST_F(GatewayServiceTest, CancelMatchRemovesQueuedPlayer) {
+    const std::string token = LoginAlice();
+    match_.snapshot.state = MatchState::kIdle;
+
+    CancelMatchRequest request;
+    request.set_token(token);
+    request.set_request_id("req-cancel-1");
+    CancelMatchResponse response;
+    service_->CancelMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 200);
+    EXPECT_EQ(match_.last_player_id, "p-0001");
+    EXPECT_EQ(match_.last_request_id, "req-cancel-1");
+}
+
+TEST_F(GatewayServiceTest, CancelMatchRequiresToken) {
+    CancelMatchRequest request;
+    CancelMatchResponse response;
+    service_->CancelMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 400);
+    EXPECT_EQ(response.error().reason(), "token_required");
+    EXPECT_EQ(match_.cancel_calls, 0);
+}
+
+TEST_F(GatewayServiceTest, CancelMatchUnavailableReturns503) {
+    const std::string token = LoginAlice();
+    match_.next_status = MatchCallStatus::kUnavailable;
+
+    CancelMatchRequest request;
+    request.set_token(token);
+    CancelMatchResponse response;
+    service_->CancelMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 503);
+    EXPECT_EQ(response.error().reason(), "match_unavailable");
+}
+
+TEST_F(GatewayServiceTest, MatchEndpointsReturn503WhenSessionStoreIsDown) {
+    const std::string token = LoginAlice();
+    sessions_.unavailable = true;
+
+    // 会话存储不可用时，鉴权阶段就应该失败，且不应触碰 Match。
+    EnqueueMatchRequest request;
+    request.set_token(token);
+    EnqueueMatchResponse response;
+    service_->EnqueueMatch(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 503);
+    EXPECT_EQ(response.error().reason(), "session_store_unavailable");
+    EXPECT_EQ(match_.enqueue_calls, 0);
 }
 
 }  // namespace

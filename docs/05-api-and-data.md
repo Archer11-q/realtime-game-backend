@@ -17,18 +17,47 @@
 
 建议首批接口：
 
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| POST | `/api/v1/login` | 使用测试身份登录 |
-| GET | `/api/v1/players/me` | 查询当前玩家信息 |
-| GET | `/api/v1/matches/current` | 查询当前匹配状态 |
-| POST | `/api/v1/matches` | 进入匹配 |
-| DELETE | `/api/v1/matches/current` | 取消匹配 |
-| GET | `/api/v1/rooms/{room_id}` | 查询房间状态 |
-| GET | `/api/v1/results/{match_id}` | 查询对局结果 |
-| GET | `/health` | 健康检查 |
+| 方法 | 路径 | 用途 | 状态 |
+|---|---|---|---|
+| POST | `/api/v1/login` | 使用测试身份登录 | 已实现（TASK-005） |
+| GET | `/api/v1/players/me` | 查询当前玩家信息 | 已实现（TASK-005） |
+| POST | `/api/v1/logout` | 结束会话 | 已实现（TASK-005） |
+| POST | `/api/v1/matches` | 进入匹配 | 已实现（TASK-007） |
+| GET | `/api/v1/matches/current` | 查询当前匹配状态 | 已实现（TASK-007） |
+| POST | `/api/v1/matches/current/cancel` | 取消匹配 | 已实现（TASK-007） |
+| GET | `/api/v1/rooms/{room_id}` | 查询房间状态 | 待 TASK-008 |
+| GET | `/api/v1/results/{match_id}` | 查询对局结果 | 待 Phase 5 |
+| GET | `/health` | 健康检查 | 已实现（brpc 内置服务） |
 
 接口名称在实现前可以调整，但必须更新本文档。
+
+**已发生的调整（TASK-007）**：取消匹配原设计为 `DELETE /api/v1/matches/current`，
+与查询接口共用同一路径。实现时确认 **brpc 的 restful 映射按路径分派，不支持按
+HTTP 方法分派**，同一路径无法同时承载 GET 与 DELETE，因此改为
+`POST /api/v1/matches/current/cancel`。这不是偏好问题，是框架约束。
+
+### 匹配接口的错误语义
+
+匹配是第一个跨服务调用（Gateway -> Match），错误语义必须逐项明确，
+否则调用方无法判断「该重试还是该放弃」：
+
+| 情形 | HTTP | `error.reason` | 调用方行为 |
+|---|---|---|---|
+| 未携带或格式非法 Token | 400 | `token_required` / `token_malformed` | 不重试，先登录 |
+| Token 合法但会话不存在 | 401 | `session_not_found` | 不重试，重新登录 |
+| 玩家已在队列，或已有未领取的匹配结果 | 200 | 无错误 | **不是错误**，读 `match.state` 即可 |
+| 玩家不在队列时取消 | 200 | 无错误 | 幂等成功，读 `match.state`（通常为 `idle`） |
+| 排队超时被淘汰 | 200 | 无错误 | `match.state = timeout`，提示重新匹配 |
+| Match 不可用（未启动 / 超时） | 503 | `match_unavailable` | 可退避重试，恢复后无需重启 |
+| 队列已满 | 429 | `match_queue_full` | 属限流，退避后重试 |
+| Match 返回未分类错误 | 500 | `match_internal` | 记录并告警 |
+
+`match.state` 取值：`idle`（未排队且无结果）、`queued`（排队中）、
+`matched`（已配对，`match_id` 与 `room_id` 有效）、`timeout`（排队超时，需重新匹配）。
+`timeout` 必须与 `idle` 区分：前者提示「重新匹配」，后者是「可以开始匹配」。
+
+**安全约束**：匹配接口的 `player_id` **只能来自会话**，请求体里即使带上该字段也会被
+忽略。否则任何登录用户都能替他人入队。
 
 ### WebSocket 消息信封
 
@@ -66,7 +95,7 @@
 建议服务：
 
 - `GatewayService`
-- `MatchService`
+- `MatchService`（已实现，TASK-007，契约见 `api/proto/match.proto`）
 - `RoomService`
 - `PlayerService`
 - `SettlementService`
@@ -77,6 +106,14 @@
 - 调用者和目标业务 ID。
 - 必要的版本或乐观锁字段。
 - 可重试错误码。
+
+`MatchService` 是本项目第一个服务间契约，落地时确认了两条约定：
+
+- 每个 RPC 都带 `request_id`，每个响应都带可判定的 `error.reason`——排查跨服务问题
+  时这是唯一的关联键。
+- 调用方（Gateway）**把传输层失败与业务错误分开**：`controller.Failed()` 表示对端
+  不可用（映射 503），响应里的 `error` 才是业务结果（映射 400/429/500）。
+  混在一起会把「队列已满」误报成「服务不可用」。
 
 错误码分类：
 
@@ -100,6 +137,11 @@
 - 房间短期路由信息。
 - 排行榜视图。
 - 限流和短期幂等标记。
+
+当前落地情况（TASK-007 记录）：**匹配队列没有放进 Redis**。队列所有者是 Match，
+Phase 1 用进程内存实现（见 `docs/01-architecture.md` 第 5 节），快照与重启恢复属
+Phase 2。这样做避免了「Gateway 直读 Match 的数据」这一所有权变化——若改为
+Gateway 直接读 Redis 中的队列状态，必须先写 ADR。
 
 约束：
 

@@ -1,0 +1,162 @@
+// Match Service 的服务间契约。
+//
+// 说明：
+//   * Match 拥有匹配队列（docs/01-architecture.md 第 3 节、第 8 节）。Gateway 只能
+//     通过本契约请求入队、查询和取消，不直接读写队列状态——否则队列所有权就从
+//     Match 转移到了 Gateway。
+//   * 字段只追加，不修改既有标签号；删除字段必须先标记 reserved。
+//   * 本文件是**第一个服务间契约**：此前 brpc 只用于把 Gateway 暴露成 HTTP 服务。
+//     因此每个请求都带 request_id，每个响应都带可判定的 error.reason。
+//   * TASK-007 只做最小配对：FIFO、两人一局（决策 2 选 A）。分差放宽没有分数体系
+//     支撑，留到有评分模型之后。
+//
+// 路径与错误码依据 docs/05-api-and-data.md 第 2、3 节。
+
+syntax = "proto3";
+
+package rgbt.match.v1;
+
+option cc_generic_services = true;
+
+// ---------------------------------------------------------------------------
+// 公共结构
+// ---------------------------------------------------------------------------
+
+// 匹配状态。
+//
+// IDLE 与 TIMEOUT 必须区分：前者是「没在排队也没有结果」，后者是「排过队但超时被
+// 淘汰」。对客户端来说前者是「可以开始匹配」，后者是「需要重新匹配」，合并成一个
+// 状态会让前端无法给出正确提示。
+enum MatchState {
+  MATCH_STATE_UNSPECIFIED = 0;
+
+  // 既不在队列中，也没有待领取的匹配结果。
+  MATCH_STATE_IDLE = 1;
+
+  // 在队列中等待配对。
+  MATCH_STATE_QUEUED = 2;
+
+  // 已配对成功。match_id 与 room_id 有效，玩家应从队列中移除。
+  MATCH_STATE_MATCHED = 3;
+
+  // 排队超时被惰性淘汰，需要重新入队。
+  MATCH_STATE_TIMEOUT = 4;
+}
+
+// 错误码。与 docs/05-api-and-data.md 第 3 节的分类对应：
+//   INVALID_ARGUMENT   输入错误，调用方不应重试
+//   ALREADY_QUEUED     状态冲突，按幂等成功处理，调用方取 status 即可
+//   QUEUE_FULL         限流，调用方退避后重试
+//   INTERNAL           未分类内部错误
+enum MatchErrorCode {
+  MATCH_ERROR_CODE_UNSPECIFIED = 0;
+  MATCH_INVALID_ARGUMENT = 1;
+  MATCH_ALREADY_QUEUED = 2;
+  MATCH_QUEUE_FULL = 3;
+  MATCH_INTERNAL = 4;
+}
+
+// 统一错误体。
+message MatchError {
+  MatchErrorCode code = 1;
+
+  // 稳定可判定的错误标识，例如 queue_full。
+  string reason = 2;
+
+  // 面向开发者的描述，不包含敏感信息。
+  string message = 3;
+
+  // 与请求中的 request_id 对应，便于跨服务追踪。
+  string request_id = 4;
+}
+
+// 匹配状态快照。承载 Match 拥有的队列状态。
+message MatchStatus {
+  MatchState state = 1;
+
+  // 本次匹配请求的幂等键。state 为 IDLE 时为空。
+  string request_id = 2;
+
+  // state == MATCH_STATE_MATCHED 时有效。
+  string match_id = 3;
+
+  // state == MATCH_STATE_MATCHED 时有效。由房间分配接口产生。
+  // TASK-007 期间只是占位号，不含任何房间状态（TASK-008 接管）。
+  string room_id = 4;
+
+  // 同局玩家，包含自己。客户端据此知道「和谁匹配上了」。
+  repeated string player_ids = 5;
+
+  // 入队时间（Unix 毫秒）。客户端据此显示等待时长。
+  int64 queued_at_ms = 6;
+
+  // 淘汰后的当前队列长度。用于回答「为什么还没匹配上」。
+  int32 queue_size = 7;
+}
+
+// ---------------------------------------------------------------------------
+// 进入匹配
+// ---------------------------------------------------------------------------
+
+message EnqueueMatchRequest {
+  // 幂等键。同一 request_id 重复入队不产生第二条队列记录。
+  string request_id = 1;
+
+  // 玩家标识。**必须由 Gateway 从会话中填充**，不得使用客户端提交的值，
+  // 否则任何登录用户都能替别人入队。
+  string player_id = 2;
+}
+
+message EnqueueMatchResponse {
+  MatchError error = 1;
+
+  // 无论成功还是「已在队列」都返回当前状态，保证调用方总能拿到一致视图。
+  MatchStatus status = 2;
+}
+
+// ---------------------------------------------------------------------------
+// 查询匹配状态
+// ---------------------------------------------------------------------------
+
+message GetMatchStatusRequest {
+  string request_id = 1;
+
+  string player_id = 2;
+}
+
+message GetMatchStatusResponse {
+  MatchError error = 1;
+
+  MatchStatus status = 2;
+}
+
+// ---------------------------------------------------------------------------
+// 取消匹配
+// ---------------------------------------------------------------------------
+
+message CancelMatchRequest {
+  string request_id = 1;
+
+  string player_id = 2;
+}
+
+message CancelMatchResponse {
+  MatchError error = 1;
+
+  MatchStatus status = 2;
+}
+
+// ---------------------------------------------------------------------------
+// 服务定义
+// ---------------------------------------------------------------------------
+
+service MatchService {
+  // 进入匹配队列。玩家已在队列或已有匹配结果时按幂等处理，返回当前状态。
+  rpc EnqueueMatch(EnqueueMatchRequest) returns (EnqueueMatchResponse);
+
+  // 查询当前匹配状态。TASK-007 期间客户端轮询本接口获取匹配结果（决策 4 选 A）。
+  rpc GetMatchStatus(GetMatchStatusRequest) returns (GetMatchStatusResponse);
+
+  // 取消匹配。玩家不在队列时按幂等成功处理，与登出保持一致。
+  rpc CancelMatch(CancelMatchRequest) returns (CancelMatchResponse);
+}

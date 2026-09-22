@@ -483,8 +483,11 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
 - 将 brpc 预设与 Compose 配置纳入 CI 覆盖。
 - 实现 `docs/05-api-and-data.md` 中其余接口（匹配、房间、结果）。
 - Token 刷新与长期会话策略（Phase 2）。
-- 把 proto 代码生成从 `src/gateway/CMakeLists.txt` 移到顶层或 `api/proto/`
-  （理由见 `docs/devlog.md` 的 TASK-005 记录，待出现第二个 proto 时评估）。
+- 抽取 Protobuf 代码生成的公共 CMake 逻辑。TASK-007 引入了第二个 proto
+  （`api/proto/match.proto`），`src/match/CMakeLists.txt` 与
+  `src/gateway/CMakeLists.txt` 中的生成写法现在**确实重复了**。TASK-007 故意不做
+  抽取：把公共 CMake 函数的重构混进「新增服务」的提交里会降低可审阅性。
+  建议在第三个 proto 出现、或把代码生成整体上移到顶层时一并处理。
 - 为 Gateway 增加区分存活与就绪的健康检查端点（`/health/ready`），
   同时检查 Redis 与 MySQL。
 - 把 `src/gateway/test_credentials.{hpp,cpp}` 改名为 `dev_accounts.{hpp,cpp}`。

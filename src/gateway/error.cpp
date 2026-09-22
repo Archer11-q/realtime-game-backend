@@ -11,6 +11,10 @@ std::int32_t HttpStatusOf(rgbt::gateway::v1::ErrorCode code) noexcept {
             return 401;
         case ErrorCode::NOT_FOUND:
             return 404;
+        case ErrorCode::RESOURCE_EXHAUSTED:
+            // 限流（例如匹配队列已满）。429 而不是 503：请求本身没错，
+            // 是当前容量不足，调用方应退避后重试。
+            return 429;
         case ErrorCode::UNAVAILABLE:
             return 503;
         case ErrorCode::INTERNAL:
@@ -38,6 +42,8 @@ std::string_view ErrorCodeName(rgbt::gateway::v1::ErrorCode code) noexcept {
             return "UNAUTHENTICATED";
         case ErrorCode::NOT_FOUND:
             return "NOT_FOUND";
+        case ErrorCode::RESOURCE_EXHAUSTED:
+            return "RESOURCE_EXHAUSTED";
         case ErrorCode::UNAVAILABLE:
             return "UNAVAILABLE";
         case ErrorCode::INTERNAL:
@@ -51,8 +57,8 @@ std::string_view ErrorCodeName(rgbt::gateway::v1::ErrorCode code) noexcept {
 
 bool IsRetryable(rgbt::gateway::v1::ErrorCode code) noexcept {
     using rgbt::gateway::v1::ErrorCode;
-    // 只有依赖暂时失败才允许调用方重试；输入错误和未认证重试无意义。
-    return code == ErrorCode::UNAVAILABLE;
+    // 依赖暂时失败与限流都允许调用方重试（限流需退避）；输入错误和未认证重试无意义。
+    return code == ErrorCode::UNAVAILABLE || code == ErrorCode::RESOURCE_EXHAUSTED;
 }
 
 }  // namespace rgbt::gateway
