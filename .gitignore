@@ -56,7 +56,10 @@ dist/
 # Local maintenance scripts
 # 以 scripts/_ 开头的临时或本机辅助脚本不纳入版本管理，避免被一次性提交
 # 误同步到其他环境。需要长期保留的脚本请改用不带下划线前缀的名字。
-scripts/_*.sh
+#
+# 模式写成 scripts/_* 而不是 scripts/_*.sh：这个规则已经因为「只匹配 .sh」
+# 而漏掉过辅助文件（如 scripts/_commitmsg.txt），改为匹配全部扩展名。
+scripts/_*
 
 # Database dumps and backups
 # 数据库导出文件包含真实数据，绝不能进入版本库。
@@ -64,4 +67,9 @@ scripts/_*.sh
 backup-*.sql
 *_dump.sql
 redis-dump-*.rdb
+
+# 面试复习笔记
+# 每个任务（版本迭代）一份，记录需要掌握的内容与答案，用于应对面试的项目深挖。
+# 属于个人学习材料，不是项目交付物，不进入版本库。
+interview-notes/
 

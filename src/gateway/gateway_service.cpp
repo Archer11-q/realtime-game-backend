@@ -118,12 +118,31 @@ std::string ValidateToken(const std::string& token) {
     return {};
 }
 
+/// 匹配状态 -> 对外字符串。
+///
+/// 对外用字符串而不是枚举数字：浏览器直接可用，且新增状态时不需要客户端同步升级
+/// 枚举定义。字符串取值与 api/proto/match.proto 的枚举名一一对应。
+std::string MatchStateName(MatchState state) {
+    switch (state) {
+        case MatchState::kIdle:
+            return "idle";
+        case MatchState::kQueued:
+            return "queued";
+        case MatchState::kMatched:
+            return "matched";
+        case MatchState::kTimeout:
+            return "timeout";
+    }
+    return "idle";
+}
+
 }  // namespace
 
 GatewayServiceImpl::GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* players,
-                                       std::int32_t session_ttl_seconds)
+                                       MatchClient* match, std::int32_t session_ttl_seconds)
     : sessions_(sessions),
       players_(players),
+      match_(match),
       session_ttl_seconds_(session_ttl_seconds > 0 ? session_ttl_seconds
                                                    : kDefaultSessionTtlSeconds) {}
 
@@ -221,37 +240,20 @@ void GatewayServiceImpl::GetCurrentPlayer(::google::protobuf::RpcController* con
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
 
-    const std::string token_error = ValidateToken(token);
-    if (!token_error.empty()) {
-        const std::int32_t status =
-            FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, token_error,
-                      "Token 缺失或格式不合法", request_id);
-        response->set_status_code(status);
-        ApplyHttpStatus(controller, status);
+    std::string player_id;
+    rgbt::gateway::v1::Error error;
+    // 注意：错误体先写进局部变量，成功时不拷贝回 response。直接传
+    // response->mutable_error() 会**提前创建** error 子消息，导致成功响应里也带一个
+    // 空 error 字段，客户端据此会误判为失败。
+    const std::int32_t auth = ResolvePlayerId(token, request_id, &player_id, &error);
+    if (auth != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(auth);
+        ApplyHttpStatus(controller, auth);
         return;
     }
 
-    SessionRecord session;
-    const StoreStatus status = sessions_->GetSession(token, &session);
-    if (status == StoreStatus::kUnavailable) {
-        const std::int32_t http_status =
-            FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
-                      "session_store_unavailable", "会话存储暂时不可用，请稍后重试", request_id);
-        response->set_status_code(http_status);
-        ApplyHttpStatus(controller, http_status);
-        return;
-    }
-    if (status == StoreStatus::kNotFound) {
-        // Token 格式合法但会话不存在：可能是过期或伪造，按未认证处理。
-        const std::int32_t http_status =
-            FillError(response->mutable_error(), ErrorCode::UNAUTHENTICATED, "session_not_found",
-                      "会话不存在或已过期", request_id);
-        response->set_status_code(http_status);
-        ApplyHttpStatus(controller, http_status);
-        return;
-    }
-
-    const auto player = players_->FindByPlayerId(session.player_id);
+    const auto player = players_->FindByPlayerId(player_id);
     if (!player.has_value()) {
         const std::int32_t http_status =
             FillError(response->mutable_error(), ErrorCode::NOT_FOUND, "player_not_found",
@@ -301,8 +303,179 @@ void GatewayServiceImpl::Logout(::google::protobuf::RpcController* controller,
     ApplyHttpStatus(controller, 200);
 }
 
+std::int32_t GatewayServiceImpl::ResolvePlayerId(const std::string& token,
+                                                 const std::string& request_id,
+                                                 std::string* out_player_id,
+                                                 rgbt::gateway::v1::Error* error) {
+    const std::string token_error = ValidateToken(token);
+    if (!token_error.empty()) {
+        return FillError(error, ErrorCode::INVALID_ARGUMENT, token_error, "Token 缺失或格式不合法",
+                         request_id);
+    }
+
+    SessionRecord session;
+    const StoreStatus status = sessions_->GetSession(token, &session);
+    if (status == StoreStatus::kUnavailable) {
+        return FillError(error, ErrorCode::UNAVAILABLE, "session_store_unavailable",
+                         "会话存储暂时不可用，请稍后重试", request_id);
+    }
+    if (status == StoreStatus::kNotFound) {
+        // Token 格式合法但会话不存在：可能是过期或伪造，按未认证处理。
+        return FillError(error, ErrorCode::UNAUTHENTICATED, "session_not_found",
+                         "会话不存在或已过期", request_id);
+    }
+
+    *out_player_id = session.player_id;
+    return 200;
+}
+
+void GatewayServiceImpl::FillMatchStatus(const MatchSnapshot& snapshot,
+                                         rgbt::gateway::v1::MatchStatusInfo* out) {
+    if (out == nullptr) {
+        return;
+    }
+    out->set_state(MatchStateName(snapshot.state));
+    out->set_match_id(snapshot.match_id);
+    out->set_room_id(snapshot.room_id);
+    for (const std::string& player_id : snapshot.player_ids) {
+        out->add_player_ids(player_id);
+    }
+    out->set_queued_at_ms(snapshot.queued_at_ms);
+    out->set_queue_size(snapshot.queue_size);
+}
+
+std::int32_t GatewayServiceImpl::HandleMatchFailure(MatchCallStatus status,
+                                                    const std::string& request_id,
+                                                    rgbt::gateway::v1::Error* error) {
+    switch (status) {
+        case MatchCallStatus::kOk:
+            return 200;
+        case MatchCallStatus::kUnavailable:
+            // 对端未启动、超时或连接失败。返回 503 而不是 500：这是依赖不可用，
+            // 不是本服务代码错误，恢复后无需重启 Gateway 即可继续匹配。
+            return FillError(error, ErrorCode::UNAVAILABLE, "match_unavailable",
+                             "匹配服务暂时不可用，请稍后重试", request_id);
+        case MatchCallStatus::kInvalidArgument:
+            return FillError(error, ErrorCode::INVALID_ARGUMENT, "match_invalid_argument",
+                             "匹配请求参数不合法", request_id);
+        case MatchCallStatus::kQueueFull:
+            return FillError(error, ErrorCode::RESOURCE_EXHAUSTED, "match_queue_full",
+                             "匹配队列已满，请稍后重试", request_id);
+        case MatchCallStatus::kInternal:
+            return FillError(error, ErrorCode::INTERNAL, "match_internal", "匹配服务返回未分类错误",
+                             request_id);
+    }
+    return FillError(error, ErrorCode::INTERNAL, "match_internal", "匹配服务返回未知结果",
+                     request_id);
+}
+
+void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* controller,
+                                      const rgbt::gateway::v1::EnqueueMatchRequest* request,
+                                      rgbt::gateway::v1::EnqueueMatchResponse* response,
+                                      ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    const std::string token = ExtractToken(controller, request->token());
+    const std::string request_id = request->request_id();
+
+    std::string player_id;
+    rgbt::gateway::v1::Error error;
+    const std::int32_t auth = ResolvePlayerId(token, request_id, &player_id, &error);
+    if (auth != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(auth);
+        ApplyHttpStatus(controller, auth);
+        return;
+    }
+
+    // player_id 来自会话，请求体里就算带了这个字段也不会被读取。
+    MatchSnapshot snapshot;
+    const MatchCallStatus call = match_->Enqueue(player_id, request_id, &snapshot);
+    const std::int32_t status = HandleMatchFailure(call, request_id, &error);
+    if (status != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    response->set_status_code(200);
+    ApplyHttpStatus(controller, 200);
+    FillMatchStatus(snapshot, response->mutable_match());
+}
+
+void GatewayServiceImpl::GetMatchStatus(::google::protobuf::RpcController* controller,
+                                        const rgbt::gateway::v1::GetMatchStatusRequest* request,
+                                        rgbt::gateway::v1::GetMatchStatusResponse* response,
+                                        ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    const std::string token = ExtractToken(controller, request->token());
+    const std::string request_id = request->request_id();
+
+    std::string player_id;
+    rgbt::gateway::v1::Error error;
+    const std::int32_t auth = ResolvePlayerId(token, request_id, &player_id, &error);
+    if (auth != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(auth);
+        ApplyHttpStatus(controller, auth);
+        return;
+    }
+
+    MatchSnapshot snapshot;
+    const MatchCallStatus call = match_->GetStatus(player_id, &snapshot);
+    const std::int32_t status = HandleMatchFailure(call, request_id, &error);
+    if (status != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    response->set_status_code(200);
+    ApplyHttpStatus(controller, 200);
+    FillMatchStatus(snapshot, response->mutable_match());
+}
+
+void GatewayServiceImpl::CancelMatch(::google::protobuf::RpcController* controller,
+                                     const rgbt::gateway::v1::CancelMatchRequest* request,
+                                     rgbt::gateway::v1::CancelMatchResponse* response,
+                                     ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    const std::string token = ExtractToken(controller, request->token());
+    const std::string request_id = request->request_id();
+
+    std::string player_id;
+    rgbt::gateway::v1::Error error;
+    const std::int32_t auth = ResolvePlayerId(token, request_id, &player_id, &error);
+    if (auth != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(auth);
+        ApplyHttpStatus(controller, auth);
+        return;
+    }
+
+    // 取消是幂等操作：玩家本来就不在队列中时，Match 同样返回成功状态。
+    MatchSnapshot snapshot;
+    const MatchCallStatus call = match_->Cancel(player_id, request_id, &snapshot);
+    const std::int32_t status = HandleMatchFailure(call, request_id, &error);
+    if (status != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    response->set_status_code(200);
+    ApplyHttpStatus(controller, 200);
+    FillMatchStatus(snapshot, response->mutable_match());
+}
+
 bool GatewayServiceImpl::DependenciesHealthy() {
-    // 只检查会话存储：账号目录是进程内数据，不产生外部依赖。
+    // 只检查会话存储：账号目录是进程内数据，匹配服务在每次请求时单独判断
+    // （它不可用只影响匹配接口，不应让整个 Gateway 显示为不健康）。
     return sessions_ != nullptr;
 }
 

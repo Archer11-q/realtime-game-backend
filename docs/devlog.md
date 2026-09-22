@@ -742,6 +742,162 @@ TASK-005 的登录使用代码内的明文测试身份，`players` 表不存在�
   `feat/task-006-schema-and-migrations` 并开 PR。
 - TASK-006 验收通过后再输出 TASK-007（Match Service）任务单。
 
+### 补充（2026-09-22）：验收与合并
+
+- 项目所有者实际执行了 `cmake --build --preset brpc-debug`、`ctest`（46/46）与
+  `bash scripts/verify-login.sh`（48/48），全部通过。
+- 已通过 **PR #3** 合并到 `main`，合并提交 `0e58a2f`。CI 对功能分支与 `main` 均为
+  `success`。TASK-006 状态更新为**已完成**。
+- 合并前修正的两处判断，记录如下：
+  1. **端口处理方式纠正**：第一版把网关默认端口改成 18080 以避开本机冲突，属修错
+     层次。默认值已回到约定值 8080，改为由 `scripts/verify-login.sh` 预检并自动挑选
+     空闲端口。项目所有者指出「8080 只是被临时占用」，复验时确认该端口仍被无关的
+     `uvicorn` 进程监听——这恰好证明了「冲突留给环境、选择交给脚本」是对的。
+  2. **新增文件的权限位**：首次提交与第一次 amend 时新文件被记为 `100755`，原因是
+     权限归一化脚本只遍历 `git ls-files`（已跟踪文件）。改为同时覆盖未跟踪文件后，
+     提交内权限为 87 个 `100644` + 6 个 `100755`（仅 `scripts/*.sh`）。
+- 新增本地约定：每个任务完成后额外输出一份 `interview-notes/<任务号>.md`
+  （面试复习材料，已在 `.gitignore` 中，不作为交付物）。约定同时写入 `CLAUDE.md`。
+- 下一步：TASK-007（Match Service）。
+
+## TASK-007 实施记录（2026-09-22）
+
+### 背景
+
+Phase 1 的最小闭环要求「两个客户端能匹配进同一房间」。此前项目只有 Gateway 的登录
+切片，而且**从未发起过一次服务间 RPC**——brpc 一直被用来把 Gateway 自己暴露成 HTTP
+服务。因此本任务真正的难点不是匹配算法，而是把第一条跨服务链路（Gateway -> Match）
+的契约、错误语义和故障行为建起来。
+
+### 完成
+
+- `api/proto/match.proto`：`MatchService` 契约（`EnqueueMatch`、`GetMatchStatus`、
+  `CancelMatch`），含 `MatchState`（idle / queued / matched / timeout）与
+  `MatchErrorCode`。这是项目第一个服务间契约。
+- `src/match/match_queue.{hpp,cpp}`：匹配队列与配对逻辑，不依赖 brpc，可独立测试。
+- `src/match/room_allocator.{hpp,cpp}`：房间分配接口 + Phase 1 占位实现
+  （`room_id` 由 `match_id` 派生）。
+- `src/match/match_service.{hpp,cpp}`：brpc 服务实现，只做协议转换与错误码映射。
+- `src/match/match_main.cpp`、`src/match/CMakeLists.txt`：独立进程 `rgbt_match`。
+- `api/proto/gateway.proto`：新增 `MatchStatusInfo` 与三个匹配接口，
+  `ErrorCode` 追加 `RESOURCE_EXHAUSTED = 6`。
+- `src/gateway/match_client.hpp` + `brpc_match_client.{hpp,cpp}`：Gateway 侧调用接口
+  与 brpc 实现，错误码映射为 400 / 429 / 500 / 503。
+- `src/gateway/gateway_service.{hpp,cpp}`：三个匹配接口；抽出 `ResolvePlayerId`
+  统一鉴权，`GetCurrentPlayer` 一并改用它。
+- `src/gateway/error.cpp`：`RESOURCE_EXHAUSTED -> 429`，并把限流纳入可重试。
+- `tests/unit/match/match_queue_test.cpp`：22 个新用例。
+- `tests/unit/gateway/gateway_service_test.cpp`：新增假 `MatchClient` 与 14 个匹配
+  接口用例。
+- `scripts/verify-match.sh`：端到端验收入口（30 项）。
+- 文档：`docs/05-api-and-data.md`（接口表、匹配错误语义表、服务间契约约定）、
+  `docs/01-architecture.md`（4.2 匹配数据流补充落地差异、状态归属表）、
+  `docs/06-operations.md` 与 `deploy/compose/.env.example`（`MATCH_HTTP_PORT`）。
+
+### 决策（项目所有者于 2026-09-22 全部选择 A，已写入 docs/TASKS.md）
+
+1. **队列放 Match 进程内存**。与架构文档把队列所有者记为 Match 一致；若改为放
+   Redis 并让 Gateway 直读，属于数据所有权变化，必须先写 ADR。
+2. **配对只做 FIFO 两人一局**。当前没有任何分数体系，先实现分差放宽等于把未验证的
+   评分模型固化进契约。
+3. **房间分配抽象为 `RoomAllocator`**。Room 的契约应由拥有它的 TASK-008 定型，
+   提前冻结会逼 TASK-008 迁就一个没有房间语义的接口。
+4. **客户端轮询获取匹配结果**。WebSocket 属 TASK-009；轮询接口在 WebSocket 落地后
+   仍作为兜底保留。
+5. **`MATCH_HTTP_PORT=8082`**。
+
+实现层面的决策：
+
+- **单个互斥锁保护全部队列状态**。队列与结果表都以 `player_id` 为键，所有状态变更
+  在同一把锁内完成，于是架构要求的「同一玩家不重复进入多个有效队列或匹配结果」
+  由数据结构本身保证，而不是靠额外检查。**已知限制**：这把锁只在单进程内有效，
+  多实例部署时不再成立，属 Phase 4。
+- **时间由调用方注入**（`now_ms` 参数）。超时与结果过期因此可以用单元测试精确验证，
+  不需要 sleep，也不会偶发失败。
+- **惰性淘汰**：不创建定时器或后台线程，超时与过期只在每次调用时顺带结算。
+- **重复入队不覆盖已有的匹配结果**。否则「配对成功」与「客户端下一次轮询」之间的
+  竞态会让玩家丢掉已经配好的局。
+- **`timeout` 与 `idle` 是两个状态**。前者提示「重新匹配」，后者是「可以开始匹配」，
+  合并会让前端无法给出正确提示。
+- **不自动重试跨服务调用**。失败按类型映射（503 / 429 / 400 / 500），由调用方决定
+  是否重发；在传输层无脑重放会掩盖真实的容量问题。
+
+### 验证（均在 WSL 的 `~/workspace/realtime-game-backend` 执行）
+
+- 命令：`cmake --preset brpc-debug && cmake --build --preset brpc-debug`
+- 结果：配置与构建成功，退出码 0，**无新增编译警告**（`-Werror` 生效）。
+- 命令：`ctest --test-dir build/brpc-debug`
+- 结果：**87/87 通过**（TASK-006 为 46 个，本次新增 41 个：match 22 个 +
+  gateway 匹配接口 14 个 + 错误码映射与其它 5 个）。
+- 命令：`bash scripts/check-format.sh`
+- 结果：通过，检查 40 个文件。
+- 命令：`bash scripts/verify.sh`
+- 结果：`debug`/`release`/`asan` 三预设各 4/4 通过；首次因格式检查失败，
+  格式化后复跑通过。
+- 命令：`bash scripts/verify-match.sh`（需 Docker；首次因 Docker 未启动而中止，
+  项目所有者启动 Docker Desktop 后复跑）
+- 结果：**30 项全部通过，退出码 0**。覆盖：未入队为 `idle`、缺少 Token 返回 400、
+  alice 入队为 `queued`、bob 入队后双方立即配对且 `match_id`/`room_id` 一致、
+  `player_ids` 恰好两人、重复入队幂等返回同一 `match_id`、结果保留期过后回到
+  `idle`、第二次匹配得到新的 `match_id` 与 `room_id`、取消幂等、超时状态为
+  `timeout` 且过期后回到 `idle`、Match 停机时入队与查询均返回 503
+  `match_unavailable`、Match 恢复后无需重启 Gateway 即可匹配、Gateway 全程存活、
+  两个进程收到 SIGTERM 后退出码均为 0。
+
+### 问题与风险（本轮实际踩到并解决的）
+
+- **`response->mutable_error()` 会提前创建 error 子消息**。三个用例
+  （`GetCurrentPlayerSucceedsWithValidToken`、`GetMatchStatusReturnsIdleForNewPlayer`、
+  `CancelMatchIsIdempotentWhenNotQueued`）失败，原因是断言「成功响应不应带 error」。
+  根因：把 `response->mutable_error()` 直接交给辅助函数，即使函数不写入，
+  **protobuf 的 `mutable_*` 也会实例化该子消息**，于是成功响应里带上一个空 error，
+  客户端会据此误判为失败。修复：先写入局部 `v1::Error`，只在失败时拷贝回响应。
+  这是本轮最值得记住的一个坑，因为它**只在单元测试断言 `has_error()` 时才会暴露**，
+  端到端脚本看 HTTP 状态码和 `state` 字段是发现不了的。
+- **brpc 的 restful 映射按路径分派，不支持按 HTTP 方法分派**。文档原先把取消匹配
+  设计为 `DELETE /api/v1/matches/current`，与查询共用路径，这在 brpc 下不可实现。
+  改为 `POST /api/v1/matches/current/cancel` 并同步更新 `docs/05-api-and-data.md`。
+  这与 TASK-005 中「brpc 不存在 `brpc::HttpService`」属于同一类问题：
+  **框架行为必须实测，不能按常识假设**。
+- **端到端脚本第一版用 carol 作为「第三个玩家」，结果 10 项失败**。carol 在种子数据
+  里是 `disabled`，专门用于覆盖「禁用账号被拒绝」，无法登录。这暴露了一个覆盖缺口：
+  **种子数据只有两个可用身份，而「第三个玩家不会被并入已配满的局」需要三个**。
+  当前处理：端到端改为验证强度接近的「已完成的局不会被后续请求复用」，
+  该不变量由单元测试 `CompletedMatchDoesNotAbsorbLaterPlayers` 覆盖，
+  脚本结尾显式打印这个未覆盖项，不假装已覆盖。是否新增第四个启用身份待项目所有者决定。
+- **`std::signal` 不是 `std::` 的成员**：`<signal.h>` 只提供 `::signal`。
+  改为 `::signal` 与既有 `::usleep` 保持一致。
+- **格式化**：5 个新文件未过 `clang-format --dry-run --Werror`，已在 WSL 格式化后
+  把结果写回 Windows 副本（Windows 侧是编辑来源，只改一边会在下次同步时丢失）。
+- **`verify.sh` 会 `rm -rf build`**，因此它会清掉 brpc 预设的构建产物；后续需要
+  `brpc-debug` 的命令要重新构建。本轮把它放在端到端验收之前执行以避开这个影响。
+- **辅助文件第三次混进提交**：本轮把 `scripts/_commit7.txt`（提交信息文件）提交了
+  进去。前两次是 `scripts/_*.sh`，因此 `.gitignore` 的规则写成了只匹配 `.sh`——
+  而这次的 `.txt` 不在范围内。修复：规则改为 `scripts/_*`（匹配全部扩展名），
+  并把该文件从提交中删除。**这条经验值得记住：忽略规则要按「意图」写，而不是按
+  当时那一个文件的扩展名写**；只要意图是「以下划线开头的都是本机临时文件」，
+  模式就应该覆盖全部扩展名。
+- 与之相关的一个脚本 bug：剔除文件的断言最初用 `git diff --cached --name-only`
+  判断，会把**期望中的删除**也当成违规而报错。改为按 `--name-status` 只看
+  `A/M/R`，允许 `D`。
+
+### 未做 / 留给后续
+
+- 不实现 Room/Battle Service；`room_id` 是占位号，不含任何房间状态（TASK-008）。
+- 不实现 WebSocket 推送（TASK-009）。
+- 不实现分差放宽、等待时间放宽、多实例分片。
+- 不实现队列的 Redis 快照与进程重启恢复（Phase 2）。**Match 重启即丢失排队状态**，
+  这是当前明确的已知限制。
+- `src/match/CMakeLists.txt` 与 `src/gateway/CMakeLists.txt` 的 Protobuf 代码生成
+  写法**已经重复**（第二个 proto 出现），本轮故意不抽取以保持提交可审阅，
+  已记入 `docs/TASKS.md` 的 Backlog。
+- 端到端的「第三个玩家」覆盖缺口（见上）。
+
+### 下一步
+
+- 由项目所有者审阅 Diff 并运行 `bash scripts/verify-match.sh`；确认后开 PR。
+- TASK-008（Room/Battle Service）在 TASK-007 验收通过后开单。
+
 ## 日志模板
 
 ```markdown

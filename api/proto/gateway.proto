@@ -30,11 +30,12 @@ message PlayerInfo {
 }
 
 // 错误码。与 docs/05-api-and-data.md 第 3 节的分类对应：
-//   INVALID_ARGUMENT  输入错误，调用方不应重试
-//   UNAUTHENTICATED   凭证缺失或无效
-//   NOT_FOUND         资源不存在
-//   UNAVAILABLE       依赖暂时失败，可有限重试
-//   INTERNAL          未分类内部错误
+//   INVALID_ARGUMENT   输入错误，调用方不应重试
+//   UNAUTHENTICATED    凭证缺失或无效
+//   NOT_FOUND          资源不存在
+//   UNAVAILABLE        依赖暂时失败，可有限重试
+//   INTERNAL           未分类内部错误
+//   RESOURCE_EXHAUSTED 限流，退避后重试（TASK-007 新增：匹配队列已满）
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   INVALID_ARGUMENT = 1;
@@ -42,6 +43,7 @@ enum ErrorCode {
   NOT_FOUND = 3;
   UNAVAILABLE = 4;
   INTERNAL = 5;
+  RESOURCE_EXHAUSTED = 6;
 }
 
 // 统一错误体。
@@ -128,6 +130,83 @@ message LogoutResponse {
 }
 
 // ---------------------------------------------------------------------------
+// 匹配（TASK-007）
+// ---------------------------------------------------------------------------
+//
+// 这三个接口是 Gateway 对浏览器的入口，Gateway 自己不保存任何队列状态：
+// 它把请求转给 Match Service（契约见 api/proto/match.proto），把结果整理后返回。
+// 这是本项目第一次出现服务间调用，因此错误语义必须明确：
+//   * Match 不可用      -> 503 UNAVAILABLE，reason = match_unavailable
+//   * 队列已满          -> 429，reason = match_queue_full（限流类，可退避重试）
+//   * 玩家已在队列      -> 200，body 中 state = queued（幂等，不是错误）
+//   * 玩家标识           -> 一律取自会话，忽略请求体，避免冒名入队
+
+// 匹配状态快照。state 取值：idle / queued / matched / timeout。
+message MatchStatusInfo {
+  // 与之对应的 Match 侧枚举在 api/proto/match.proto 中。这里用字符串是为了让
+  // 浏览器直接可用，不必依赖枚举数字。
+  string state = 1;
+
+  // state == matched 时有效。
+  string match_id = 2;
+  string room_id = 3;
+
+  // 同局玩家，包含自己。
+  repeated string player_ids = 4;
+
+  // 入队时间（Unix 毫秒）。
+  int64 queued_at_ms = 5;
+
+  // 当前队列长度，便于客户端与排障时判断「为什么还没匹配上」。
+  int32 queue_size = 6;
+}
+
+message EnqueueMatchRequest {
+  // 会话 Token。缺失或无效返回 UNAUTHENTICATED。
+  string token = 1;
+
+  // 幂等键。同一 request_id 与同一玩家重复入队不产生第二条队列记录。
+  string request_id = 2;
+}
+
+message EnqueueMatchResponse {
+  int32 status_code = 1;
+
+  // 成功（含「已在队列」）时返回当前状态。
+  MatchStatusInfo match = 2;
+
+  Error error = 3;
+}
+
+message GetMatchStatusRequest {
+  string token = 1;
+
+  string request_id = 2;
+}
+
+message GetMatchStatusResponse {
+  int32 status_code = 1;
+
+  MatchStatusInfo match = 2;
+
+  Error error = 3;
+}
+
+message CancelMatchRequest {
+  string token = 1;
+
+  string request_id = 2;
+}
+
+message CancelMatchResponse {
+  int32 status_code = 1;
+
+  MatchStatusInfo match = 2;
+
+  Error error = 3;
+}
+
+// ---------------------------------------------------------------------------
 // 服务定义
 // ---------------------------------------------------------------------------
 
@@ -143,4 +222,19 @@ service GatewayService {
   // 主动结束会话。
   // HTTP: POST /api/v1/logout
   rpc Logout(LogoutRequest) returns (LogoutResponse);
+
+  // 进入匹配队列。
+  // HTTP: POST /api/v1/matches
+  rpc EnqueueMatch(EnqueueMatchRequest) returns (EnqueueMatchResponse);
+
+  // 查询当前匹配状态。客户端轮询本接口获取匹配结果。
+  // HTTP: GET /api/v1/matches/current
+  rpc GetMatchStatus(GetMatchStatusRequest) returns (GetMatchStatusResponse);
+
+  // 取消匹配。玩家不在队列时按幂等成功处理。
+  // HTTP: POST /api/v1/matches/current/cancel
+  // 注意：不是文档原先写的 DELETE /api/v1/matches/current。brpc 的 restful
+  // 映射按**路径**分派，不支持按 HTTP 方法分派，因此取消与查询不能共用同一路径。
+  // docs/05-api-and-data.md 第 2 节的接口表已同步修正。
+  rpc CancelMatch(CancelMatchRequest) returns (CancelMatchResponse);
 }

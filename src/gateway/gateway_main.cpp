@@ -1,10 +1,14 @@
 /// @file gateway_main.cpp
-/// @brief Gateway 服务入口（TASK-005 登录切片 + TASK-006 玩家档案走数据库）。
+/// @brief Gateway 服务入口（TASK-005 登录切片 + TASK-006 玩家档案走数据库
+///        + TASK-007 匹配接口转发）。
 ///
 /// 提供接口（docs/05-api-and-data.md 第 2 节）：
 ///   POST /api/v1/login
 ///   GET  /api/v1/players/me
 ///   POST /api/v1/logout
+///   POST /api/v1/matches
+///   GET  /api/v1/matches/current
+///   POST /api/v1/matches/current/cancel
 ///   GET  /health
 ///
 /// 启动失败与依赖不可用采用不同策略：
@@ -26,6 +30,7 @@
 #include <memory>
 #include <string>
 
+#include "brpc_match_client.hpp"
 #include "common/version.hpp"
 #include "database_player_directory.hpp"
 #include "gateway.pb.h"
@@ -52,6 +57,11 @@ DEFINE_string(mysql_user, "realtime_game", "MySQL 账号");
 DEFINE_string(mysql_password, "change_me", "MySQL 密码");
 DEFINE_string(mysql_database, "realtime_game", "MySQL 库名");
 DEFINE_int32(mysql_timeout_seconds, 3, "MySQL 连接与读写超时（秒）");
+// Match Service 地址。TASK-007 起 Gateway 会调用它，这是本项目第一次发起服务间
+// RPC。超时设得比客户端超时短，保证依赖故障表现为快速失败的 503 而不是请求悬挂。
+DEFINE_string(match_host, "127.0.0.1", "Match Service 主机");
+DEFINE_int32(match_port, 8082, "Match Service 端口");
+DEFINE_int32(match_timeout_ms, 500, "调用 Match Service 的超时（毫秒）");
 DEFINE_int32(idle_timeout_s, -1, "连接空闲超时（秒），-1 表示不超时");
 
 namespace {
@@ -96,7 +106,14 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<rgbt::gateway::PlayerDirectory> players =
         std::make_unique<rgbt::gateway::DatabasePlayerDirectory>(player_reader.get());
 
-    rgbt::gateway::GatewayServiceImpl service(sessions.get(), players.get(),
+    // --- 匹配（Match Service，TASK-007）---
+    rgbt::gateway::MatchClientOptions match_options;
+    match_options.host = FLAGS_match_host;
+    match_options.port = FLAGS_match_port;
+    match_options.timeout_ms = FLAGS_match_timeout_ms;
+    auto match = std::make_unique<rgbt::gateway::BrpcMatchClient>(match_options);
+
+    rgbt::gateway::GatewayServiceImpl service(sessions.get(), players.get(), match.get(),
                                               FLAGS_session_ttl_seconds);
 
     brpc::Server server;
@@ -105,10 +122,17 @@ int main(int argc, char* argv[]) {
     options.has_builtin_services = true;
 
     // restful 映射把 RPC 暴露为 docs/05-api-and-data.md 约定的 HTTP 路径。
+    //
+    // 注意取消匹配的路径：文档原先写的是 DELETE /api/v1/matches/current，与查询
+    // 共用同一路径。brpc 的 restful 映射按**路径**分派，不支持按 HTTP 方法分派，
+    // 因此两者不能共用路径，改为 /api/v1/matches/current/cancel。
     const std::string mappings =
         "/api/v1/login => Login,"
         "/api/v1/players/me => GetCurrentPlayer,"
-        "/api/v1/logout => Logout";
+        "/api/v1/logout => Logout,"
+        "/api/v1/matches => EnqueueMatch,"
+        "/api/v1/matches/current => GetMatchStatus,"
+        "/api/v1/matches/current/cancel => CancelMatch";
 
     brpc::ServiceOptions service_options;
     service_options.restful_mappings = mappings;
@@ -135,6 +159,8 @@ int main(int argc, char* argv[]) {
                 redis_ok ? "可用" : "当前不可用，请求将返回 503");
     std::printf("  MySQL(玩家档案): %s:%d/%s (%s)\n", FLAGS_mysql_host.c_str(), FLAGS_mysql_port,
                 FLAGS_mysql_database.c_str(), mysql_ok ? "可用" : "当前不可用，登录将返回 503");
+    std::printf("  Match(匹配): %s:%d (%s)\n", FLAGS_match_host.c_str(), FLAGS_match_port,
+                match->IsHealthy() ? "已配置" : "地址不合法");
     std::printf("  Key 前缀: %s:gateway:\n", env_prefix.c_str());
     std::printf("  进程号: %d\n", static_cast<int>(::getpid()));
     std::fflush(stdout);

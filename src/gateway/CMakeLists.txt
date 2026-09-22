@@ -53,6 +53,7 @@ endif()
 
 add_library(
   rgbt_gateway_lib STATIC
+  brpc_match_client.cpp
   database_player_directory.cpp
   error.cpp
   gateway_service.cpp
@@ -72,6 +73,8 @@ target_link_libraries(
     rgbt_common
     rgbt_gateway_proto
   PRIVATE
+    # Gateway 调用 Match Service（TASK-007），需要 match 的生成代码与服务桩。
+    rgbt_match_proto
     unofficial::brpc::brpc
     hiredis::hiredis
     unofficial::libmariadb
