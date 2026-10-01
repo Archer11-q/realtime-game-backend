@@ -9,8 +9,9 @@
 /// 这样做的意义是让档案真的走数据库，而不是继续用代码里的常量——只有真实
 /// 读写才能验证表结构是否合理。
 ///
-/// 退出条件提示：Phase 1 期间 Gateway 直接读 players 表，依据 ADR-0002；
-/// Player/State 服务落地后本类应被替换为对该服务的 RPC 调用。
+/// 所有者说明：Gateway 拥有 players 表（依据 ADR-0002 与 ADR-0003），
+/// 直接读表是正式安排。原定的 Player/State 服务已列为非目标、不实现，
+/// 因此本类不再存在"待迁移到 RPC 调用"的退出条件。
 
 #ifndef RGBT_GATEWAY_DATABASE_PLAYER_DIRECTORY_HPP
 #define RGBT_GATEWAY_DATABASE_PLAYER_DIRECTORY_HPP

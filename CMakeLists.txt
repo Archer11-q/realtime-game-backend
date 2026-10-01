@@ -1,14 +1,16 @@
 # Realtime Game Backend - 顶层构建入口
 #
 # 本文件只负责构建基线：工程声明、编译标准、警告策略、测试开关和公共子目录。
-# 业务服务（Gateway/Match/Room/Player/Settlement）在各自任务中按需加入。
+# 业务服务只有 Gateway / Match / Room-Battle 三个，在各自任务中按需加入。
+# 不要为 Player/State 或 Settlement 添加子目录：两者已列入非目标，见
+# docs/adr/0003-scope-reduction.md。
 
 cmake_minimum_required(VERSION 3.25)
 
 project(
   realtime_game_backend
   VERSION 0.1.0
-  DESCRIPTION "面向小型实时对战产品的分布式游戏服务端参考实现"
+  DESCRIPTION "面向小型实时对战产品的游戏服务端参考实现"
   LANGUAGES CXX
 )
 

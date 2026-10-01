@@ -1,10 +1,13 @@
 # 架构设计
 
-> 状态：已确认（2026-09-14）
+> 状态：已确认（2026-09-14），**2026-10-02 按 [ADR-0003](adr/0003-scope-reduction.md)
+> 裁剪范围：服务固定为 Gateway / Match / Room-Battle 三个，不实现 Player/State、
+> Settlement、Kafka、etcd 与多实例。**
 
 ## 1. 架构原则
 
-1. 先保证单机端到端正确，再根据真实瓶颈进入分布式阶段。
+1. 先保证单机端到端正确。项目范围内**不进入多实例**，深度优先于广度，
+   见 [ADR-0003](adr/0003-scope-reduction.md)。
 2. 服务的拆分依据是数据所有权、故障隔离和独立扩展需求，而不是微服务数量。
 3. 同步请求走 RPC，异步事实和后续处理走事件。
 4. 每个状态必须有明确所有者、生命周期、持久化策略和恢复方式。
@@ -24,23 +27,21 @@
              |
              | brpc + Protobuf
              v
- +-----------+-----------+------------+
- |                       |            |
- v                       v            v
-Match Service      Room/Battle    Player/State
- |                  Service         Service
- |                       |            |
- +-----------+-----------+------------+
+ +-----------+------------+
+ |                        |
+ v                        v
+Match Service      Room/Battle Service
+ |                        |
+ |                        | 对局结束时同步幂等写入
+ +-----------+------------+
              |
              v
-     Kafka Domain Events
-             |
-             v
-    Settlement Worker
-             |
-             v
-     MySQL / Redis
+        Redis / MySQL
 ```
+
+**服务集合固定为三个**，见 [ADR-0003](adr/0003-scope-reduction.md)。
+原目标架构中的 Player/State 服务、Settlement Worker、Kafka 与 etcd
+**已列为非目标，不实现**；跨服务协作只走 brpc 同步调用。
 
 ## 3. 服务职责
 
@@ -83,41 +84,23 @@ Match Service      Room/Battle    Player/State
 - 保存当前房间的权威状态。
 - 接收玩家输入、推进逻辑帧并生成房间消息。
 - 保存必要快照，支持重连和故障恢复。
-- 产生结算和战斗领域事件。
+- 对局结束时**同步幂等**写入 `match_results`（以 `match_id` 为幂等业务键）。
 
 不负责：
 
 - 玩家登录和连接管理。
 - 全局匹配策略。
-- 排行榜和长期战绩写入。
+- 玩家长期档案。
 
-### Player/State Service
+### 已取消的服务（不实现）
 
-职责：
+以下服务**不实现**，见 [ADR-0003](adr/0003-scope-reduction.md)。
+不要为它们创建目录、proto、进程入口或 Compose 服务：
 
-- 管理玩家基本资料、会话映射和战绩查询。
-- 读取或维护排行榜视图。
-- 为模块提供不跨数据所有权的状态查询。
-
-不负责：
-
-- 实时战斗循环。
-- 房间帧推进。
-- 直接消费客户端 WebSocket。
-
-### Settlement Worker
-
-职责：
-
-- 消费房间产生的结算事件。
-- 在幂等保护下更新战绩、积分和排行榜。
-- 支持失败重试和重复消息处理。
-- 记录处理结果和可观测性指标。
-
-不负责：
-
-- 同步阻塞客户端请求。
-- 修改房间实时状态。
+| 原服务 | 原职责 | 现在的处理方式 |
+|---|---|---|
+| Player/State | 玩家资料、会话映射、战绩查询、排行榜 | `players` 表改由 Gateway 拥有；排行榜移出范围 |
+| Settlement Worker | 消费结算事件、幂等更新战绩和排行榜 | 结算并入 Room/Battle 的结束流程，同步幂等写入，不消费事件 |
 
 ## 4. 核心数据流
 
@@ -127,7 +110,7 @@ Match Service      Room/Battle    Player/State
 浏览器
   -> Gateway HTTP 登录
   -> 校验账号/测试凭证
-  -> Player/State 获取玩家信息
+  -> 从 players 表获取玩家档案（Gateway 拥有该表，见 ADR-0002/ADR-0003）
   -> Redis 建立会话
   -> 返回 Token 和玩家信息
 ```
@@ -163,7 +146,7 @@ Phase 1 的落地差异（TASK-007 记录，避免把计划当成已实现）：
   -> Room 广播状态或帧数据
   -> Gateway 推送至房间内玩家
   -> 结算条件满足
-  -> Room 发布领域事件
+  -> Room 同步幂等写入对局结果（不走消息队列）
 ```
 
 ### 4.4 断线重连
@@ -178,36 +161,35 @@ Phase 1 的落地差异（TASK-007 记录，避免把计划当成已实现）：
   -> 恢复 ACTIVE 并重新绑定连接
 ```
 
-### 4.5 异步结算
+### 4.5 对局结果写入（同步幂等，不走消息队列）
 
 ```text
-Room 发布 MatchFinished
-  -> Kafka
-  -> Settlement 消费
-  -> 幂等检查
-  -> 更新 MySQL 战绩/积分
-  -> 更新 Redis 排行榜
-  -> 记录处理结果
+对局满足结束条件
+  -> Room 以 match_id 为幂等业务键写入 match_results
+  -> 重复写入同一 match_id 返回已有结果，不产生第二行
+  -> 客户端查询对局结果
 ```
+
+这里**不使用消息队列**：结算只有一次幂等写入，异步化不带来收益，反而增加故障面。
+依据见 [ADR-0003](adr/0003-scope-reduction.md)。
 
 ## 5. 状态归属
 
 | 状态 | 所有者 | 存储 | 恢复策略 |
 |---|---|---|---|
 | WebSocket 连接 | Gateway | 内存 | 客户端重连后重建 |
-| 玩家会话 | Gateway/Player | Redis + MySQL | 使用 Session 映射恢复 |
+| 玩家会话 | Gateway | Redis | 使用 Session 映射恢复 |
+| 玩家档案 | Gateway | MySQL（`players`） | 数据库恢复 |
 | 匹配队列 | Match | 内存（Phase 1）；Redis 快照属 Phase 2 | 当前重启即丢失；快照与重建在 Phase 2 定义 |
-| 房间权威状态 | Room | 内存 + 快照 | 从最近快照和事件恢复 |
-| 玩家档案和战绩 | Player/Settlement | MySQL | 数据库恢复 |
-| 排行榜 | Player/State | Redis | 数据可从 MySQL 重建 |
-| 领域事件 | Kafka | Kafka 日志 | 按位点重放 |
+| 房间权威状态 | Room/Battle | 内存 + 快照 | 从最近快照恢复 |
+| 对局结果 | Room/Battle | MySQL（`match_results`） | 数据库恢复，`match_id` 保证幂等 |
 
 任何模块不得绕过所有者直接修改数据。
 
-**已知例外（Phase 1）**：`players` 表由 Gateway 直接**读取**，用于玩家档案校验。
-这是带退出条件的临时安排，依据
-[ADR-0002](adr/0002-gateway-temporary-player-ownership.md)；Player/State 服务落地后
-必须收敛。Gateway 对该表只读不写，测试数据由迁移脚本写入。
+**所有权变更（2026-10-02）**：`players` 表的正式所有者由 Gateway 承担，依据
+[ADR-0002](adr/0002-gateway-temporary-player-ownership.md) 与
+[ADR-0003](adr/0003-scope-reduction.md)。Gateway 对该表**只读**，测试数据由迁移脚本
+写入。原定的 Player/State 与 Settlement 所有者已取消；排行榜与领域事件移出范围。
 
 ## 6. 一致性和幂等
 
@@ -228,8 +210,7 @@ Room 发布 MatchFinished
 | Room 崩溃 | 根据快照和事件恢复，无法恢复时明确结束并通知玩家 |
 | MySQL 暂时不可用 | 写请求失败并返回可重试错误，不写假成功 |
 | Redis 暂时不可用 | 关键会话降级或请求失败，不静默继续错误状态 |
-| Kafka 积压 | 异步结算延迟，增加告警和背压，不影响已有对局 |
-| 重复结算 | 幂等键阻止重复战绩 |
+| 重复写入对局结果 | `match_id` 幂等键阻止重复行 |
 
 ## 8. 部署演进
 
@@ -245,23 +226,20 @@ Room 发布 MatchFinished
 - 使用健康检查、网络、卷和配置注入。
 - 目标是可复现和现场演示。
 
-### 阶段三：多实例和协调服务
+### 阶段三：故障注入和可靠性验证（当前路线的终点）
 
-- 仅在出现容量或故障需求时引入 etcd。
-- 支持多 Gateway 和多 Match 实例。
-- Room 根据状态和恢复模型决定是否迁移。
-
-### 阶段四：事件和故障恢复
-
-- 在结算异步化、回放和统计需求明确后引入 Kafka。
-- 加入故障注入、恢复测试、背压和容量治理。
-- 暂不默认引入 Kubernetes。
+- **不做多实例，不引入 etcd、Kafka 和 Kubernetes**，依据
+  [ADR-0003](adr/0003-scope-reduction.md)。
+- 在单实例内验证：进程崩溃恢复、断线重连与宽限期、依赖不可用降级、
+  优雅退出与排空、连接风暴、长稳运行。
+- 每个故障场景都需要可重复执行的注入脚本和实测数据，不靠推断。
 
 ## 9. 对外与对内接口
 
 - 浏览器到 Gateway：HTTP + WebSocket，消息使用版本化 JSON 信封。
 - C++ 服务之间：brpc + Protobuf，接口定义位于 `api/proto/`。
-- 异步领域事件：Kafka + Protobuf 或带版本的 JSON，Topic 规则另立 ADR。
+- 异步领域事件：**不使用**。跨服务协作只走 brpc 同步调用，见
+  [ADR-0003](adr/0003-scope-reduction.md)。
 - 日志和指标：结构化字段，统一请求 ID、会话 ID、房间 ID 和匹配 ID。
 
 详细约束见 [接口、数据与协议](05-api-and-data.md)。
@@ -297,8 +275,8 @@ Room 发布 MatchFinished
 
 示例（截至 TASK-005）：
 
-- `include/common/token.hpp`：会话 Token 生成。Gateway 使用，Player、Settlement
-  后续也会使用，故放在公共目录。
+- `include/common/token.hpp`：会话 Token 生成。Gateway 使用；若将来出现第二个
+  使用方（例如拆出独立鉴权服务），再按依赖方向评估是否保留在公共目录。
 - `src/gateway/error.hpp`：只服务 Gateway，且依赖 `gateway.pb.h`。放进 `include/`
   会诱导其他服务反向依赖 Gateway 的契约，故留在服务目录内。
 
@@ -326,4 +304,8 @@ Room 发布 MatchFinished
 - 改变同步 RPC 与异步事件的边界。
 - 引入新的中间件或第二套协议。
 - 修改一致性、幂等或恢复策略。
-- 从 Docker Compose 升级到 Kubernetes。
+
+**额外前置条件**：Kafka、etcd、多实例部署、Kubernetes、独立 Player/State 服务、
+独立 Settlement 服务、排行榜、匹配分差放宽已由
+[ADR-0003](adr/0003-scope-reduction.md) 列为非目标。引入它们**必须先从"替代关系"
+角度撤销或修改 ADR-0003**；只写一个新 ADR 说明"现在需要了"不足以生效。

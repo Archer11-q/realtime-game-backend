@@ -9,8 +9,8 @@
 ///     字符串拼接，避免 SQL 注入。这是本模块的硬约束。
 ///   * 连接、读超时、写超时均为显式配置，避免 MySQL 不可用时请求长时间挂起。
 ///
-/// 退出条件提示：Phase 1 期间 Gateway 直接读 players 表，依据 ADR-0002；
-/// Player/State 服务落地后本模块应从 Gateway 移除。
+/// 所有者说明：Gateway 拥有 players 表（依据 ADR-0002 与 ADR-0003），
+/// 本模块留在 Gateway 内，不存在"待拆分到 Player/State 服务"的退出条件。
 
 #ifndef RGBT_GATEWAY_MYSQL_CONNECTION_HPP
 #define RGBT_GATEWAY_MYSQL_CONNECTION_HPP

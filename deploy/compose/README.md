@@ -2,8 +2,9 @@
 
 本目录提供本地开发和集成环境所需的 Redis 与 MySQL，通过 Docker Compose 启动。
 
-> 状态：TASK-003 交付。当前只包含 Redis 和 MySQL，**不包含** Kafka、etcd 和任何
-> C++ 服务，这些按各自任务引入。
+> 状态：TASK-003 交付。当前只包含 Redis 和 MySQL。
+> **Kafka 与 etcd 已列为非目标，不会加入本目录**，见
+> [ADR-0003](../../docs/adr/0003-scope-reduction.md)。C++ 服务按各自任务引入。
 
 ## 1. 前置依赖
 

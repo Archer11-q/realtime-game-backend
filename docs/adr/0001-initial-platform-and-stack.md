@@ -1,6 +1,7 @@
 # ADR-0001：初始开发平台与技术栈
 
-- 状态：已接受
+- 状态：已接受；**Kafka 与 etcd 两项已由 [ADR-0003](0003-scope-reduction.md)
+  部分替代（改为「不实现」）**
 - 日期：2026-09-14
 - 决策者：项目所有者
 - 关联任务：TASK-000、TASK-001、TASK-002
@@ -22,8 +23,10 @@ C++ 后端和游戏服务端常用技术栈。项目优先验证主流服务端�
 - brpc + Protobuf 3.21.12 作为服务间通信。
 - HTTP + WebSocket 作为浏览器通信。
 - Redis + MySQL 作为第一版数据组件。
-- Kafka 用于后续异步和回放阶段。
-- etcd 用于后续多实例和服务发现阶段。
+- ~~Kafka 用于后续异步和回放阶段~~ → **已由 [ADR-0003](0003-scope-reduction.md)
+  取代为「不实现」**。
+- ~~etcd 用于后续多实例和服务发现阶段~~ → **已由 [ADR-0003](0003-scope-reduction.md)
+  取代为「不实现」**。
 - Docker Compose 作为本地集成环境。
 - GitHub Actions 作为 CI。
 - Prometheus + Grafana + OpenTelemetry 作为可观测性方案。
@@ -76,7 +79,9 @@ CMakePresets、vcpkg manifest 和 CI 配置保证工具链可复现。
 - 当前阶段没有真实调度和多节点需求。
 - 会显著增加调试和演示成本。
 
-结论：暂不采用。先使用 Docker Compose，满足明确触发条件后再评估 k3s。
+结论：不采用。使用 Docker Compose 即满足本项目全部部署与演示需求；
+**多节点与容器编排已由 [ADR-0003](0003-scope-reduction.md) 列为非目标**，
+不再是"等触发条件"的待办项。
 
 ## 后果
 
@@ -101,4 +106,7 @@ CMakePresets、vcpkg manifest 和 CI 配置保证工具链可复现。
 
 ## 替代关系
 
-无。
+- **部分被 [ADR-0003](0003-scope-reduction.md) 替代**：本 ADR 决策列表中
+  "Kafka 用于后续异步和回放阶段"与"etcd 用于后续多实例和服务发现阶段"两项，
+  以及 Kubernetes 备选方案的结论，已改为「不实现」。其余技术栈选择仍然有效。
+- 其余无替代关系。

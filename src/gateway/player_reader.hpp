@@ -11,10 +11,9 @@
 ///     PlayerReader        —— 只负责按 account / player_id 读档案
 ///     PlayerDirectory     —— 组合档案与凭据，产出凭据校验结果
 ///
-/// 所有者说明（依据 docs/01-architecture.md）：
-///   players 表的正式所有者是 Player/State 服务。Phase 1 期间由 Gateway 只读，
-///   依据 docs/adr/0002-gateway-temporary-player-ownership.md 这一带退出条件的
-///   临时安排。本接口只读，不提供任何写入方法。
+/// 所有者说明（依据 docs/01-architecture.md 与 docs/adr/0003-scope-reduction.md）：
+///   players 表的所有者是 **Gateway**。原定的 Player/State 服务已列为非目标、
+///   不实现，因此该归属是正式安排，不再是临时例外。本接口只读，不提供写入方法。
 
 #ifndef RGBT_GATEWAY_PLAYER_READER_HPP
 #define RGBT_GATEWAY_PLAYER_READER_HPP

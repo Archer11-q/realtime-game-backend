@@ -898,6 +898,106 @@ Phase 1 的最小闭环要求「两个客户端能匹配进同一房间」。此
 - 由项目所有者审阅 Diff 并运行 `bash scripts/verify-match.sh`；确认后开 PR。
 - TASK-008（Room/Battle Service）在 TASK-007 验收通过后开单。
 
+## 2026-10-02：范围裁剪（TASK-012）
+
+### 背景
+
+项目所有者在范围复盘中确认：原路线图的 Phase 4（等 etcd、多实例）与 Phase 5
+（Kafka、Settlement Worker），以及独立的 Player/State 服务，与本项目真正要证明的
+能力不匹配——没有真实的异步消费者，也没有真实的多实例服务发现需求。
+**这些内容此前只写在对话里，文档中仍表述为"后续阶段"，因此后续 AI 仍会按计划实现。**
+
+### 决策
+
+新增 [ADR-0003：范围裁剪](adr/0003-scope-reduction.md)，把下列内容从"延后"改为
+**"不实现"**：
+
+- Kafka 及任何消息队列、领域事件、事件回放、异步结算 Worker
+- etcd 及任何服务注册、发现、租约机制
+- 多实例部署与水平扩展
+- Kubernetes / k3s / 容器编排
+- 独立的 Player/State 服务
+- 独立的 Settlement 服务
+- 排行榜
+- 匹配分差放宽 / MMR / 评分体系
+
+连带决定：
+
+1. **服务集合固定为三个**：Gateway、Match、Room/Battle。
+2. **`players` 表所有者改为 Gateway**（正式归属）。ADR-0002 的"临时例外"退出条件
+   由 ADR-0003 取消；实现上 `PlayerReader` 接口不变。
+3. **`match_results` 表所有者改为 Room/Battle**，对局结束时**同步幂等**写入
+   （以 `match_id` 为幂等业务键），不经过任何异步链路。Settlement 服务不实现。
+4. **路线图重排**：原 Phase 4/5 取消，原 Phase 6 的可靠性验证内容提为新的
+   Phase 4，Phase 5 为工程收口。
+5. **产品目标调整**：保留登录、匹配、进房、最小对战、断线重连、对局结果写入与查询；
+   移出排行榜、事件回放、异步结算。
+
+### 同步修改的文档
+
+`CLAUDE.md`（规则、技术方向、服务边界、数据所有权、准入条件、当前阶段，并新增
+「范围裁剪」硬性约束一节）、`README.md`、`docs/00-charter.md`、
+`docs/01-architecture.md`、`docs/02-roadmap.md`、
+`docs/04-quality-and-observability.md`、`docs/05-api-and-data.md`、
+`docs/06-operations.md`、`docs/07-open-decisions.md`（D-004、D-005 改为已关闭）、
+`docs/README.md`、`docs/TASKS.md`、`docs/adr/0001`（标注部分替代）、
+`docs/adr/0002`（取消退出条件）、`deploy/compose/.env.example`（移除
+`KAFKA_BROKERS` 与 `ETCD_ENDPOINTS`）、`migrations/002`、`003` 的头部说明，
+以及 `CMakeLists.txt` 与 `src/` 中 5 处指向已取消阶段的注释。
+
+### 未做的事（有意保留）
+
+- **没有删除 `migrations/002`、`003`**：迁移只追加，删除属破坏性变更。
+  `match_results` 保留表定义，只是所有者与写入者变更。
+- **没有改 SQL 的 DDL 与列 `COMMENT`**：只改文件头部注释。改 DDL 会让新库与已有
+  数据卷产生 schema 漂移，而 `CREATE TABLE IF NOT EXISTS` 不会修正已存在的表。
+- **没有重编号 TASK-008~011**：它们只是计划，但重编号会迫使 `api/proto/` 与 `src/`
+  中大量指向 TASK-008/009 的注释一起改动，把一次纯文档提交变成跨模块改动。
+  因此本任务取编号 TASK-012，并在 `docs/TASKS.md` 中注明它实际先于 TASK-008 执行。
+
+### 验证
+
+- 命令：全仓库检索 `Kafka`、`etcd`、`Settlement`、`Player/State`、`多实例`。
+- 结果：剩余出现处均为「非目标」说明、ADR 的历史论证，或 `docs/devlog.md` 中
+  2026-09-22 及以前的历史记录；**不存在实现指引**。
+- 结果：`deploy/compose/.env.example` 已无 Kafka 与 etcd 变量。
+- 结果：服务列表在 `CLAUDE.md`、`README.md`、`docs/01-architecture.md`、
+  `docs/05-api-and-data.md` 四处口径一致，均为三个服务。
+- 本任务**只改文档与注释，不改任何行为代码**，因此未运行构建与测试；
+  合并前由项目所有者运行一次 `bash scripts/verify.sh` 确认无意外影响。
+
+### 下一步
+
+- 由项目所有者审阅 Diff 并确认合并。
+- 合并后按 `docs/TASKS.md` 的 Phase 1 拆分进入 TASK-008（Room/Battle Service），
+  其范围已包含「对局结束时同步幂等写入 `match_results`」。
+
+## 2026-10-02：取消面试复习笔记约定
+
+### 决策
+
+取消 `CLAUDE.md` 中「每完成一个任务额外输出一份 `interview-notes/<任务号>.md`」的
+约定（该约定于 2026-09-22 的 TASK-006 收尾时引入）。迭代流程简化为
+「按迭代计划逐步实现 -> 项目所有者确认」，不再附带面试准备材料。
+
+理由由项目所有者给出：面试准备材料不属于迭代交付物，把生成它们嵌入每轮任务
+流程会稀释迭代本身的产出。
+
+### 完成
+
+- 删除 `interview-notes/` 整个目录（`README.md`、`00-overview.md`、
+  `TASK-006.md`、`TASK-007.md`），Windows 备份副本与 WSL 正式目录同时删除。
+- `CLAUDE.md`：移除原「面试复习笔记」一节，替换为「迭代交付物范围（2026-10-02 起）」，
+  明确禁止再生成此类文件。
+- `.gitignore`：保留 `interview-notes/` 规则并改写注释为"防御性保留"，防止目录被
+  重建后误提交。
+
+### 验证
+
+- 结果：`git ls-files interview-notes/` 为空——该目录**从未被 git 跟踪**，
+  因此也从未出现在任何 PR 或远程分支中。
+- 结果：删除后 `Test-Path` 与 WSL 侧 `test -e` 均确认目录不存在。
+
 ## 日志模板
 
 ```markdown

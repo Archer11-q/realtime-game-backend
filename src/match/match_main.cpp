@@ -12,7 +12,8 @@
 ///
 /// Phase 1 的已知限制：
 ///   * 队列在进程内存中，进程重启即丢失排队状态（快照与恢复属 Phase 2）。
-///   * 队列由单把互斥锁保护，只在单实例下正确（多实例属 Phase 4）。
+///   * 队列由单把互斥锁保护，只在单实例下正确。本项目**不做多实例**
+///     （见 docs/adr/0003-scope-reduction.md），因此该限制不会在项目范围内触发。
 
 #include <brpc/server.h>
 #include <gflags/gflags.h>
