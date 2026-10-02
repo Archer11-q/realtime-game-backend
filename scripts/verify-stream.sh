@@ -513,7 +513,9 @@ else
 fi
 
 # 心跳：以注释行发送，不应被当成事件。
-if grep -q ': ping' "$stream_file"; then
+# 用等待而不是立即断言：心跳按固定间隔发送，前面的断言可能在第一次心跳之前返回，
+# 立即 grep 会变成一个只在特定时序下失败的脆弱断言。
+if wait_for_file_pattern "$stream_file" ': ping' 20; then
   ok "空闲期间收到心跳注释（保持长连接）"
 else
   fail "未观察到心跳"

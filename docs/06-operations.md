@@ -40,13 +40,43 @@ CMakePresets、vcpkg manifest 和 CI 配置固定工具链及仓库提交。
 Docker Desktop 的 Ubuntu WSL Integration 已于 2026-09-14 验证生效。
 `docker version` 能同时返回 Client 和 Server，Docker Compose 插件可正常调用。
 
+### Node.js（TASK-010 起）
+
+前端需要 Node，但**WSL 里原本没有**：`command -v node` 为空，而 PATH 里出现的
+`npm`/`pnpm` 来自 Windows 侧的 `AILauncher` 目录（那是在 WSL 里调用 Windows 的
+Node，路径与文件权限都不适用于 `~/workspace` 下的仓库）。
+
+安装方式（2026-10-02 实际执行）：
+
+```bash
+curl -fL -o /tmp/node.tar.xz \
+  https://nodejs.org/dist/v22.22.2/node-v22.22.2-linux-x64.tar.xz
+mkdir -p ~/tools && tar -xJf /tmp/node.tar.xz -C ~/tools
+mv ~/tools/node-v22.22.2-linux-x64 ~/tools/node
+# 然后把下面这行加入 ~/.bashrc
+export PATH="$HOME/tools/node/bin:$PATH"
+```
+
+为什么不用另外两种常见方式：
+
+- **nvm**：它的安装脚本托管在 `raw.githubusercontent.com`，本机访问被重置
+  （`curl: (35) Recv exception`），装不上。
+- **apt**：源里有 `nodejs 22.22.1`，但本机没有免密 sudo，需要交互输入密码。
+
+官方 tarball 解压是唯一「不需要提权、源可达、版本可精确指定」的路径。
+
+版本：`node v22.22.2` / `npm 10.9.7`，装在 `~/tools/node`（与 `~/tools/vcpkg` 同级）。
+`scripts/verify-web.sh` 会自己把这个目录加进 PATH，不依赖调用者的 shell 配置。
+
 ## 2. 环境分层
 
 ### 本地开发
 
 - C++ 服务直接在 WSL 中运行和调试。
 - Redis、MySQL 等依赖通过 Docker Compose 启动。
-- 前端通过 Vite 开发服务器运行。
+- 前端通过 Vite 开发服务器运行；它把 `/api` 代理到 Gateway，
+  因此浏览器侧是同源请求，**不需要任何 CORS 配置**。
+  代理目标端口用 `RGBT_GATEWAY_PORT` 指定，默认 8080。
 
 ### 集成环境
 
