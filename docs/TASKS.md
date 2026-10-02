@@ -676,6 +676,51 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
 - 回退方式：`git revert` 本任务提交。前端不参与后端构建，
   删除 `web/` 与 `scripts/verify-web.sh` 不影响任何 C++ 目标。
 
+## TASK-011：集成验收：一条命令启动并双客户端完成对局
+
+- 状态：待验收
+- 背景问题：Phase 1 的其余退出标准都已满足（`scripts/verify-web.sh` 已经证明
+  两个身份能登录、匹配、进同一房间并打完整局），但**启动流程散落在四个脚本文档
+  和各处命令里**，没有人能照着一条命令把整套环境跑起来。
+  另外「重跑既有验收脚本」这条纪律在 TASK-009 期间被证明落不了地——
+  TASK-008 改坏 `verify-match.sh` 后十天无人发现。纪律需要一条命令来承载。
+- 本次目标：一条命令起齐集成环境；一条命令跑完整套验收。
+- 范围：
+  - `scripts/dev-up.sh`：起 Redis/MySQL（容器）+ 三个 C++ 服务 + Vue 前端，
+    应用迁移、清理上一轮会话、检查端口、等就绪、打印人工验证步骤。
+  - `scripts/dev-down.sh`：按**进程组**停掉全部进程并按端口兜底核对，
+    可选 `--with-docker` 一并停容器。数据卷保留。
+  - `scripts/verify-all.sh`：按顺序跑 6 个验收脚本，输出汇总表与失败项摘要。
+  - `.run/` 作为运行时产物目录（pid、日志），加入 `.gitignore`。
+  - 修正 `docs/06-operations.md` 中与实现不符的「集成环境」描述。
+- 非范围：
+  - **不把应用服务容器化**（项目所有者 2026-10-02 确认）。理由与环境冲突的
+    处理见 `docs/06-operations.md` 第 2 节；已记入 Backlog。
+  - 不改任何服务代码、接口与数据。
+  - 不做故障注入（Phase 4）。
+  - 不把 `verify-all.sh` 接进 CI：它需要 Docker 与四个本机进程，
+    当前的 CI 形态不适合（Phase 5 再评估）。
+- 相关 ADR：无新增。ADR-0003 的非目标不受影响。
+- 涉及目录：`scripts/`、`docs/`、`.gitignore`。
+- 接口变化：无。
+- 数据变化：无。
+- 失败场景：
+  - 端口被占用 → 明确报错并指出占用进程，不静默换端口（换端口会让前端的代理
+    目标与用户手上的 URL 对不上）。
+  - Docker 不可达 → 启动前检查并明确报错。
+  - 某个服务启动失败 → 直接打印该服务日志的末尾，不让用户自己去猜。
+  - `dev-down.sh` 在无进程时重复执行 → 必须安全（幂等）。
+  - pid 文件丢失或过期 → 按端口兜底清理，并断言端口确实释放。
+- 验收命令：
+  ```bash
+  bash scripts/dev-up.sh --no-build    # 起齐环境并自检
+  bash scripts/dev-down.sh             # 停干净
+  bash scripts/verify-all.sh           # 全套验收（实测 142 秒，见 devlog）
+  ```
+- 测试要求：`dev-up.sh` → 经代理跑通一局 → `dev-down.sh` 的闭环必须实测；
+  `dev-down.sh` 必须在无进程时也安全；`verify-all.sh` 必须跑完全套并给出汇总。
+- 回退方式：`git revert` 本任务提交。三个脚本是纯新增，删掉不影响任何构建。
+
 ## TASK-012：范围裁剪——把非目标写进文档
 
 > **编号说明**：本任务在编号上排在 Phase 1 计划之后，但**实际执行时间早于
@@ -726,7 +771,14 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
 
 ## Backlog：后续待办
 
-- 将 brpc 预设与 Compose 配置纳入 CI 覆盖。
+- **应用服务的容器化**（TASK-011 期间决定延后）。给三个 C++ 服务与前端写
+  Dockerfile，并加进 `deploy/compose/docker-compose.yml`。它是「现场演示可复现」
+  与「故障注入」的前置条件，属于 Phase 4/5。
+  **第一步应该是限时构建实测，而不是先写 Dockerfile**：容器里要用 vcpkg 从源码
+  重建 brpc，首次耗时与内存占用都未实测，而 Docker Desktop 只分到 11 GiB。
+  拿到真实数字再决定是否值得做。背景见 `docs/06-operations.md` 第 2 节。
+- 将 brpc 预设与 Compose 配置纳入 CI 覆盖。`scripts/verify-all.sh` 需要 Docker
+  与四个本机进程，当前 CI 形态不适合，一并在这里评估。
 - 实现 `docs/05-api-and-data.md` 中其余接口（匹配、房间、结果）。
 - Token 刷新与长期会话策略（Phase 2）。
 - 抽取 Protobuf 代码生成的公共 CMake 逻辑。TASK-007 引入了第二个 proto
