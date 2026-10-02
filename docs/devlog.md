@@ -1320,6 +1320,125 @@ TASK-007 的记录里留了一个待决问题（见本文档 2026-09-22 的「�
 - 由项目所有者审阅 Diff 并运行 `bash scripts/verify-stream.sh`；确认后开 PR。
 - 通过后进入 TASK-010（Vue 演示页面：登录、大厅、对战、结算）。
 
+## TASK-010 实施记录（2026-10-02）
+
+### 背景
+
+到 TASK-009 为止服务端链路已经完整，但没有任何东西能把它演示出来。
+Phase 1 的退出标准是「双浏览器完成匹配、进房和对战」，没有前端就无法验证。
+
+动手前先核对了前端要对接的字段名：`api/proto/gateway.proto` 里
+`LoginResponse.player`、`EnqueueMatchResponse.match`、`JoinRoomResponse.room`、
+`GetMatchResultResponse.result` 都是**无前缀直接嵌套**，且字段名是 snake_case。
+前端因此不做 camelCase 转换——多一层映射只多一处「读出来是 undefined」的错误。
+
+### 环境问题（先于编码解决）
+
+**WSL 里没有 Node。** `command -v node` 为空；PATH 里出现的 `npm`/`pnpm` 指向
+`/mnt/c/Users/.../AILauncher/node/`，那是 Windows 侧的 Node 被 WSL 互操作暴露出来的，
+路径与文件权限都不适用于 `~/workspace` 下的仓库。
+
+两条常见路径都不通，实测结论：
+
+- **nvm 装不上**：安装脚本在 `raw.githubusercontent.com`，本机访问被重置
+  （`curl: (35) Recv failure: Connection reset by peer`）。探测结果：
+  `raw.githubusercontent.com` 000，而 `nodejs.org` 与 `registry.npmjs.org` 都是 200。
+- **apt 装不了**：源里有 `nodejs 22.22.1`，但本机没有免密 sudo。
+
+最终用官方 tarball 解压到 `~/tools/node`（与 `~/tools/vcpkg` 同级），
+`node v22.22.2` / `npm 10.9.7`。安装步骤、被否决的两种方式与原因写进了
+`docs/06-operations.md` 第 1 节，`scripts/verify-web.sh` 自己把该目录加进 PATH。
+
+### 完成
+
+- `web/`：Vue 3 + TypeScript + Vite 应用，四个视图 + Canvas 对战渲染。
+- `web/src/api/stream.ts`：用 `fetch` + `ReadableStream` 手动消费 SSE。
+- `web/src/api/stream.test.ts`：SSE 解析的 12 个边界用例（vitest）。
+- `web/src/api/client.ts`：HTTP 封装，**按 `error.reason` 分支而不是按状态码**。
+- `web/vite.config.ts`：`/api` 代理到 Gateway，浏览器侧同源，无需 CORS。
+- `scripts/verify-web.sh`：端到端验收（单测 + 类型检查 + 构建 + 代理 + 全流程）。
+- `docs/06-operations.md`：Node 安装方式与前端运行方式。
+
+### 决策
+
+- **不用 `EventSource`，改用 `fetch` + `ReadableStream` 手动解析 SSE。**
+  `EventSource` 无法设置请求头，token 只能进查询字符串，于是会出现在访问日志、
+  浏览器历史与 `Referer` 里。多约 60 行代码换取 token 始终走 `Authorization` 头。
+  这段解析逻辑因此成为前端最值得测的部分，单独写了单元测试。
+- **不引 `vue-router`**：四个视图是**同一个会话的四个阶段**，不是可独立寻址的
+  页面。用路由会引入 history 管理、路由守卫与「刷新后落到哪一页」这些无收益的问题。
+- **不引 Pinia**：跨组件共享的只有会话那几项，模块作用域的 `ref` 足够。
+- **不引 UI 组件库与 axios**：整个界面只有四个视图，写 CSS 比引组件库便宜。
+  依据 CLAUDE.md 第 6 条。
+- **不做本地乐观更新**：点攻击后血量要等服务端下一帧推送才变。
+  本地先减血会制造第二种真相，与服务端判定冲突时无从分辨。
+- **结算页把「胜负」与「结果已落库」分开显示**。胜负来自 SSE 推送的权威快照，
+  「已落库」来自另一次 `GET /api/v1/results`。两者分开是为了把
+  「对局已结束但结果还没写进数据库」这个真实状态暴露出来，而不是含糊过去。
+- **代理不改写响应头**。SSE 需要的 `Cache-Control` / `X-Accel-Buffering` 由
+  Gateway 自己设置；在代理里再写一遍等于把同一份缓存策略维护在两个地方。
+- **本轮不加前端 CI job**。本地可运行性已由 `verify-web.sh` 覆盖，
+  前端稳定后再纳入。
+
+### 验证（均在 WSL 的 `~/workspace/realtime-game-backend` 执行）
+
+- 命令：`cd web && npm run test`
+- 结果：**12/12 通过**。覆盖的边界包括：心跳注释块必须返回 null（不能变成空事件）、
+  多行 `data` 按换行连接、`data:` 后**只有一个**空格被去掉、CRLF 行尾、
+  空 `data` 与「没有 data 行」必须区分。
+- 命令：`cd web && npm run type-check`
+- 结果：无错误（`vue-tsc --noEmit`）。
+- 命令：`cd web && npm run build`
+- 结果：构建成功，产物 `index.html` + `assets/index-*.js`（82.75 kB，gzip 32.30 kB）
+  + CSS（2.35 kB）。
+- 命令：`bash scripts/verify-web.sh`
+- 结果：**全部通过，退出码 0**。实测覆盖：`GET /` 返回含 `#app` 的页面；
+  空请求体的 `POST /api/v1/login` **经代理**得到 `400 account_required`
+  （证明 `/api` 代理生效，没配就是 404）；alice/bob 登录、匹配、进房全程经代理；
+  **SSE 经代理增量到达**——`session.ready`、`room.state`、攻击造成的
+  `p-0002 hp=90`、心跳注释都在**连接仍然打开时**被文件轮询观察到，
+  这条断言的意义是证明 Vite 代理没有把响应缓冲到最后一起吐；
+  非本局成员订阅经代理被拒（400 `not_a_member`）；打完一局后经代理收到
+  `room.finished` 且流被服务端关闭；结果查询经代理返回 200 且 winner 正确；
+  轮询兜底经代理仍可用；Vite 与三个后端进程都能优雅退出。
+
+### 问题与风险（本轮实际踩到并解决的）
+
+- **npm 默认解析到 TypeScript 7，而 `vue-tsc` 与它不兼容**。
+  报错是 `ERR_PACKAGE_PATH_NOT_EXPORTED: Package subpath './lib/tsc' is not defined`——
+  TS 7（Go 版编译器）不再暴露该子路径，而 `vue-tsc` 正是通过它加载编译器。
+  修复：显式装 `typescript@^5.9.0`。**注意这是依赖解析的结果，不是版本偏好**；
+  将来 `vue-tsc` 支持 TS 7 后可以松开。
+- **验收脚本里的心跳断言原本是竞态**。第一次跑 `verify-web.sh` 时
+  「经代理未观察到心跳」失败，但产品是对的：心跳按固定间隔发送，
+  前一条断言（血量变化）可能在第一次心跳之前就返回了。
+  修复：改成 `wait_for_file_pattern` 等待，并**同时修掉了 `verify-stream.sh`
+  里同样的写法**——它在 TASK-009 那次恰好通过，只是时序上运气好。
+  这类断言的危险在于它会在无关改动后随机变红，让人误以为是产品回归。
+- **`vite.config.ts` 里用 `process.env` 需要 `@types/node`**，
+  否则类型检查报 `Cannot find name 'process'`。代价是应用代码也能看到 Node 类型，
+  换取不必拆分 `tsconfig.app` / `tsconfig.node` 两个项目引用。
+- **原本想在 Vite 代理里改写 `Cache-Control`，但那会造成策略两处维护**，
+  而且类型上 `proxy.on` 在 Vite 8 的类型定义里不存在。删掉这段之后既少一处重复，
+  也顺带解决了类型错误——原来的写法是「以为需要」而不是「验证过需要」。
+- **`verify-web.sh` 覆盖不到渲染。** 它用 curl 验证的是网络路径与代理行为
+  （前端发出的每个 URL、方法、请求头，以及 SSE 经过代理是否增量到达），
+  但 Canvas 画得对不对、按钮可用状态对不对，curl 验证不了。
+  脚本结尾显式打印人工检查步骤，**不假装已覆盖**。
+
+### 未做 / 留给后续
+
+- 不做断线重连 UI（Phase 2）。SSE 规范自带 `Last-Event-ID`，届时可直接利用。
+- 匹配状态仍靠轮询感知，不推送。
+- 前端不进 CI。`verify-web.sh` 需要 Docker 与三个服务，不适合当前的 CI 形态；
+  接入方式在 TASK-011（集成验收）里一并考虑。
+- 不做移动端适配与多语言。
+
+### 下一步
+
+- 由项目所有者审阅 Diff 并运行 `bash scripts/verify-web.sh`；确认后开 PR。
+- 通过后进入 TASK-011（集成验收：一条命令启动并双客户端完成对局）。
+
 ## 日志模板
 
 ```markdown

@@ -1,0 +1,25 @@
+{
+  "name": "rgbt-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Realtime Game Backend 的演示前端：登录、匹配、对战、结算。",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "type-check": "vue-tsc --noEmit",
+    "test": "vitest run",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.43"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3",
+    "vue-tsc": "^3.3.11"
+  }
+}

@@ -618,6 +618,64 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
   `GatewayServiceImpl` 即可——推送接口会返回 503 `stream_unavailable`，
   房间与匹配的轮询链路完全不受影响。
 
+## TASK-010：Vue 演示页面：登录、大厅、对战、结算
+
+- 状态：待验收
+- 背景问题：到 TASK-009 为止服务端链路已经完整（匹配 → 房间 → 对战 → 结果，
+  以及 SSE 推送），但**没有任何东西能把它演示出来**。Phase 1 的退出标准是
+  「双浏览器完成匹配、进房和对战」，没有前端就无法验证，也无法演示。
+- 本次目标：浏览器里能完整走通「登录 → 匹配 → 进房对战 → 结算」，
+  并且服务端推送在界面上真实可见。
+- 范围：
+  - `web/` 下的 Vue 3 + TypeScript + Vite 应用。
+  - 四个视图：登录、大厅（匹配）、对战（Canvas）、结算。
+  - `BattleCanvas.vue`：Canvas 渲染双方血条、帧号与推送序号。
+  - `src/api/stream.ts`：用 `fetch` + `ReadableStream` 消费 SSE。
+  - `vite.config.ts`：把 `/api` 代理到 Gateway，浏览器侧同源，无需 CORS。
+  - 单元测试：SSE 解析的边界（注释、多行 data、CRLF、冒号后空格、无 data 行）。
+  - `scripts/verify-web.sh`：端到端验收。
+- 非范围（明确不做，避免前端膨胀）：
+  - **不引 `vue-router`**。四个视图是同一会话的四个阶段，不是可独立寻址的页面。
+  - **不引 Pinia / Vuex**。跨组件共享的状态只有会话那几项。
+  - **不引 UI 组件库、不引 axios**。
+  - 不做断线重连 UI（Phase 2）。
+  - **不改进 CI**。本轮不加前端 CI job：本地的可运行性已由 `verify-web.sh` 覆盖，
+    前端稳定后再纳入（依据 CLAUDE.md 第 6 条）。
+  - 不改任何后端接口。
+- 相关 ADR：ADR-0004（SSE 取代 WebSocket，决定了前端如何消费推送）。
+- 涉及目录：`web/`、`scripts/`、`deploy/compose/`、`docs/`。
+  后端源码不在本任务范围内。
+- 接口变化：无。
+- 数据变化：无。
+- **环境变化**：WSL 里原本没有 Node，本任务安装了 `node v22.22.2` 到
+  `~/tools/node`（用户态，未用 sudo）。安装方式与两种被否决的方式
+  （nvm 源不可达、apt 需要 sudo）记录在 `docs/06-operations.md` 第 1 节。
+- 失败场景（界面必须说清楚，不能装作成功）：
+  - 依赖不可用（Redis / MySQL / Match / Room）→ 按 `error.reason` 给出具体提示，
+    而不是「请求失败」。
+  - 会话失效 → 提示重新登录。
+  - 订阅被拒（`not_a_member`）→ 明确说明不是这一局的成员。
+  - 对局结束但结果未落库（`result_pending`）→ 界面区分「胜负」（来自推送）
+    与「结果已落库」（来自一次查询），不把两者混为一谈。
+  - SSE 断开 → 顶栏显示「推送已断开」，不静默。
+- 已知限制：
+  - 不做断线重连（Phase 2）。
+  - 匹配状态靠轮询感知，不推送（理由见 `docs/05-api-and-data.md` 第 2 节）。
+  - 不做本地乐观更新：点攻击后血量要等服务端下一帧推送才变。
+    这是刻意的——本地先减血会制造第二种真相。
+  - `verify-web.sh` **覆盖不到渲染**（Canvas 画得对不对、按钮状态），
+    它验证的是网络路径与 SSE 经过代理的行为。渲染由脚本结尾打印的人工步骤确认。
+- 验收命令：
+  ```bash
+  bash scripts/verify-web.sh
+  # 或分步：
+  cd web && npm ci && npm run test && npm run type-check && npm run build
+  ```
+- 测试要求：`vitest` 覆盖 SSE 解析（12 个用例）；`vue-tsc` 无错误；
+  `verify-web.sh` 断言全部通过。
+- 回退方式：`git revert` 本任务提交。前端不参与后端构建，
+  删除 `web/` 与 `scripts/verify-web.sh` 不影响任何 C++ 目标。
+
 ## TASK-012：范围裁剪——把非目标写进文档
 
 > **编号说明**：本任务在编号上排在 Phase 1 计划之后，但**实际执行时间早于
