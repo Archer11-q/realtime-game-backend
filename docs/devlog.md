@@ -1908,8 +1908,12 @@ A/B 复现（7/10 → 0/10）、ASan 与"废弃 Token `OK`"这类直接现象，
 
 ### 下一步
 
+- 交付提交：`fa704f4`（分支 `feat/task-014-room-recovery`，未推送、未合并）。
+  其上 `a35b3ef` 是接手时的 WIP，再往下是 TASK-013 的 `5642b28`。
+  审阅时建议 `git show fa704f4`，或直接用下面两条命令跑验收。
 - 由项目所有者审阅 Diff，并运行：
-  `bash scripts/verify-persistence.sh`（约 4 分钟）与 `bash scripts/verify-all.sh`。
+  `bash scripts/verify-persistence.sh`（约 45 秒）与 `bash scripts/verify-all.sh`
+  （实测 212 秒）。
 - TASK-015（匹配队列的 Redis 快照与重启恢复）需要项目所有者先决定
   「Redis 不可用时是明确报错还是降级为纯内存」，见任务单。
 
