@@ -49,6 +49,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "match_queue_store.hpp"
 #include "room_allocator.hpp"
 
 namespace rgbt::match {
@@ -103,17 +104,45 @@ enum class EnqueueOutcome {
     kInvalidArgument,
 };
 
+/// 启动恢复的结果统计（TASK-015）。
+///
+/// 为什么要有一个结构而不是只打日志：启动日志会被后续输出冲掉，而
+/// 「这次到底恢复了几个排队、几个已配对、丢了几条」是排障与验收都必须能一眼
+/// 看到的事实。验收脚本也靠它断言"确实发生了恢复"，而不是只看玩家还在不在队列。
+struct MatchRestoreReport {
+    /// 从存储读到的行数。
+    std::size_t scanned = 0;
+    /// 重建为「排队中」的玩家数。
+    std::size_t queued = 0;
+    /// 重建为「已配对」的玩家数。
+    std::size_t matched = 0;
+    /// 因损坏或重复被跳过的行数（**不静默丢弃**：每一条都会记日志）。
+    std::size_t dropped = 0;
+    /// **已经超时所以没有恢复**的排队玩家数——停机时间算在等待里。
+    /// 他们不会被装进内存变成 `timeout` 状态，而是干脆不恢复（等同于"该重新入队"）。
+    std::size_t timed_out = 0;
+    /// **结果保留期已过所以没有恢复**的已配对玩家数。
+    std::size_t expired_results = 0;
+    /// 存储不可用导致整体失败。此时一个条目也没有恢复。
+    bool load_failed = false;
+};
+
 /// 匹配队列。
 class MatchQueue {
 public:
     /// @param allocator 房间分配器，生命周期由调用方保证，不能为空。
     /// @param match_id_factory 匹配 ID 生成器；默认使用随机 Token。
     ///        注入的目的只是让测试可得到确定结果，生产路径不需要自定义。
+    /// @param store 队列快照存储（TASK-015）。可以为 nullptr（此时不做任何
+    ///        快照与恢复），用于不关心持久化的测试。
+    ///        **它的失败策略与对局结果相反**：快照可以丢弃、不重试、不阻塞入队；
+    ///        因此 Redis 不可用时匹配照常工作，只是失去"重启可恢复"。
     explicit MatchQueue(RoomAllocator* allocator,
                         std::function<std::string()> match_id_factory = {},
                         std::int64_t match_timeout_ms = kDefaultMatchTimeoutMs,
                         std::int64_t result_ttl_ms = kDefaultResultTtlMs,
-                        std::size_t max_queue_size = kDefaultMaxQueueSize);
+                        std::size_t max_queue_size = kDefaultMaxQueueSize,
+                        MatchQueueStore* store = nullptr);
 
     MatchQueue(const MatchQueue&) = delete;
     MatchQueue& operator=(const MatchQueue&) = delete;
@@ -129,6 +158,20 @@ public:
     /// 本方法内部会调用 RoomAllocator（网络调用），但**不会持有锁**。
     EnqueueOutcome Enqueue(const std::string& player_id, const std::string& request_id,
                            std::int64_t now_ms);
+
+    /// @brief 从存储恢复队列（TASK-015）。**在开始接受请求之前调用一次。**
+    ///
+    /// 行为：
+    ///   * 只恢复「排队中」与「已配对」两类条目。已超时的条目不必持久化：
+    ///     重启后玩家本就是空闲状态，对外语义等价。
+    ///   * 排队条目按 `queued_at_ms` **稳定排序**重建 FIFO。稳定是必需的：
+    ///     同一毫秒入队的两个人必须保持原来的先后。
+    ///   * **重新判定超时**：把停机期间流逝的时间算进去。超过排队超时的条目
+    ///     在恢复时就被淘汰，而不是让玩家重启后还能再排很久。
+    ///   * 损坏的行**不静默丢弃**：跳过、计数、并逐条记日志。
+    ///   * 存储不可用时**一个条目都不恢复**并如实报告 `load_failed`
+    ///     ——空手启动比"以为恢复了其实没有"安全。
+    [[nodiscard]] MatchRestoreReport Restore(std::int64_t now_ms);
 
     /// @brief 取消匹配。
     /// @return true 表示确实从队列中移除，或玩家正处于房间分配中（取消请求已登记，
@@ -169,7 +212,8 @@ private:
     };
 
     /// 惰性结算：淘汰超时的排队项，清理过期结果。调用方必须已持有 mutex_。
-    void SweepLocked(std::int64_t now_ms);
+    /// @return true 表示状态发生了变化（调用方据此决定是否需要写快照）。
+    [[nodiscard]] bool SweepLocked(std::int64_t now_ms);
 
     /// 阶段一：从队列取出可配对的组并标记为分配中。调用方必须已持有 mutex_。
     [[nodiscard]] std::vector<PendingGroup> TakePairGroupsLocked();
@@ -182,24 +226,48 @@ private:
 
     /// 阶段一 + 阶段三的组合：取组 -> **锁外**分配 -> 锁内提交。
     /// 调用方**不得**持有 mutex_。
-    void RunPairingRound(std::int64_t now_ms);
+    /// @return true 表示本轮确实处理过分组（调用方据此决定是否需要写快照）。
+    [[nodiscard]] bool RunPairingRound(std::int64_t now_ms);
 
     /// 如果上一次分配失败且玩家已退回队列，顺带重试一次配对。
     /// 只在真的有待重试的配对时才发起远程调用。
-    void RetryPairingIfNeeded(std::int64_t now_ms);
+    /// @return true 表示本轮确实处理过分组。
+    [[nodiscard]] bool RetryPairingIfNeeded(std::int64_t now_ms);
 
     /// 从 FIFO 队列中移除指定玩家。调用方必须已持有 mutex_。
     void RemoveFromQueueLocked(const std::string& player_id);
 
     [[nodiscard]] MatchStatusSnapshot SnapshotLocked(const std::string& player_id) const;
 
+    /// 由内存状态生成快照内容。调用方必须已持有 mutex_。
+    ///
+    /// 「正在分配房间」的条目会作为**排队中**写入：重启后无法知道 CreateRoom
+    /// 是否已经成功，而 Room 侧以 match_id 幂等，退回队列重新分配会拿回同一个
+    /// room_id，因此退回比丢弃安全（TASK-015 决策 4）。
+    [[nodiscard]] MatchQueueSnapshot MakeSnapshotLocked() const;
+
+    /// @brief 把当前内存状态写进快照存储。**不持有任何锁即可调用。**
+    ///
+    /// 为什么不直接在状态变更处写：本项目明确避免"持锁做 I/O"——一次 Redis
+    /// 超时会把整个队列卡住。因此这里的做法是**锁内取副本、锁外写**。
+    ///
+    /// 但只做到这一点还不够：两个线程可能各自取到较早的快照 S1 与较晚的快照 S2，
+    /// 却按 S2 → S1 的顺序写入，把队列**写回退**。因此用 `snapshot_order_mutex_`
+    /// 把「取快照 + 写快照」整体串行化，锁序固定为
+    /// `snapshot_order_mutex_ → mutex_`（反向不存在，因此不会死锁）。
+    void PersistSnapshot();
+
     RoomAllocator* allocator_;
+    MatchQueueStore* store_;
     std::function<std::string()> match_id_factory_;
     std::int64_t match_timeout_ms_;
     std::int64_t result_ttl_ms_;
     std::size_t max_queue_size_;
 
     mutable std::mutex mutex_;
+    /// 串行化「取快照 + 写快照」这一对操作，防止旧快照后写把队列写回退。
+    /// 锁序固定为 snapshot_order_mutex_ -> mutex_（见 PersistSnapshot 的说明）。
+    mutable std::mutex snapshot_order_mutex_;
     /// FIFO 顺序的 player_id。只保存仍在排队中的玩家（分配中的不在其中）。
     std::deque<std::string> queue_;
     /// 玩家 -> 状态。**以 player_id 为键**，这是「同一玩家不会重复出现在两个有效

@@ -123,10 +123,12 @@ done
 [ "$applied" -gt 0 ] || die "迁移脚本未成功应用"
 ok "已应用 $applied 个迁移脚本（幂等）"
 
-# 清掉上一轮的会话，避免「明明退出了却还是登录状态」这种难以理解的现象。
-docker exec rgbt-redis redis-cli --scan --pattern 'dev:gateway:*' 2>/dev/null |
+# 清掉上一轮遗留的状态，避免「明明退出了却还是登录状态」这种难以理解的现象。
+# TASK-015 起 `dev:*` 里还多了匹配队列快照（`dev:match:queue`）：Match 启动会恢复它，
+# 不清掉的话，上一轮的排队玩家会出现在新一局的验收里。
+docker exec rgbt-redis redis-cli --scan --pattern 'dev:*' 2>/dev/null |
   while read -r key; do docker exec rgbt-redis redis-cli DEL "$key" >/dev/null 2>&1; done
-ok "已清理上一轮遗留的会话"
+ok "已清理上一轮遗留的会话与队列快照"
 
 # ---------- 2. 编译 ----------
 if [ "$skip_build" -eq 1 ]; then

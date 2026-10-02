@@ -145,13 +145,13 @@ if [ "$manage_docker" -eq 1 ]; then
   # 幂等映射会残留 7 天。不清理会导致结果不可复现——例如某个 request_id 已存在
   # 幂等映射时，本次登录会直接返回旧 Token，而该 Token 对应的会话可能已被登出
   # 或从未创建，表现为「刚拿到的 Token 查询失败」这类难以定位的偶发问题。
-  stale=$(docker exec rgbt-redis redis-cli --scan --pattern 'dev:gateway:*' 2>/dev/null | wc -l)
+  stale=$(docker exec rgbt-redis redis-cli --scan --pattern 'dev:*' 2>/dev/null | wc -l)
   if [ "$stale" -gt 0 ]; then
-    docker exec rgbt-redis redis-cli --scan --pattern 'dev:gateway:*' 2>/dev/null \
+    docker exec rgbt-redis redis-cli --scan --pattern 'dev:*' 2>/dev/null \
       | while IFS= read -r key; do
           [ -n "$key" ] && docker exec rgbt-redis redis-cli del "$key" >/dev/null 2>&1
         done
-    ok "已清理上次运行残留的 $stale 个 dev:gateway:* Key"
+    ok "已清理上次运行残留的 $stale 个 dev:* Key（会话与队列快照）"
   else
     ok "无残留 Key"
   fi

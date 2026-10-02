@@ -205,11 +205,13 @@ if [ "$manage_docker" -eq 1 ]; then
     fail "迁移脚本未成功应用"
   fi
 
-  # 清理上一次运行留下的会话与幂等映射，保证结果可复现。
-  stale=$(docker exec rgbt-redis redis-cli --scan --pattern 'dev:gateway:*' 2>/dev/null | wc -l)
-  docker exec rgbt-redis redis-cli --scan --pattern 'dev:gateway:*' 2>/dev/null |
+  # 清理上一次运行留下的会话、幂等映射与队列快照，保证结果可复现。
+  # 队列快照（TASK-015 起）必须一起清掉：Match 启动会恢复它，
+  # 不清的话上一轮的排队玩家会出现在本次验收里。
+  stale=$(docker exec rgbt-redis redis-cli --scan --pattern 'dev:*' 2>/dev/null | wc -l)
+  docker exec rgbt-redis redis-cli --scan --pattern 'dev:*' 2>/dev/null |
     while read -r key; do docker exec rgbt-redis redis-cli DEL "$key" >/dev/null 2>&1; done
-  ok "已清理上次运行残留的 $stale 个 dev:gateway:* Key"
+  ok "已清理上次运行残留的 $stale 个 dev:* Key"
   echo
 else
   echo "===== 1. 跳过依赖启停（--no-docker） ====="

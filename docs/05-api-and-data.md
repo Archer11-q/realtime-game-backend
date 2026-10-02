@@ -214,10 +214,23 @@ data: {"version":1,"type":"room.state","sequence":12,"timestamp_ms":0,"payload":
 - 房间短期路由信息。
 - 限流和短期幂等标记。
 
-当前落地情况（TASK-007 记录）：**匹配队列没有放进 Redis**。队列所有者是 Match，
-Phase 1 用进程内存实现（见 `docs/01-architecture.md` 第 5 节），快照与重启恢复属
-Phase 2。这样做避免了「Gateway 直读 Match 的数据」这一所有权变化——若改为
-Gateway 直接读 Redis 中的队列状态，必须先写 ADR。
+当前落地的 Key（截至 TASK-015）：
+
+| Key | 类型 | 所有者 | 说明 |
+|---|---|---|---|
+| `<env>:gateway:session:<token>` | Hash | Gateway | 会话，带 TTL |
+| `<env>:gateway:idem:login:<request_id>` | String | Gateway | 登录幂等映射，带 TTL |
+| `<env>:match:queue` | List | Match | 匹配队列快照（TASK-015），**无 TTL**：它是"整份替换"的旁路快照，由写入端每次覆盖 |
+
+`<env>:match:queue` 的语义（TASK-015）：
+
+- 元素是**长度前缀文本**的条目，带显式格式版本号；不认识的版本会被拒绝并记日志。
+- 只保存「排队中」与「已配对」两类条目。已超时的条目不必保存：重启后玩家本就是
+  空闲状态，对外语义等价。
+- **队列的权威状态仍在 Match 内存里**，这里只是旁路快照。因此写失败不重试、
+  不阻塞匹配（Redis 不可用时降级为纯内存），这与 `rooms` 表的失败策略一致，
+  与 `match_results` 的"不可丢弃、无限重试"相反。
+- 启动时读取并重建；**读失败时一个条目都不恢复**并如实报告，不假装恢复了一个空队列。
 
 约束：
 

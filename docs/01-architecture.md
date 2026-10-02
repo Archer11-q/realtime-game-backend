@@ -236,7 +236,7 @@ Room 自己的推进线程每 50 ms 调用一次 RoomManager::Tick
 | SSE 连接与订阅 | Gateway | 内存 | 客户端重连后重建（Phase 2） |
 | 玩家会话 | Gateway | Redis | 使用 Session 映射恢复 |
 | 玩家档案 | Gateway | MySQL（`players`） | 数据库恢复 |
-| 匹配队列 | Match | 内存（Phase 1）；Redis 快照属 Phase 2 | 当前重启即丢失；快照与重建在 Phase 2 定义 |
+| 匹配队列 | Match | 内存（权威）+ Redis 快照（`<env>:match:queue`） | 启动时从 Redis 快照重建并**重算超时**（TASK-015 已实现）；Redis 不可用时降级为纯内存，匹配照常 |
 | 房间权威状态 | Room/Battle | 内存 + 快照（MySQL `rooms`） | 从最近快照恢复（已实现，边界见下） |
 | 对局结果 | Room/Battle | MySQL（`match_results`） | 数据库恢复，`match_id` 保证幂等 |
 
