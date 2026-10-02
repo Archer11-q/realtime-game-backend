@@ -231,12 +231,18 @@ message CancelMatchResponse {
 message RoomPlayerInfo {
   string player_id = 1;
   int32 hp = 2;
+
+  // 是否在房间内（已加入且未离开）。**不是**"网络是否连通"，看 online。
   bool connected = 3;
+
+  // TASK-016：推送连接是否在线。false 表示该玩家断线、正处于宽限期。
+  // 前端据此显示"等待对方重连"，并在自己断线时触发自动重连。
+  bool online = 4;
 }
 
 // 房间权威状态快照。state 取值：
 // created / waiting / playing / finishing / finished / aborted。
-// finish_reason 取值：none / hp_zero / timeout / aborted。
+// finish_reason 取值：none / hp_zero / timeout / aborted / disconnect。
 message RoomStateInfo {
   string room_id = 1;
   string match_id = 2;

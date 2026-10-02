@@ -127,6 +127,16 @@ private:
     void TickRoom(const std::string& room_id, const std::vector<SinkRef>& sinks,
                   std::int64_t now_ms, std::vector<std::uint64_t>* failed);
 
+    /// 把"某个玩家的推送连接是否在线"上报给 Room（TASK-016）。**不得持锁调用**。
+    /// 失败只记日志、不重试：这是尽力而为的事实同步，下一次连接变化会覆盖它。
+    void ReportPresence(const std::string& room_id, const std::string& player_id, bool online);
+
+    /// 由房间状态生成"是否需要推送"的比较签名。
+    ///
+    /// 为什么不只比帧号（TASK-016）：宽限期内对局暂停推进、帧号不变，
+    /// 而"对方断线了/回来了"正是那时最需要推给客户端的变化。
+    [[nodiscard]] static std::string StateSignature(const RoomSnapshot& snapshot);
+
     RoomClient* room_;
     StreamHubOptions options_;
 
@@ -135,9 +145,9 @@ private:
     std::uint64_t next_id_ = 1;
     std::uint64_t room_poll_count_ = 0;
 
-    /// 每个房间最近一次已推送的帧号。
+    /// 每个房间最近一次已推送的状态签名（见 StateSignature）。
     /// 只由 Tick 访问（单线程），因此不需要加锁。
-    std::unordered_map<std::string, std::int64_t> last_pushed_frame_;
+    std::unordered_map<std::string, std::string> last_pushed_state_;
 
     std::thread thread_;
     std::atomic<bool> stopping_{false};

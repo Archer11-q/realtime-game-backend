@@ -46,6 +46,9 @@ public:
 
     RoomCallStatus GetResult(const std::string& match_id, MatchResultView* out_view) override;
 
+    RoomCallStatus SetPresence(const std::string& room_id, const std::string& player_id,
+                               bool online, RoomSnapshot* out_snapshot) override;
+
     [[nodiscard]] bool IsHealthy() override;
 
 private:

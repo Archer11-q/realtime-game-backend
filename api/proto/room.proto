@@ -64,6 +64,12 @@ enum FinishReason {
 
   // 异常终止，未产生胜负。
   FINISH_REASON_ABORTED = 3;
+
+  // TASK-016：一方在宽限期内没有回来，判其负。
+  //
+  // 与 ABORTED 的区别是**它产生胜负**：会正常写入 match_results。
+  // 只有"双方都断线且都没回来"才走 ABORTED（那一局没有任何一方值得判负）。
+  FINISH_REASON_DISCONNECT = 4;
 }
 
 // 房间错误码。与 docs/05-api-and-data.md 第 3 节的分类对应：
@@ -115,9 +121,19 @@ message PlayerState {
 
   // 该玩家当前是否在房间内（已加入且未离开）。
   //
-  // 注意语义：这不是「网络是否连通」。TASK-008 没有断线重连与宽限期（属 Phase 2），
-  // 因此 PLAYING 及之后恒为 true；在 WAITING 期间尚未加入的玩家为 false。
+  // 注意语义：这不是「网络是否连通」。PLAYING 及之后恒为 true；
+  // 在 WAITING 期间尚未加入的玩家为 false。**判断网络连通请看 online。**
   bool connected = 3;
+
+  // TASK-016：该玩家的推送连接当前是否在线。
+  //
+  // 为什么不让 connected 承担这个含义：它已经被 `rooms.pN_joined` 与快照校验
+  // （"PLAYING 的房间必须双方都已加入"）依赖，改语义会破坏 TASK-014 的恢复逻辑。
+  // 而且「在房间里」与「网络通着」本来就是两个事实：断线的玩家仍然在房间里。
+  //
+  // 断线后进入宽限期（见 src/room/room_types.hpp 的 kReconnectGraceMs）：
+  // 期内对局**暂停推进**，回来接上继续打；到期未归则判负（FINISH_REASON_DISCONNECT）。
+  bool online = 4;
 }
 
 // 房间权威状态快照。每 tick 生成一份，Phase 1 通过查询接口下发。
@@ -273,6 +289,29 @@ message GetMatchResultResponse {
 }
 
 // ---------------------------------------------------------------------------
+// 上报玩家连接状态（TASK-016）
+// ---------------------------------------------------------------------------
+
+// 「socket 断了」这个事实只有 Gateway 知道（SSE 是长连接，客户端断开时服务端
+// 收不到显式通知，只能靠写失败感知，见 StreamHub 的说明）；而「这一局怎么办」
+// 是房间的权威状态，属于 Room。因此由 Gateway 在订阅建立/移除时上报本接口。
+message SetPlayerPresenceRequest {
+  string request_id = 1;
+  string room_id = 2;
+  string player_id = 3;
+
+  // true = 该玩家的推送连接已建立；false = 已断开（进入宽限期）。
+  bool connected = 4;
+}
+
+message SetPlayerPresenceResponse {
+  RoomError error = 1;
+
+  // 上报后的房间快照。调用方一般不需要，但排障时能直接看到宽限期状态。
+  RoomSnapshot room = 2;
+}
+
+// ---------------------------------------------------------------------------
 // 服务定义
 // ---------------------------------------------------------------------------
 
@@ -291,4 +330,7 @@ service RoomService {
 
   // 查询对局结果。结果尚未落库时返回 RESULT_PENDING，而不是空结果。
   rpc GetMatchResult(GetMatchResultRequest) returns (GetMatchResultResponse);
+
+  // 上报玩家的推送连接状态（TASK-016）。幂等：重复上报同一状态无副作用。
+  rpc SetPlayerPresence(SetPlayerPresenceRequest) returns (SetPlayerPresenceResponse);
 }

@@ -10,7 +10,13 @@ import { computed, ref } from 'vue'
 
 import * as api from '../api/client'
 import { ApiFailure, NetworkFailure } from '../api/client'
-import { decodeEnvelope, streamRoom } from '../api/stream'
+import {
+  connectRoomPush,
+  decodeEnvelope,
+  kMaxReconnectAttempts,
+  streamRoom,
+} from '../api/stream'
+import type { PushConnection, PushStatus } from '../api/stream'
 import type {
   MatchResultInfo,
   MatchStatusInfo,
@@ -38,11 +44,15 @@ const result = ref<MatchResultInfo | null>(null)
 const resultPending = ref(false)
 const notice = ref('')
 const errorText = ref('')
-const streamConnected = ref(false)
+/** 推送连接状态。见 api/stream.ts 的 PushStatus：重连中与已放弃必须能分辨。 */
+const streamStatus = ref<PushStatus>('stopped')
+/** 当前已经尝试到第几次重连，供界面显示「重连中（第 N/5 次）」。 */
+const streamAttempt = ref(0)
 const lastSequence = ref(-1)
 
 let matchPollTimer: ReturnType<typeof setTimeout> | undefined
-let streamAbort: AbortController | undefined
+let push: PushConnection | undefined
+let pushRoomId = ''
 
 const selfPlayerId = computed(() => player.value?.player_id ?? '')
 
@@ -98,11 +108,13 @@ function stopMatchPolling(): void {
 }
 
 function stopStream(): void {
-  if (streamAbort !== undefined) {
-    streamAbort.abort()
-    streamAbort = undefined
+  if (push !== undefined) {
+    push.stop()
+    push = undefined
   }
-  streamConnected.value = false
+  pushRoomId = ''
+  streamAttempt.value = 0
+  streamStatus.value = 'stopped'
 }
 
 export function useGameSession() {
@@ -221,44 +233,95 @@ export function useGameSession() {
     startStream(roomId)
   }
 
+  /**
+   * 订阅房间推送，并带上自动重连（TASK-016 前端部分）。
+   *
+   * 重连窗口就是 Gateway 的 30 秒宽限期：期内重连成功，对局接着打；
+   * 超过宽限期判断线方负。因此这里的重试预算（1/2/4/5/5 秒）刻意压在 17 秒内，
+   * 给「每次尝试本身的连接耗时」留出余量。
+   *
+   * 状态与重连的关系：
+   *   * session.ready 只说明「流通了」，不重置退避——真正重置的是收到带 payload
+   *     的事件（room.state / room.finished），由 push.resetBudget() 表达。
+   *   * room.finished 是终局：立刻 stop()，不再重连，也不会留下定时器。
+   */
   function startStream(roomId: string): void {
     stopStream()
-    const controller = new AbortController()
-    streamAbort = controller
+    pushRoomId = roomId
     lastSequence.value = -1
+    streamAttempt.value = 0
+    streamStatus.value = 'connecting'
 
-    void streamRoom({
-      roomId,
-      token: token.value,
-      signal: controller.signal,
-      onEvent: (event) => {
-        if (event.event === 'session.ready') {
-          streamConnected.value = true
-          return
-        }
-        const envelope = decodeEnvelope<StreamEnvelope<RoomStateInfo>>(event)
-        if (envelope?.payload === undefined) {
-          return
-        }
-        room.value = envelope.payload
-        if (typeof envelope.sequence === 'number') {
-          lastSequence.value = envelope.sequence
-        }
-        if (event.event === 'room.finished') {
-          void finishBattle()
+    const connection = connectRoomPush({
+      run: (signal) =>
+        streamRoom({
+          roomId,
+          token: token.value,
+          signal,
+          onEvent: (event) => {
+            if (event.event === 'session.ready') {
+              streamStatus.value = 'connected'
+              return
+            }
+            const envelope = decodeEnvelope<StreamEnvelope<RoomStateInfo>>(event)
+            if (envelope?.payload === undefined) {
+              return
+            }
+            room.value = envelope.payload
+            if (typeof envelope.sequence === 'number') {
+              lastSequence.value = envelope.sequence
+            }
+            // 收到真实数据：链路确实通了，退避预算回到起点。
+            connection.resetBudget()
+            streamStatus.value = 'connected'
+            if (event.event === 'room.finished') {
+              // 对局结束：先停掉重连，再切结算页。顺序不能反——
+              // finishBattle() 是异步的，期间若还有重连在跑，会重新订阅一个
+              // 已经结束的房间。
+              connection.stop()
+              void finishBattle()
+            }
+          },
+        }),
+      onStatus: (status) => {
+        streamStatus.value = status
+        // 重试次数是状态的派生值，不单独维护一个可能跑偏的计数器：
+        // 状态机的 'reconnecting' 每次等待开始时上报一次，递增即可；
+        // 而 'exhausted' 一定等于上限，直接对齐，避免显示「第 4/5 次」却已经放弃。
+        switch (status) {
+          case 'connecting':
+          case 'connected':
+            streamAttempt.value = 0
+            break
+          case 'reconnecting':
+            streamAttempt.value = Math.min(streamAttempt.value + 1, kMaxReconnectAttempts)
+            break
+          case 'exhausted':
+            streamAttempt.value = kMaxReconnectAttempts
+            break
+          case 'stopped':
+          default:
+            break
         }
       },
-    })
-      .then(() => {
-        // 流结束：可能是对局结束（正常），也可能是服务端重启或网络断开。
-        streamConnected.value = false
-      })
-      .catch((cause: unknown) => {
-        streamConnected.value = false
+      onError: (cause) => {
+        // 只在还处于对战阶段时提示：切到结算页之后的失败是收尾噪音。
         if (stage.value === 'battle') {
           errorText.value = describeFailure(cause)
         }
-      })
+      },
+    })
+    push = connection
+  }
+
+  /** 界面上「重试连接」按钮的动作：预算耗尽后用户显式要求再试。 */
+  function retryStream(): void {
+    const roomId = pushRoomId !== '' ? pushRoomId : (room.value?.room_id ?? '')
+    if (roomId === '') {
+      return
+    }
+    errorText.value = ''
+    startStream(roomId)
   }
 
   /**
@@ -347,7 +410,8 @@ export function useGameSession() {
     resultPending,
     notice,
     errorText,
-    streamConnected,
+    streamStatus,
+    streamAttempt,
     lastSequence,
     selfPlayerId,
     selfPlayer,
@@ -360,6 +424,7 @@ export function useGameSession() {
     enterBattle,
     attack,
     reloadResult,
+    retryStream,
     backToLobby,
   }
 }

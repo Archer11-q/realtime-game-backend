@@ -141,8 +141,14 @@ data: {"version":1,"type":"room.state","sequence":12,"timestamp_ms":0,"payload":
 推送事件类型（TASK-009 已实现的部分）：
 
 - `session.ready` —— 订阅建立后的第一个事件，带上订阅者与房间
-- `room.state` —— 房间权威状态快照，**仅在该房间帧号变化时推送**
-- `room.finished` —— 对局结束（含平局与 `aborted`），推送后服务端关闭连接
+- `room.state` —— 房间权威状态快照。**判据是"状态变化"而不是"帧号变化"**：
+  宽限期内对局暂停推进、帧号不变，但"对方断线了/回来了"必须推出去（TASK-016）
+- `room.finished` —— 对局结束（含平局、`aborted` 与断线判负），推送后服务端关闭连接
+
+**断线语义（TASK-016）**：订阅的建立与断开都会被 Gateway 上报给 Room
+（`SetPlayerPresence`，见下节）。断开后该玩家进入 **30 秒宽限期**，期内对局暂停推进；
+重连后接着打。`room.state` 里每个玩家带 `connected`（是否在房间里）与
+`online`（推送连接是否在线）两个字段——**它们是两件事**：断线的玩家仍然在房间里。
 
 计划中但**当前未实现**的事件类型（不要在没有对应实现时把它们写进文档之外的地方）：
 
@@ -164,7 +170,17 @@ data: {"version":1,"type":"room.state","sequence":12,"timestamp_ms":0,"payload":
 
 - `GatewayService`
 - `MatchService`（已实现，TASK-007，契约见 `api/proto/match.proto`）
-- `RoomService`（已实现，TASK-008，契约见 `api/proto/room.proto`）
+- `RoomService`（已实现，TASK-008；TASK-016 新增 `SetPlayerPresence`，契约见 `api/proto/room.proto`）
+
+`RoomService.SetPlayerPresence`（TASK-016）是本项目第四个跨服务事实来源：
+
+- **为什么由 Gateway 上报**：SSE 是长连接，客户端断开时服务端收不到显式通知，
+  只能靠写失败感知——那是 Gateway 才知道的事实。而"这一局怎么办"是房间的权威状态，
+  属于 Room。两者通过这条 RPC 对接。
+- **幂等**：重复上报同一状态无副作用；**不重试、不补偿**——下一次连接状态变化
+  会自然覆盖它。上报失败只记日志（`online` 是尽力而为的事实同步）。
+- `online = false` 开始宽限计时；`online = true` 清除它。
+  对局已结束时返回 `ALREADY_FINISHED`（而不是"成功"），避免掩盖调用方时序错误。
 
 **不实现** `PlayerService` 与 `SettlementService`；不要为它们创建 `.proto`。
 
@@ -184,7 +200,6 @@ data: {"version":1,"type":"room.state","sequence":12,"timestamp_ms":0,"payload":
   混在一起会把「队列已满」误报成「服务不可用」。
 
 `RoomService` 是第三个契约，沿用同一套约定，并额外确立一条：
-
 - **幂等键由业务字段承担，而不是 `request_id`**。`CreateRoom` 以 `match_id` 为幂等键、
   对局结果以 `match_id` 为主键；`request_id` 只用于跨服务日志关联。理由是幂等必须
   在**重试方无法保证携带同一个 request_id** 时仍然成立——Match 超时后重试，
@@ -305,7 +320,7 @@ data: {"version":1,"type":"room.state","sequence":12,"timestamp_ms":0,"payload":
 | `p1_hp` / `p2_hp` | `INT` | 双方血量 |
 | `p1_joined` / `p2_joined` | `TINYINT` | 该玩家是否已进入房间 |
 | `winner_id` | `VARCHAR(64)` | 胜者，平局或未结束为 NULL |
-| `finish_reason` | `VARCHAR(16)` | `none` / `hp_zero` / `timeout` / `aborted` |
+| `finish_reason` | `VARCHAR(16)` | `none` / `hp_zero` / `timeout` / `aborted` / `disconnect` |
 | `started_at_ms` / `finished_at_ms` | `BIGINT` | 开局与结束时间（毫秒） |
 | `snapshot_at_ms` | `BIGINT` | 本行写入时刻（毫秒），用于"新快照覆盖旧快照" |
 

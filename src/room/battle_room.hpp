@@ -56,6 +56,17 @@ enum class SubmitOutcome {
     kInvalidArgument,
 };
 
+/// 上报玩家连接状态的结果（TASK-016）。
+enum class PresenceOutcome {
+    kOk,
+    /// 该玩家不是这一局的成员。
+    kNotAMember,
+    /// 对局已结束，连接状态不再影响它。
+    kAlreadyFinished,
+    /// 玩家标识不合法。
+    kInvalidArgument,
+};
+
 /// 单个房间。
 class BattleRoom {
 public:
@@ -112,6 +123,23 @@ public:
     /// @brief 提交输入。仅 PLAYING 阶段接受。
     SubmitOutcome SubmitInput(const std::string& player_id, InputKind kind);
 
+    /// @brief 上报某个玩家的推送连接状态（TASK-016）。**幂等**：重复上报同一状态无副作用。
+    ///
+    /// 为什么由 Gateway 上报而不是 Room 自己判断：SSE 是长连接，客户端断开时服务端
+    /// 收不到显式通知，只能靠写失败感知（见 StreamHub）；那是 Gateway 才知道的事实。
+    /// 而"这一局怎么办"是房间的权威状态，属于 Room。两者通过本方法的 RPC 对接。
+    ///
+    /// 行为：
+    ///   * `online == false` → 记录断线时刻，进入宽限期（对局暂停推进）。
+    ///   * `online == true` → 清除断线时刻，若无人断线则对局继续推进（血量与帧号不变，
+    ///     所以"回来接着打"是精确的）。
+    ///   * 对局已结束（FINISHING/FINISHED/ABORTED）→ 不再接受上报，返回 kAlreadyFinished。
+    ///     理由：结束后的连接状态不会改变任何结果，让它"成功"会掩盖调用方的时序错误。
+    PresenceOutcome SetPresence(const std::string& player_id, bool online, std::int64_t now_ms);
+
+    /// @brief 是否有玩家处于宽限期。此时 Tick 不推进帧。
+    [[nodiscard]] bool IsWaitingForReconnect() const noexcept;
+
     /// @brief 按当前时间推进对局。
     ///
     /// @return true 表示状态发生了变化（帧号前进或进入结束流程）。
@@ -159,6 +187,30 @@ private:
     /// 结束对局。调用方必须已确认对局处于 PLAYING。
     void Finish(FinishReason reason, std::string winner_id, std::int64_t now_ms);
 
+    /// 作废对局（不产生胜负、不写结果）。调用方必须已确认对局尚未结束。
+    void Abort(std::int64_t now_ms);
+
+    /// @brief 宽限期结算：有人断线且已到期时结束或作废对局（TASK-016）。
+    ///
+    /// 规则（项目所有者确认）：
+    ///   * 只有一方断线且已到期 → 断线方判负（FinishReason::kDisconnect）。
+    ///   * 双方都断线且**最后一位**断线者也已到期 → 作废（不判定胜负，不写结果）。
+    ///     为什么等最后一位而不是第一位：Gateway 重启会让所有订阅同时断开，
+    ///     若按第一位到期就作废，任何一次 Gateway 重启都会立刻毁掉所有进行中的对局。
+    ///
+    /// @return true 表示对局已经因此结束/作废；false 表示仍在宽限期内（对局应暂停推进）。
+    [[nodiscard]] bool ResolveReconnectGrace(std::int64_t now_ms);
+
+    /// 每个玩家的连接运行态。与 players_ 下标对齐。
+    ///
+    /// 为什么不把这些字段直接放进 PlayerSnapshot：快照是对外契约（proto 一一对应），
+    /// 而"断线时刻"纯属内部调度状态，泄漏进快照只会让调用方以为它有意义。
+    struct PlayerRuntime {
+        bool online = true;
+        /// 断线时刻（毫秒）；在线时为 0。
+        std::int64_t offline_since_ms = 0;
+    };
+
     /// 推进一帧：结算本帧输入并检查胜负。
     void AdvanceOneFrame(std::int64_t now_ms);
 
@@ -173,6 +225,9 @@ private:
 
     std::int64_t frame_ = 0;
     std::vector<PlayerSnapshot> players_;
+
+    /// 与 players_ 下标对齐的连接运行态（TASK-016）。
+    std::vector<PlayerRuntime> runtime_;
 
     /// 每个玩家本帧是否有待结算的攻击。下标与 players_ 对齐。
     std::vector<bool> pending_attack_;

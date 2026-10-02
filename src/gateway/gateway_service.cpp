@@ -467,6 +467,9 @@ void GatewayServiceImpl::FillRoomState(const RoomSnapshot& snapshot,
         item->set_player_id(player.player_id);
         item->set_hp(player.hp);
         item->set_connected(player.connected);
+        // TASK-016：轮询兜底接口同样要暴露 online，否则自动重连的前端在
+        // 推送断开、退回轮询的这段时间里看不到"对方是否还在"。
+        item->set_online(player.online);
     }
 }
 

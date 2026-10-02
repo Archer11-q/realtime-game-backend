@@ -117,6 +117,15 @@ public:
                                                            InputKind kind,
                                                            RoomSnapshot* out_snapshot);
 
+    /// @brief 上报某个玩家的推送连接状态（TASK-016）。
+    ///
+    /// 与 Join/SubmitInput 同构：返回 nullopt 表示房间不存在；否则返回房间层的判定结果。
+    /// 存在原因见 battle_room.hpp 的 SetPresence：只有 Gateway 知道连接是否还在。
+    [[nodiscard]] std::optional<PresenceOutcome> SetPresence(const std::string& room_id,
+                                                             const std::string& player_id,
+                                                             bool online, std::int64_t now_ms,
+                                                             RoomSnapshot* out_snapshot);
+
     /// @brief 查询房间状态。
     /// @return false 表示房间不存在。
     [[nodiscard]] bool GetState(const std::string& room_id, std::int64_t now_ms,

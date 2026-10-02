@@ -27,6 +27,7 @@ using rgbt::room::kMaxFrames;
 using rgbt::room::kMaxSnapshotHistory;
 using rgbt::room::kWaitingTimeoutMs;
 using rgbt::room::PlayerSnapshot;
+using rgbt::room::PresenceOutcome;
 using rgbt::room::RoomPhase;
 using rgbt::room::RoomSnapshot;
 using rgbt::room::SubmitOutcome;
@@ -373,6 +374,140 @@ TEST(BattleRoomTest, TickClampsCatchUpFrames) {
 
     // 基准时间已经前移，因此紧接着再 Tick 不会继续补上剩余的帧。
     EXPECT_FALSE(room.Tick(kT0 + 100 * kFrameIntervalMs));
+}
+
+// ---------------------------------------------------------------------------
+// 断线重连与宽限期（TASK-016）
+//
+// 这一组覆盖的是"谁在线"如何影响对局：暂停、恢复、到期判负、双方都断线作废。
+// 时间全部由用例注入，因此 30 秒的宽限期不需要真的等 30 秒。
+// ---------------------------------------------------------------------------
+
+using rgbt::room::kReconnectGraceMs;
+
+TEST(BattleRoomTest, SetPresenceMarksPlayerOffline) {
+    BattleRoom room = PlayingRoom();
+
+    EXPECT_EQ(room.SetPresence("p-0001", false, kT0), PresenceOutcome::kOk);
+
+    const RoomSnapshot snapshot = room.Snapshot();
+    ASSERT_EQ(snapshot.players.size(), 2U);
+    EXPECT_FALSE(snapshot.players[0].online);
+    EXPECT_TRUE(snapshot.players[1].online);
+    // 断线者仍然**在房间里**：connected 与 online 是两件事。
+    EXPECT_TRUE(snapshot.players[0].connected);
+    EXPECT_TRUE(room.IsWaitingForReconnect());
+}
+
+TEST(BattleRoomTest, PresenceRejectsStrangerAndFinishedRoom) {
+    BattleRoom room = PlayingRoom();
+    EXPECT_EQ(room.SetPresence("p-9999", false, kT0), PresenceOutcome::kNotAMember);
+    EXPECT_EQ(room.SetPresence("", false, kT0), PresenceOutcome::kInvalidArgument);
+
+    // 打完之后连接状态不再影响任何结果：明确报 ALREADY_FINISHED，
+    // 而不是"成功"——后者会掩盖调用方的时序错误。
+    RunToTimeout(&room);
+    ASSERT_EQ(room.phase(), RoomPhase::kFinishing);
+    EXPECT_EQ(room.SetPresence("p-0001", false, kT0 + 1000), PresenceOutcome::kAlreadyFinished);
+}
+
+TEST(BattleRoomTest, DisconnectPausesTheMatch) {
+    BattleRoom room = PlayingRoom();
+    const std::int64_t offline_at = kT0 + 5 * kFrameIntervalMs;
+    AdvanceTo(&room, kT0, offline_at);
+    const std::int64_t frame_before = room.Snapshot().frame;
+    ASSERT_GT(frame_before, 0);
+
+    ASSERT_EQ(room.SetPresence("p-0001", false, offline_at), PresenceOutcome::kOk);
+    // 整个宽限期内帧号都不前进——这是"暂停推进"而不是"继续推进"。
+    AdvanceTo(&room, offline_at, offline_at + 10 * kFrameIntervalMs);
+    EXPECT_EQ(room.Snapshot().frame, frame_before);
+}
+
+TEST(BattleRoomTest, ReconnectResumesWithoutLosingProgress) {
+    BattleRoom room = PlayingRoom();
+    const std::int64_t offline_at = kT0 + 5 * kFrameIntervalMs;
+    AdvanceTo(&room, kT0, offline_at);
+    const RoomSnapshot before = room.Snapshot();
+
+    ASSERT_EQ(room.SetPresence("p-0001", false, offline_at), PresenceOutcome::kOk);
+    AdvanceTo(&room, offline_at, offline_at + 10 * kFrameIntervalMs);
+
+    // 宽限期内回来：帧号与血量都还是断线那一刻的值，因此"接着打"是精确的。
+    ASSERT_EQ(room.SetPresence("p-0001", true, offline_at + 10 * kFrameIntervalMs),
+              PresenceOutcome::kOk);
+    const RoomSnapshot after = room.Snapshot();
+    EXPECT_EQ(after.frame, before.frame);
+    EXPECT_EQ(after.players[0].hp, before.players[0].hp);
+    EXPECT_EQ(after.players[1].hp, before.players[1].hp);
+    EXPECT_TRUE(after.players[0].online);
+    EXPECT_FALSE(room.IsWaitingForReconnect());
+
+    // 恢复后继续推进。
+    room.Tick(offline_at + 11 * kFrameIntervalMs);
+    EXPECT_GT(room.Snapshot().frame, before.frame);
+}
+
+TEST(BattleRoomTest, GraceExpiryMakesTheDisconnectedPlayerLose) {
+    BattleRoom room = PlayingRoom();
+    ASSERT_EQ(room.SetPresence("p-0002", false, kT0), PresenceOutcome::kOk);
+
+    // 宽限期未到：不结束。
+    room.Tick(kT0 + kReconnectGraceMs - kFrameIntervalMs);
+    EXPECT_EQ(room.phase(), RoomPhase::kPlaying);
+
+    // 宽限期到：判断线方负，且**产生胜负**（走 FINISHING 以落库）。
+    room.Tick(kT0 + kReconnectGraceMs);
+    EXPECT_EQ(room.phase(), RoomPhase::kFinishing);
+    const RoomSnapshot snapshot = room.Snapshot();
+    EXPECT_EQ(snapshot.finish_reason, FinishReason::kDisconnect);
+    EXPECT_EQ(snapshot.winner_id, "p-0001");
+    ASSERT_TRUE(room.Result().has_value());
+    EXPECT_EQ(room.Result()->winner_id, "p-0001");
+}
+
+TEST(BattleRoomTest, BothOfflineExpiryAbortsWithoutDecidingAWinner) {
+    BattleRoom room = PlayingRoom();
+    ASSERT_EQ(room.SetPresence("p-0001", false, kT0), PresenceOutcome::kOk);
+    ASSERT_EQ(room.SetPresence("p-0002", false, kT0), PresenceOutcome::kOk);
+
+    room.Tick(kT0 + kReconnectGraceMs);
+    EXPECT_EQ(room.phase(), RoomPhase::kAborted);
+    EXPECT_EQ(room.Snapshot().finish_reason, FinishReason::kAborted);
+    EXPECT_TRUE(room.Snapshot().winner_id.empty());
+    // 作废的对局不产生结果，也就不会写进 match_results。
+    EXPECT_FALSE(room.Result().has_value());
+}
+
+TEST(BattleRoomTest, BothOfflineWaitsForTheLastOneToExpire) {
+    // 这条锁定的是"Gateway 重启"场景：所有订阅会同时断开，若按第一位到期就作废，
+    // 任何一次 Gateway 重启都会立刻毁掉所有进行中的对局。因此要等最后一位也到期。
+    BattleRoom room = PlayingRoom();
+    const std::int64_t first_offline = kT0;
+    const std::int64_t second_offline = kT0 + 20'000;
+    ASSERT_EQ(room.SetPresence("p-0001", false, first_offline), PresenceOutcome::kOk);
+    ASSERT_EQ(room.SetPresence("p-0002", false, second_offline), PresenceOutcome::kOk);
+
+    // 第一位已到期，但第二位还在自己的宽限期内：不作废，继续等。
+    room.Tick(first_offline + kReconnectGraceMs);
+    EXPECT_EQ(room.phase(), RoomPhase::kPlaying);
+
+    // 最后一位也到期：作废。
+    room.Tick(second_offline + kReconnectGraceMs);
+    EXPECT_EQ(room.phase(), RoomPhase::kAborted);
+}
+
+TEST(BattleRoomTest, RepeatedOfflineReportDoesNotResetTheGraceClock) {
+    // 幂等：重复上报同一状态不能把宽限期无限推后（否则玩家可以靠刷请求赖着不走）。
+    BattleRoom room = PlayingRoom();
+    ASSERT_EQ(room.SetPresence("p-0001", false, kT0), PresenceOutcome::kOk);
+    for (std::int64_t t = kT0 + 1000; t < kT0 + kReconnectGraceMs; t += 1000) {
+        ASSERT_EQ(room.SetPresence("p-0001", false, t), PresenceOutcome::kOk);
+    }
+
+    room.Tick(kT0 + kReconnectGraceMs);
+    EXPECT_EQ(room.phase(), RoomPhase::kFinishing);
+    EXPECT_EQ(room.Snapshot().finish_reason, FinishReason::kDisconnect);
 }
 
 }  // namespace

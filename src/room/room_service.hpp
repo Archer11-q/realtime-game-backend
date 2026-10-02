@@ -49,6 +49,11 @@ public:
                         rgbt::room::v1::GetMatchResultResponse* response,
                         google::protobuf::Closure* done) override;
 
+    void SetPlayerPresence(google::protobuf::RpcController* controller,
+                           const rgbt::room::v1::SetPlayerPresenceRequest* request,
+                           rgbt::room::v1::SetPlayerPresenceResponse* response,
+                           google::protobuf::Closure* done) override;
+
 private:
     [[nodiscard]] std::int64_t NowMs() const;
 
