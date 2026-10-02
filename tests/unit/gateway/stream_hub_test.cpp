@@ -87,10 +87,28 @@ public:
     RoomCallStatus GetResult(const std::string&, rgbt::gateway::MatchResultView*) override {
         return RoomCallStatus::kNotFound;
     }
+    /// TASK-016：记录每次连接状态上报，供用例断言
+    /// 「订阅建立 → 上报 online；订阅移除 → 上报 offline」。
+    RoomCallStatus SetPresence(const std::string& room_id, const std::string& player_id,
+                               bool online, RoomSnapshot*) override {
+        presence_calls.push_back(PresenceCall{room_id, player_id, online});
+        if (fail_set_presence) {
+            return RoomCallStatus::kUnavailable;
+        }
+        return RoomCallStatus::kOk;
+    }
     [[nodiscard]] bool IsHealthy() override { return true; }
+
+    struct PresenceCall {
+        std::string room_id;
+        std::string player_id;
+        bool online = false;
+    };
 
     std::unordered_map<std::string, RoomSnapshot> rooms;
     int get_state_calls = 0;
+    std::vector<PresenceCall> presence_calls;
+    bool fail_set_presence = false;
 };
 
 RoomSnapshot PlayingRoom(const std::string& room_id, std::int64_t frame) {
@@ -128,6 +146,96 @@ bool Contains(const std::shared_ptr<SinkLog>& log, const std::string& needle) {
         }
     }
     return false;
+}
+
+TEST(StreamHubTest, SubscribeReportsPlayerOnline) {
+    // TASK-016：订阅建立 = 这个玩家的推送连接通了，必须如实上报给 Room。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 1);
+    StreamHub hub(&room);
+
+    const Subscribed sub = Subscribe(&hub, "p-0001", "r-1");
+    ASSERT_GT(sub.id, 0U);
+
+    ASSERT_EQ(room.presence_calls.size(), 1U);
+    EXPECT_EQ(room.presence_calls[0].room_id, "r-1");
+    EXPECT_EQ(room.presence_calls[0].player_id, "p-0001");
+    EXPECT_TRUE(room.presence_calls[0].online);
+}
+
+TEST(StreamHubTest, UnsubscribeReportsPlayerOfflineExactlyOnce) {
+    // 连接结束要上报"断线"，让 Room 开始宽限计时；重复取消不应重复上报。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 1);
+    StreamHub hub(&room);
+
+    const Subscribed sub = Subscribe(&hub, "p-0001", "r-1");
+    ASSERT_EQ(room.presence_calls.size(), 1U);
+
+    hub.Unsubscribe(sub.id);
+    ASSERT_EQ(room.presence_calls.size(), 2U);
+    EXPECT_FALSE(room.presence_calls[1].online);
+    EXPECT_EQ(room.presence_calls[1].player_id, "p-0001");
+
+    hub.Unsubscribe(sub.id);  // 幂等
+    EXPECT_EQ(room.presence_calls.size(), 2U);
+}
+
+TEST(StreamHubTest, WriteFailureReportsPlayerOffline) {
+    // 客户端断开时服务端收不到显式通知，只能靠写失败感知——这条路径也必须上报。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 1);
+    StreamHub hub(&room);
+
+    const Subscribed sub = Subscribe(&hub, "p-0001", "r-1");
+    sub.sink->fail = true;
+
+    hub.Tick(kT0);
+    hub.Tick(kT0 + 100);
+    EXPECT_EQ(hub.ConnectionCount(), 0U);
+
+    ASSERT_GE(room.presence_calls.size(), 2U);
+    EXPECT_FALSE(room.presence_calls.back().online);
+    EXPECT_EQ(room.presence_calls.back().player_id, "p-0001");
+}
+
+TEST(StreamHubTest, CloseAllReportsOfflineForEveryPlayer) {
+    // 优雅退出时所有连接事实上都断了，必须逐个如实上报，否则这些对局
+    // 在 Room 侧永远不会进入宽限期。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 1);
+    room.rooms["r-2"] = PlayingRoom("r-2", 1);
+    StreamHub hub(&room);
+
+    Subscribe(&hub, "p-0001", "r-1");
+    Subscribe(&hub, "p-0002", "r-2");
+    ASSERT_EQ(room.presence_calls.size(), 2U);
+
+    hub.CloseAll();
+    ASSERT_EQ(room.presence_calls.size(), 4U);
+    EXPECT_FALSE(room.presence_calls[2].online);
+    EXPECT_FALSE(room.presence_calls[3].online);
+}
+
+TEST(StreamHubTest, OfflineStateChangeIsPushedEvenWhenFrameIsUnchanged) {
+    // TASK-016 的关键一条：宽限期内对局**暂停推进**，帧号不变，但"对方断线了"
+    // 恰恰是这一刻最该让客户端知道的事。若推送判据只看帧号，客户端在整个
+    // 宽限期里收不到任何事件——所以判据必须是完整的状态签名。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 1);
+    StreamHub hub(&room);
+
+    const Subscribed sub = Subscribe(&hub, "p-0001", "r-1");
+    hub.Tick(kT0);
+    ASSERT_TRUE(Contains(sub.log, "room.state"));
+    const std::size_t writes_after_first = sub.log->writes.size();
+
+    // 帧号不变，只有 online 变成 false。
+    room.rooms["r-1"].players[1].online = false;
+    hub.Tick(kT0 + 100);
+
+    EXPECT_GT(sub.log->writes.size(), writes_after_first);
+    EXPECT_NE(sub.log->writes.back().find("\"online\":false"), std::string::npos);
 }
 
 }  // namespace

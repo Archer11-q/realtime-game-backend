@@ -2053,6 +2053,110 @@ Match 启动时会恢复 `dev:match:queue`，而验收脚本此前只清理 `dev
   TASK-014 与 TASK-015 各自一个提交，按顺序合并回 `main`
   （`git merge --no-ff feat/phase-2`），**不 squash 整条分支**。
 
+## TASK-016 实施记录（2026-10-02）
+
+### 背景
+
+TASK-008 起 `connected` 字段只表示"是否已加入房间"，**网络断开根本不被感知**：
+对局中刷新页面或断网，玩家永久缺席，而对局仍会推进到他输。本任务把「断线」变成
+可观测、可恢复、有期限的状态。
+
+项目所有者确认了四个决定：宽限期 **30 秒**；期内**暂停推进**；到期时
+**只有一方断线则判断线方负**（新增 `finish_reason = disconnect`，产生胜负并落库）、
+**双方都断线则作废**；双方断线时等**最后一位**到期。
+
+### 完成
+
+- `api/proto/room.proto`：`SetPlayerPresence` RPC、`PlayerState.online`、
+  `FINISH_REASON_DISCONNECT`。
+- `api/proto/gateway.proto`：`RoomPlayerInfo.online`（轮询兜底接口也要能看到）。
+- `src/room/room_types.hpp`：`kReconnectGraceMs = 30s`、`FinishReason::kDisconnect`、
+  `PlayerSnapshot.online`。
+- `src/room/battle_room.{hpp,cpp}`：`SetPresence` / `IsWaitingForReconnect` /
+  `ResolveReconnectGrace` / `Abort`；`Tick` 在有人断线时冻结推进。
+- `src/room/room_manager.*`、`room_service.*`：新 RPC 的通路与错误码映射。
+- `src/gateway/room_client.hpp`、`brpc_room_client.*`：`SetPresence` 接口与实现，
+  以及 proto→内部结构的映射（`online`、`disconnect`）。
+- `src/gateway/stream_hub.*`：订阅建立/移除/`CloseAll`/写失败四条路径都上报 presence；
+  推送判据从"帧号"改为**状态签名**；推送 JSON 带上 `online`。
+- `web/`：`connectRoomPush` 重连状态机（退避 1/2/4/5/5 秒、最多 5 次、累计 17 秒，
+  留在 30 秒宽限期内）、4 种连接状态的界面提示与「重试连接」按钮。
+- `scripts/verify-reconnect.sh`（新增）：真实验收。
+- 测试：Room 宽限期状态机 8 个用例、StreamHub presence 上报 5 个用例、
+  前端重连状态机 17 个用例。
+
+### 决策
+
+- **`online` 与 `connected` 必须是两个字段**。`connected` = "在房间里"，
+  已被 `rooms.pN_joined` 与快照校验（"PLAYING 的房间必须双方都已加入"）依赖；
+  改它的语义会破坏 TASK-014 的恢复逻辑。断线的玩家仍然在房间里。
+- **presence 与宽限计时不落库**（`rooms` 表不加列）。Room 重启后把双方当作在线、
+  计时清零，客户端重连后会重新上报。代价是"Room 重启期间到期的对局不会被判负"，
+  记入 `docs/01-architecture.md` 的已知限制。**选择不加列**的理由是本任务的最小改动
+  原则：加列就要改迁移、快照读写与校验，而收益只是恢复一个"重启前就已断线"的计时。
+- **双方都断线时等最后一位到期**。Gateway 重启会让所有订阅同时断开；若按第一位
+  到期就作废，任何一次 Gateway 重启都会立刻毁掉所有进行中的对局。
+  由单测 `BothOfflineWaitsForTheLastOneToExpire` 锁定。
+- **推送判据改为状态签名**（帧号 + 血量 + online + 阶段）。宽限期内帧号不动，
+  只比帧号会让客户端在整个宽限期里**收不到任何事件**——而"对方断线了"恰恰是
+  那一刻最该知道的事。
+- **上报失败不重试**。`online` 是尽力而为的事实同步：下一次连接状态变化会覆盖它，
+  为它做重试/补偿只会换来一套需要自己维护的状态机。
+
+### 验证（WSL，16 核 / 11 GiB）
+
+- `cmake --build --preset brpc-debug`：0 error / 0 warning。
+- `ctest --test-dir build/brpc-debug`：**216/216 通过**（203 + 新增 13）。
+- `bash scripts/check-format.sh`：通过（74 个文件）。
+- `bash scripts/verify-reconnect.sh`：**退出码 0**。实测覆盖：
+  SSE 订阅建立（`session.ready`）→ 杀掉流 → `players[0].online` 不再是 true →
+  **帧号冻结**（23 → 23，3 秒内不动）→ 期内重连 → `online` 恢复 true、
+  血量与断线时一致 → 继续推进（36 → 56）；
+  第二次断开后真的等满 30 秒 → `state=finished`、`finish_reason=disconnect`、
+  `winner_id=p-0002`、**结果已写入 `match_results`**；
+  第三局双方都断线 → `state=aborted` 且 **`match_results` 里没有这一局**。
+- `bash scripts/verify-web.sh`：**退出码 0（43 项通过）**；前端 `vitest` 29 通过
+  （原 12 + 新增 17）、`vue-tsc --noEmit` 与 `vite build` 均通过。
+
+### 问题与修正（本轮实际踩到的）
+
+- **客户端断网这条路径原本漏上报**。`StreamHub` 清理写失败的订阅时是**直接 erase**，
+  不经过 `Unsubscribe`，因此"客户端断网"——最常见的断线方式——从来不会上报 offline，
+  Room 也就永远不会进入宽限期。是新写的单测
+  `WriteFailureReportsPlayerOffline` 逼出来的：它第一次就失败了。
+  修法是在锁外统一收集并上报（持锁不做 I/O）。
+- **Gateway 的映射漏了两个新值**。`ToFinishReasonString` 没有 `FINISH_REASON_DISCONNECT`
+  分支，会 fallthrough 返回 `"none"`；`ToSnapshot` 也没转 `online`。
+  结果是"断线判负"在界面上显示成"没有结束原因"。**是验收脚本抓到的，不是单测**——
+  因为单测只覆盖到 Room 内部，跨服务的字段映射只有端到端才会暴露。
+- **proto3 的 JSON 会省略等于默认值的字段**，因此 `online=false` 时该字段
+  根本不出现在响应里。验收脚本第一版按 `online == false` 断言，读到的永远是空串。
+  判据改为"不是 true"，并**在同一段里保留一条反向检查**（重连后必须出现
+  `online=true`），否则这条断言会退化成"永远成立"。
+- **前端退避下标错位**（由前端子代理发现并修复）：初版在等待**之后**自增 `attempt`，
+  而等待内部又读 `attempt` 取退避值，实际退避变成 2/4/5/5/5 秒，累计 31 秒
+  ——**会吃掉整个 30 秒宽限期**。改为先取值再自增。
+
+### 未做 / 遗留
+
+- **前端没有做真实断线的端到端**：只验证到状态机与构建。真实断线由
+  `scripts/verify-reconnect.sh` 在后端侧验证（用 curl 起真实 SSE 再杀掉它），
+  浏览器的"拔网线"路径没有自动化验证。
+- **`useGameSession` 的接线没有单测覆盖**：项目没有组件测试环境
+  （无 `@vue/test-utils` / jsdom），加环境属于引入新依赖，本轮不引入。
+- **不可重试的 HTTP 错误仍会耗完重试预算**（例如 `invalid_token` /
+  `not_a_member` / `room_already_finished`）：现在会白重试约 17 秒才放弃。
+  该由前端错误分类处理，记入 Backlog。
+- **`Last-Event-ID` 补帧属 TASK-017**：本轮重连后直接拿最新快照；
+  在"宽限期内暂停推进"的前提下不会丢帧，但这一点**没有独立验证**。
+
+### 下一步
+
+- 由项目所有者审阅 Diff 并运行 `bash scripts/verify-reconnect.sh`
+  与 `bash scripts/verify-all.sh`。
+- 按第 9 节的分支粒度，本任务是 `feat/phase-2` 上的**单个提交**；
+  合并回 `main` 用 `git merge --no-ff`，**不 squash**。
+
 ## 分支粒度纠正记录（2026-10-02）
 
 **问题**：本轮我按 Phase 1 的「一任务一分支」建了

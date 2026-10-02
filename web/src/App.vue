@@ -5,6 +5,7 @@ import BattleView from './views/BattleView.vue'
 import LobbyView from './views/LobbyView.vue'
 import LoginView from './views/LoginView.vue'
 import ResultView from './views/ResultView.vue'
+import { kMaxReconnectAttempts } from './api/stream'
 import { useGameSession } from './composables/useGameSession'
 
 const session = useGameSession()
@@ -35,6 +36,45 @@ const playerLabel = computed(() => {
   // 因此只可能用 display_name 兜底到 player_id。
   return `${profile.display_name ?? '玩家'}（${profile.player_id ?? '?'}）`
 })
+
+/**
+ * 顶栏的推送状态文案。
+ *
+ * 三种情况必须分开写，不能都叫「推送已断开」：
+ * 「重连中（第 2/5 次）」玩家什么都不用做，而「已断开放弃」意味着
+ * 30 秒宽限期已经用完、这一局按判负处理——玩家必须知道，也有重试按钮。
+ */
+const pushLabel = computed(() => {
+  switch (session.streamStatus.value) {
+    case 'connected':
+      return '推送已连接'
+    case 'connecting':
+      return '推送连接中…'
+    case 'reconnecting':
+      return `推送重连中（第 ${session.streamAttempt.value}/${kMaxReconnectAttempts} 次）`
+    case 'exhausted':
+      return '推送已断开放弃'
+    case 'stopped':
+    default:
+      return '推送已断开'
+  }
+})
+
+/** 顶栏徽标的配色档位：live（正常） / warn（还会自己好） / down（不会了）。 */
+const pushTone = computed(() => {
+  switch (session.streamStatus.value) {
+    case 'connected':
+      return 'live'
+    case 'connecting':
+    case 'reconnecting':
+      return 'warn'
+    case 'exhausted':
+      return 'down'
+    case 'stopped':
+    default:
+      return 'down'
+  }
+})
 </script>
 
 <template>
@@ -45,13 +85,15 @@ const playerLabel = computed(() => {
     </div>
     <div class="row">
       <span v-if="playerLabel !== ''" class="badge">{{ playerLabel }}</span>
-      <span
-        v-if="session.stage.value === 'battle'"
-        class="badge"
-        :class="session.streamConnected.value ? 'live' : 'down'"
-      >
-        {{ session.streamConnected.value ? '推送已连接' : '推送已断开' }}
+      <span v-if="session.stage.value === 'battle'" class="badge" :class="pushTone">
+        {{ pushLabel }}
       </span>
+      <button
+        v-if="session.stage.value === 'battle' && session.streamStatus.value === 'exhausted'"
+        @click="session.retryStream()"
+      >
+        重试连接
+      </button>
       <button v-if="session.stage.value !== 'login'" @click="session.signOut()">退出登录</button>
     </div>
   </header>

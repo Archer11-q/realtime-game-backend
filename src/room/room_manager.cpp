@@ -219,6 +219,24 @@ std::optional<SubmitOutcome> RoomManager::SubmitInput(const std::string& room_id
     return outcome;
 }
 
+std::optional<PresenceOutcome> RoomManager::SetPresence(const std::string& room_id,
+                                                        const std::string& player_id, bool online,
+                                                        std::int64_t now_ms,
+                                                        RoomSnapshot* out_snapshot) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+
+    const auto it = rooms_.find(room_id);
+    if (it == rooms_.end()) {
+        return std::nullopt;
+    }
+
+    const PresenceOutcome outcome = it->second->SetPresence(player_id, online, now_ms);
+    if (out_snapshot != nullptr) {
+        *out_snapshot = it->second->Snapshot();
+    }
+    return outcome;
+}
+
 bool RoomManager::GetState(const std::string& room_id, std::int64_t now_ms,
                            RoomSnapshot* out_snapshot) {
     const std::lock_guard<std::mutex> lock(mutex_);

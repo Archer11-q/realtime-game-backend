@@ -241,6 +241,14 @@ public:
         return next_status;
     }
 
+    /// TASK-016：本用例集不验证 presence 上报（那是 stream_hub_test 的职责），
+    /// 因此这里只做最小实现，但**必须实现**——抽象接口不会给默认行为，
+    /// 这正是"新增 RPC 会强迫所有调用方表态"的体现。
+    RoomCallStatus SetPresence(const std::string&, const std::string&, bool,
+                               RoomSnapshot*) override {
+        return RoomCallStatus::kOk;
+    }
+
     [[nodiscard]] bool IsHealthy() override { return true; }
 };
 

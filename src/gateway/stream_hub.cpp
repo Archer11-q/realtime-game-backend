@@ -129,6 +129,10 @@ std::string PlayersJson(const std::vector<RoomPlayerSnapshot>& players) {
         out += std::to_string(players[i].hp);
         out += ",\"connected\":";
         out += players[i].connected ? "true" : "false";
+        // TASK-016：online 必须出现在推送里。宽限期内帧号不动，客户端唯一能
+        // 知道"对方断线了/回来了"的途径就是它；前端据此显示"对方已断线，等待重连"。
+        out += ",\"online\":";
+        out += players[i].online ? "true" : "false";
         out += "}";
     }
     out += "]";
@@ -196,25 +200,53 @@ std::uint64_t StreamHub::Subscribe(std::string player_id, std::string room_id,
         return 0;
     }
 
-    const std::lock_guard<std::mutex> lock(mutex_);
-    const std::uint64_t id = next_id_++;
-    Subscription subscription;
-    subscription.id = id;
-    subscription.player_id = std::move(player_id);
-    subscription.room_id = std::move(room_id);
-    subscription.sink = std::shared_ptr<EventSink>(std::move(sink));
+    // 先各留一份副本：下面会把它们 move 进订阅记录，而上报必须在**锁外**做。
+    const std::string report_room_id = room_id;
+    const std::string report_player_id = player_id;
 
-    // 清掉这个房间的「已推送帧号」，让下一个 Tick 立刻把当前状态推给新订阅者。
-    // 代价是同房间的既有订阅者会多收一条重复的状态——相比之下，
-    // 「新订阅者要等到下一次帧变化才有画面」是更糟的体验。
-    last_pushed_frame_.erase(subscription.room_id);
+    std::uint64_t id = 0;
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        id = next_id_++;
+        Subscription subscription;
+        subscription.id = id;
+        subscription.player_id = std::move(player_id);
+        subscription.room_id = std::move(room_id);
+        subscription.sink = std::shared_ptr<EventSink>(std::move(sink));
 
-    subscriptions_.emplace(id, std::move(subscription));
+        // 清掉这个房间的「已推送状态」，让下一个 Tick 立刻把当前状态推给新订阅者。
+        // 代价是同房间的既有订阅者会多收一条重复的状态——相比之下，
+        // 「新订阅者要等到下一次状态变化才有画面」是更糟的体验。
+        last_pushed_state_.erase(subscription.room_id);
+
+        subscriptions_.emplace(id, std::move(subscription));
+    }
+
+    // TASK-016：把"这个玩家的推送连接建立了"如实上报给 Room。
+    // 在锁外做（本项目一贯规则：持锁不做 I/O）。
+    ReportPresence(report_room_id, report_player_id, true);
     return id;
+}
+
+void StreamHub::ReportPresence(const std::string& room_id, const std::string& player_id,
+                               bool online) {
+    if (room_ == nullptr) {
+        return;
+    }
+    const RoomCallStatus status = room_->SetPresence(room_id, player_id, online, nullptr);
+    if (status != RoomCallStatus::kOk && status != RoomCallStatus::kAlreadyFinished) {
+        // 不重试、不阻塞推送：Room 短暂不可用时，客户端的轮询兜底仍然可用；
+        // 下一次连接变化（或重连）会重新上报。
+        std::fprintf(stderr,
+                     "[gateway] 上报连接状态失败（不重试）：room_id=%s player_id=%s online=%d\n",
+                     room_id.c_str(), player_id.c_str(), online ? 1 : 0);
+    }
 }
 
 void StreamHub::Unsubscribe(std::uint64_t id) {
     std::shared_ptr<EventSink> sink;
+    std::string room_id;
+    std::string player_id;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         const auto it = subscriptions_.find(id);
@@ -222,8 +254,13 @@ void StreamHub::Unsubscribe(std::uint64_t id) {
             return;  // 幂等：已断开的连接可能被清理两次
         }
         sink = it->second.sink;
+        room_id = it->second.room_id;
+        player_id = it->second.player_id;
         subscriptions_.erase(it);
     }
+    // TASK-016：连接已经结束，上报"断线"让 Room 进入宽限期。
+    // 注意这也覆盖 Gateway 主动断开（优雅退出）的情况——那是事实。
+    ReportPresence(room_id, player_id, false);
     // 在锁外关闭：Close 可能触发写与刷出。
     if (sink != nullptr) {
         sink->Close();
@@ -281,32 +318,61 @@ void StreamHub::Tick(std::int64_t now_ms) {
     }
 
     // 阶段四：回锁内提交状态，并清理写失败的订阅。
-    const std::lock_guard<std::mutex> lock(mutex_);
-    for (const ReadyTarget& target : need_ready) {
-        const auto it = subscriptions_.find(target.id);
-        if (it != subscriptions_.end()) {
-            it->second.ready_sent = true;
-            it->second.last_heartbeat_ms = now_ms;
+    std::vector<std::pair<std::string, std::string>> gone;  // room_id, player_id
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        for (const ReadyTarget& target : need_ready) {
+            const auto it = subscriptions_.find(target.id);
+            if (it != subscriptions_.end()) {
+                it->second.ready_sent = true;
+                it->second.last_heartbeat_ms = now_ms;
+            }
         }
-    }
-    for (const SinkRef& target : need_heartbeat) {
-        const auto it = subscriptions_.find(target.id);
-        if (it != subscriptions_.end()) {
-            it->second.last_heartbeat_ms = now_ms;
+        for (const SinkRef& target : need_heartbeat) {
+            const auto it = subscriptions_.find(target.id);
+            if (it != subscriptions_.end()) {
+                it->second.last_heartbeat_ms = now_ms;
+            }
         }
-    }
-    for (const std::uint64_t id : failed) {
-        const auto it = subscriptions_.find(id);
-        if (it != subscriptions_.end()) {
-            // 连接已断：关闭出口并移除订阅。不依赖客户端发任何东西——
-            // SSE 下服务端不会收到显式的断开通知，只能靠写失败感知。
-            std::shared_ptr<EventSink> sink = it->second.sink;
-            subscriptions_.erase(it);
-            if (sink != nullptr) {
-                sink->Close();
+        for (const std::uint64_t id : failed) {
+            const auto it = subscriptions_.find(id);
+            if (it != subscriptions_.end()) {
+                // 连接已断：关闭出口并移除订阅。不依赖客户端发任何东西——
+                // SSE 下服务端不会收到显式的断开通知，只能靠写失败感知。
+                //
+                // TASK-016：这是**客户端断网**这一最常见路径，同样必须上报 offline
+                // （由 stream_hub_test 的 WriteFailureReportsPlayerOffline 锁定）。
+                // 上了锁，所以只把 id 收集起来，出锁后再做 I/O。
+                gone.emplace_back(it->second.room_id, it->second.player_id);
+                std::shared_ptr<EventSink> sink = it->second.sink;
+                subscriptions_.erase(it);
+                if (sink != nullptr) {
+                    sink->Close();
+                }
             }
         }
     }
+
+    // 出锁后再上报：断网的客户端必须让 Room 进入宽限期，否则这些对局在服务端
+    // 看起来一切正常，而玩家其实已经掉线了。
+    for (const auto& entry : gone) {
+        ReportPresence(entry.first, entry.second, false);
+    }
+}
+
+std::string StreamHub::StateSignature(const RoomSnapshot& snapshot) {
+    std::string signature = std::to_string(snapshot.frame);
+    signature.push_back('|');
+    signature += std::to_string(static_cast<int>(snapshot.state));
+    for (const RoomPlayerSnapshot& player : snapshot.players) {
+        signature.push_back('|');
+        signature += player.player_id;
+        signature.push_back(':');
+        signature += std::to_string(player.hp);
+        // online 必须进签名：宽限期内帧号不动，而变化恰恰只有它。
+        signature.push_back(player.online ? '1' : '0');
+    }
+    return signature;
 }
 
 void StreamHub::TickRoom(const std::string& room_id, const std::vector<SinkRef>& sinks,
@@ -334,16 +400,19 @@ void StreamHub::TickRoom(const std::string& room_id, const std::vector<SinkRef>&
     bool changed = false;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = last_pushed_frame_.find(room_id);
-        const std::int64_t previous = it == last_pushed_frame_.end() ? -1 : it->second;
-        // 帧号变化才推送，避免每 100 ms 刷一条完全相同的事件。
-        // 但「进入结束态」本身是必须送达的事件，即使帧号没变。
-        changed = snapshot.frame != previous || finished;
+        const std::string current = StateSignature(snapshot);
+        const auto it = last_pushed_state_.find(room_id);
+        const std::string previous = it == last_pushed_state_.end() ? std::string() : it->second;
+        // **状态没变才不推送**，而"状态"不只是帧号（TASK-016）：
+        // 宽限期内对局暂停推进、帧号不变，但"对方断线了"恰恰是这一刻最该让客户端
+        // 知道的事。只比帧号会让客户端在整个宽限期里收不到任何事件。
+        // 但「进入结束态」本身是必须送达的事件，即使状态签名没变。
+        changed = current != previous || finished;
         if (changed) {
             if (finished) {
-                last_pushed_frame_.erase(room_id);
+                last_pushed_state_.erase(room_id);
             } else {
-                last_pushed_frame_[room_id] = snapshot.frame;
+                last_pushed_state_[room_id] = current;
             }
         }
     }
@@ -397,10 +466,13 @@ void StreamHub::CloseAll() {
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         taken.swap(subscriptions_);
-        last_pushed_frame_.clear();
+        last_pushed_state_.clear();
     }
-    // 在锁外关闭：Close 会触发响应的收尾。
+    // 在锁外关闭：Close 会触发响应的收尾；上报同样在锁外（不开 I/O 时持锁）。
     for (auto& entry : taken) {
+        // TASK-016：进程要走了，这些连接事实上就是断了。如实上报，
+        // 让 Room 开始各自的宽限计时——客户端重连后会重新上报 online。
+        ReportPresence(entry.second.room_id, entry.second.player_id, false);
         if (entry.second.sink != nullptr) {
             entry.second.sink->Close();
         }

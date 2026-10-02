@@ -62,6 +62,14 @@ inline constexpr std::int64_t kFinishedRetentionMs = 5 * 60 * 1000;
 /// 快照环形缓冲保留的帧数，为 Phase 2 的断线重连预留。
 inline constexpr std::size_t kMaxSnapshotHistory = 128;
 
+/// TASK-016：断线后的宽限期（毫秒）。项目所有者确认取 30 秒。
+///
+/// 取值的理由：与"等待玩家加入"的超时（kWaitingTimeoutMs）同量级，
+/// 足以覆盖刷新页面、切网络、短暂断连；同时对手等待时间仍然可接受。
+/// 期内对局**暂停推进**（帧不前进），回来接上继续打；
+/// 到期未归则判断线方负（FinishReason::kDisconnect）。
+inline constexpr std::int64_t kReconnectGraceMs = 30 * 1000;
+
 /// 房间号与标识的长度上限。超长输入直接判为输入错误。
 inline constexpr std::size_t kMaxIdLength = 64;
 
@@ -91,6 +99,9 @@ enum class FinishReason {
     kHpZero,
     kTimeout,
     kAborted,
+    /// TASK-016：一方在宽限期内没有回来，判其负。**它产生胜负**，会写入 match_results。
+    /// 只有"双方都断线且都没回来"才走 kAborted（那一局没有任何一方值得判负）。
+    kDisconnect,
 };
 
 /// 玩家输入类型。TASK-008 只有攻击一种。
@@ -106,7 +117,12 @@ enum class InputKind {
 struct PlayerSnapshot {
     std::string player_id;
     std::int32_t hp = kInitialHp;
+
+    /// 是否在房间内（已加入且未离开）。**不是**"网络是否连通"，见 online。
     bool connected = true;
+
+    /// TASK-016：推送连接是否在线。断线后进入宽限期。
+    bool online = true;
 };
 
 /// 房间权威状态快照。
@@ -199,6 +215,8 @@ struct RoomSnapshotRecord {
             return "timeout";
         case FinishReason::kAborted:
             return "aborted";
+        case FinishReason::kDisconnect:
+            return "disconnect";
     }
     return "unknown";
 }

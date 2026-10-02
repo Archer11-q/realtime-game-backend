@@ -19,6 +19,9 @@ BattleRoom::BattleRoom(std::string room_id, std::string match_id,
         players_.push_back(std::move(snapshot));
     }
     pending_attack_.assign(players_.size(), false);
+    // TASK-016：新房间的玩家视为在线。真正的"是否连通"由 Gateway 通过
+    // SetPlayerPresence 上报——房间创建时还没有任何推送连接，但那不等于"断线"。
+    runtime_.assign(players_.size(), PlayerRuntime{});
     player_count_ = static_cast<std::int32_t>(players_.size());
     PushSnapshot();
 }
@@ -65,6 +68,12 @@ std::optional<BattleRoom> BattleRoom::RestoreFrom(const RoomSnapshotRecord& reco
         room.players_.push_back(std::move(snapshot));
     }
     room.pending_attack_.assign(kPlayersPerRoom, false);
+    // TASK-016：恢复出来的房间把双方都当作在线，宽限计时清零。
+    //
+    // 这是**有意的近似**：presence 不落库（rooms 表没有这一列，本任务不加列），
+    // 而 Room 重启时 Gateway 的订阅本来就全断了，客户端重连后会重新上报。
+    // 代价是"Room 重启会重置宽限期"，写进 docs/01-architecture.md 的已知限制。
+    room.runtime_.assign(kPlayersPerRoom, PlayerRuntime{});
 
     // 等待超时的基准用快照时刻近似。表里没有 created_at_ms，而本任务不新增列；
     // 代价是恢复后的等待超时最多晚一个快照间隔（有上界，见头文件说明）。
@@ -174,10 +183,7 @@ bool BattleRoom::Tick(std::int64_t now_ms) {
     if (phase_ == RoomPhase::kCreated || phase_ == RoomPhase::kWaiting) {
         // 匹配成功却始终没人加入：房间不能被永久占着，否则就是资源泄漏。
         if (now_ms - created_at_ms_ >= kWaitingTimeoutMs) {
-            phase_ = RoomPhase::kAborted;
-            finish_reason_ = FinishReason::kAborted;
-            finished_at_ms_ = now_ms;
-            PushSnapshot();
+            Abort(now_ms);
             return true;
         }
         return false;
@@ -186,6 +192,23 @@ bool BattleRoom::Tick(std::int64_t now_ms) {
     if (phase_ != RoomPhase::kPlaying) {
         return false;
     }
+
+    // TASK-016：有人断线时对局**暂停推进**（帧与血量都冻结），只结算宽限期。
+    // 先结算再决定是否返回：到期必须能触发结束，而"仍在宽限期内"就是不推进。
+    //
+    // 注意暂停只影响推进，不影响 `last_tick_ms_` 的基准长度：这里直接返回，
+    // 下一次恢复推进时 elapsed 会包含整个暂停时长，因此下面会按
+    // kMaxCatchUpFrames 截断——断线这段时间不会被一次性补成几十帧，
+    // 这正是"暂停"而不是"补帧"。
+    if (IsWaitingForReconnect()) {
+        if (ResolveReconnectGrace(now_ms)) {
+            return true;
+        }
+        // 冻结推进基准，否则恢复推进时会把暂停期当成"该补的帧"。
+        last_tick_ms_ = now_ms;
+        return false;
+    }
+
     if (now_ms < last_tick_ms_) {
         // 时钟回退。防御：不推进，也不倒退 last_tick_ms_。
         return false;
@@ -277,6 +300,94 @@ void BattleRoom::Finish(FinishReason reason, std::string winner_id, std::int64_t
     // 置 0 而不是 now_ms：让 RoomManager 在下一次 Tick 立刻尝试首次写入，
     // 而不是白等一个重试间隔。写入失败后由 MarkResultFailed 记录本次时间。
     last_persist_attempt_ms_ = 0;
+    PushSnapshot();
+}
+
+bool BattleRoom::IsWaitingForReconnect() const noexcept {
+    for (const PlayerRuntime& runtime : runtime_) {
+        if (!runtime.online) {
+            return true;
+        }
+    }
+    return false;
+}
+
+PresenceOutcome BattleRoom::SetPresence(const std::string& player_id, bool online,
+                                        std::int64_t now_ms) {
+    if (player_id.empty() || player_id.size() > kMaxIdLength) {
+        return PresenceOutcome::kInvalidArgument;
+    }
+    if (phase_ == RoomPhase::kFinishing || phase_ == RoomPhase::kFinished ||
+        phase_ == RoomPhase::kAborted) {
+        return PresenceOutcome::kAlreadyFinished;
+    }
+
+    const std::optional<std::size_t> index = IndexOf(player_id);
+    if (!index.has_value()) {
+        return PresenceOutcome::kNotAMember;
+    }
+
+    PlayerRuntime& runtime = runtime_[*index];
+    if (online) {
+        runtime.online = true;
+        runtime.offline_since_ms = 0;
+        // 回来后不做任何血量/帧号补偿：暂停期间两者都没有变化，
+        // 因此"接着打"是精确的，这正是选择"暂停推进"而不是"继续推进"的收益。
+        players_[*index].online = true;
+    } else if (runtime.online) {
+        runtime.online = false;
+        runtime.offline_since_ms = now_ms;
+        players_[*index].online = false;
+        PushSnapshot();  // 让订阅者立刻看到"对方断线了"
+    }
+    // 重复上报同一状态不做任何事（幂等）。
+    return PresenceOutcome::kOk;
+}
+
+bool BattleRoom::ResolveReconnectGrace(std::int64_t now_ms) {
+    if (phase_ != RoomPhase::kPlaying || runtime_.size() != players_.size()) {
+        return false;
+    }
+
+    std::size_t offline_count = 0;
+    std::size_t online_index = 0;
+    std::size_t online_count = 0;
+    // 最晚的断线时刻：只有它过期才说明"所有人都已经等够了"。
+    std::int64_t latest_offline_at = 0;
+    for (std::size_t i = 0; i < runtime_.size(); ++i) {
+        if (runtime_[i].online) {
+            ++online_count;
+            online_index = i;
+            continue;
+        }
+        ++offline_count;
+        latest_offline_at = std::max(latest_offline_at, runtime_[i].offline_since_ms);
+    }
+    if (offline_count == 0) {
+        return false;
+    }
+
+    // 用"最晚断线者"判断是否全体到期：有人还在自己的宽限期内就继续等。
+    if (now_ms - latest_offline_at < kReconnectGraceMs) {
+        return false;
+    }
+
+    if (online_count > 0) {
+        // 还有人在线：判断线方负。两人房间里 online_count == 1，胜者就是那一位。
+        Finish(FinishReason::kDisconnect, players_[online_index].player_id, now_ms);
+        return true;
+    }
+
+    // 双方都没回来：这一局没有任何一方值得判负，作废且不写结果。
+    Abort(now_ms);
+    return true;
+}
+
+void BattleRoom::Abort(std::int64_t now_ms) {
+    phase_ = RoomPhase::kAborted;
+    finish_reason_ = FinishReason::kAborted;
+    winner_id_.clear();
+    finished_at_ms_ = now_ms;
     PushSnapshot();
 }
 

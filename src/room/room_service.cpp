@@ -57,6 +57,8 @@ rgbt::room::v1::FinishReason ToProtoFinishReason(FinishReason reason) {
             return rgbt::room::v1::FINISH_REASON_TIMEOUT;
         case FinishReason::kAborted:
             return rgbt::room::v1::FINISH_REASON_ABORTED;
+        case FinishReason::kDisconnect:
+            return rgbt::room::v1::FINISH_REASON_DISCONNECT;
         case FinishReason::kNone:
         default:
             return rgbt::room::v1::FINISH_REASON_UNSPECIFIED;
@@ -79,6 +81,7 @@ void FillSnapshot(const RoomSnapshot& source, rgbt::room::v1::RoomSnapshot* targ
         out->set_player_id(player.player_id);
         out->set_hp(player.hp);
         out->set_connected(player.connected);
+        out->set_online(player.online);
     }
 }
 
@@ -248,6 +251,51 @@ void RoomServiceImpl::SubmitInput(google::protobuf::RpcController* /*controller*
             response->set_accepted(false);
             SetError(response->mutable_error(), rgbt::room::v1::ROOM_INVALID_ARGUMENT,
                      "invalid_argument", "输入不合法", request->request_id());
+            return;
+    }
+}
+
+void RoomServiceImpl::SetPlayerPresence(google::protobuf::RpcController* /*controller*/,
+                                        const rgbt::room::v1::SetPlayerPresenceRequest* request,
+                                        rgbt::room::v1::SetPlayerPresenceResponse* response,
+                                        google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    if (manager_ == nullptr) {
+        SetError(response->mutable_error(), rgbt::room::v1::ROOM_INTERNAL, "room_internal",
+                 "房间管理器未初始化", request->request_id());
+        return;
+    }
+
+    RoomSnapshot snapshot;
+    const std::optional<PresenceOutcome> outcome = manager_->SetPresence(
+        request->room_id(), request->player_id(), request->connected(), NowMs(), &snapshot);
+    if (!outcome.has_value()) {
+        SetError(response->mutable_error(), rgbt::room::v1::ROOM_NOT_FOUND, "room_not_found",
+                 "房间不存在或已回收", request->request_id());
+        return;
+    }
+
+    switch (*outcome) {
+        case PresenceOutcome::kOk:
+            FillSnapshot(snapshot, response->mutable_room());
+            return;
+        case PresenceOutcome::kNotAMember:
+            SetError(response->mutable_error(), rgbt::room::v1::ROOM_NOT_A_MEMBER, "not_a_member",
+                     "该玩家不是这一局的成员", request->request_id());
+            return;
+        case PresenceOutcome::kAlreadyFinished:
+            // 对局已结束：连接状态不再影响任何结果。用 ALREADY_FINISHED 而不是"成功"，
+            // 否则调用方会以为上报产生了效果。
+            FillSnapshot(snapshot, response->mutable_room());
+            SetError(response->mutable_error(), rgbt::room::v1::ROOM_ALREADY_FINISHED,
+                     "room_already_finished", "对局已结束，连接状态不再影响结果",
+                     request->request_id());
+            return;
+        case PresenceOutcome::kInvalidArgument:
+        default:
+            SetError(response->mutable_error(), rgbt::room::v1::ROOM_INVALID_ARGUMENT,
+                     "invalid_input", "玩家标识不合法", request->request_id());
             return;
     }
 }

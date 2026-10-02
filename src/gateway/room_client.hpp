@@ -33,7 +33,10 @@ enum class RoomState {
 struct RoomPlayerSnapshot {
     std::string player_id;
     std::int32_t hp = 0;
+    /// 是否在房间内（已加入且未离开）。**不是**"网络是否连通"。
     bool connected = false;
+    /// TASK-016：推送连接是否在线。断线后进入宽限期，期内对局暂停推进。
+    bool online = true;
 };
 
 /// 房间权威状态快照。
@@ -132,6 +135,14 @@ public:
 
     /// @brief 查询对局结果。
     virtual RoomCallStatus GetResult(const std::string& match_id, MatchResultView* out_view) = 0;
+
+    /// @brief 上报某个玩家的推送连接状态（TASK-016）。
+    ///
+    /// 由 StreamHub 在订阅建立/移除时调用。**这不是幂等键语义上的"请求"**：
+    /// Room 侧对同一状态重复上报无副作用，因此调用方不需要重试或补偿——
+    /// 下一次连接状态变化会自然覆盖它。
+    virtual RoomCallStatus SetPresence(const std::string& room_id, const std::string& player_id,
+                                       bool online, RoomSnapshot* out_snapshot) = 0;
 
     /// @brief Room 当前是否可用。用于启动日志，不做真实往返调用。
     [[nodiscard]] virtual bool IsHealthy() = 0;

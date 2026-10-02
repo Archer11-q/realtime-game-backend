@@ -43,6 +43,11 @@ std::string ToFinishReasonString(rgbt::room::v1::FinishReason reason) {
             return "timeout";
         case rgbt::room::v1::FINISH_REASON_ABORTED:
             return "aborted";
+        // TASK-016：断线判负。**这个 case 是必须的**——漏掉它会 fallthrough 到
+        // default 返回 "none"，而前端与验收脚本都按字符串判定，
+        // 结果是"断线判负"被显示成"没有结束原因"（实测踩到过）。
+        case rgbt::room::v1::FINISH_REASON_DISCONNECT:
+            return "disconnect";
         case rgbt::room::v1::FINISH_REASON_UNSPECIFIED:
         default:
             return "none";
@@ -66,6 +71,9 @@ RoomSnapshot ToSnapshot(const rgbt::room::v1::RoomSnapshot& source) {
         out.player_id = player.player_id();
         out.hp = player.hp();
         out.connected = player.connected();
+        // TASK-016：online 也要转过来，否则轮询兜底接口里看不到"对方是否断线"，
+        // 而自动重连的前端正是靠它显示"等待对方重连"。
+        out.online = player.online();
         snapshot.players.push_back(std::move(out));
     }
     return snapshot;
@@ -167,6 +175,32 @@ RoomCallStatus BrpcRoomClient::SubmitAttack(const std::string& room_id,
     brpc::Controller controller;
     controller.set_timeout_ms(impl_->options.timeout_ms);
     stub.SubmitInput(&controller, &request, &response, nullptr);
+
+    if (controller.Failed()) {
+        return RoomCallStatus::kUnavailable;
+    }
+    if (out_snapshot != nullptr) {
+        *out_snapshot = ToSnapshot(response.room());
+    }
+    return ToCallStatus(response.error().code());
+}
+
+RoomCallStatus BrpcRoomClient::SetPresence(const std::string& room_id, const std::string& player_id,
+                                           bool online, RoomSnapshot* out_snapshot) {
+    rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
+
+    rgbt::room::v1::SetPlayerPresenceRequest request;
+    // request_id 用「房间:玩家:状态」：本接口不要求幂等键（重复上报无副作用），
+    // 它只用于让跨服务日志能直接关联到人、房间与这次变化。
+    request.set_request_id(room_id + ":" + player_id + (online ? ":online" : ":offline"));
+    request.set_room_id(room_id);
+    request.set_player_id(player_id);
+    request.set_connected(online);
+    rgbt::room::v1::SetPlayerPresenceResponse response;
+
+    brpc::Controller controller;
+    controller.set_timeout_ms(impl_->options.timeout_ms);
+    stub.SetPlayerPresence(&controller, &request, &response, nullptr);
 
     if (controller.Failed()) {
         return RoomCallStatus::kUnavailable;
