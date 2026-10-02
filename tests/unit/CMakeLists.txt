@@ -2,12 +2,22 @@
 #
 # 各服务的测试放在各自子目录（与 src/<service>/ 对应），便于按服务定位。
 #
-# gateway 与 match 测试依赖只在启用 vcpkg 工具链时才存在的目标
-# （rgbt_gateway_lib / rgbt_match_lib，它们需要 brpc 等依赖）。默认预设
-# （debug/release/asan）不包含这两个服务，因此这里必须按目标是否存在来决定是否
-# 加入其测试目录，否则会因「target 未被本项目构建」而在配置阶段报错。
+# gateway、match 与 room 测试依赖只在启用 vcpkg 工具链时才存在的目标
+# （rgbt_gateway_lib / rgbt_match_lib / rgbt_room_lib，它们需要 brpc 等依赖）。
+# 默认预设（debug/release/asan）不包含这三个服务，因此这里必须按目标是否存在来
+# 决定是否加入其测试目录，否则会因「target 未被本项目构建」而在配置阶段报错。
 
 add_subdirectory(common)
+
+if(TARGET rgbt_room_lib)
+  add_subdirectory(room)
+else()
+  message(
+    STATUS
+      "未启用 vcpkg 工具链（缺少 rgbt_room_lib），跳过 room 单元测试。"
+      " 需要时使用 brpc-debug 预设。"
+  )
+endif()
 
 if(TARGET rgbt_match_lib)
   add_subdirectory(match)

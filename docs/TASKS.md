@@ -1,7 +1,7 @@
 # 当前任务
 
-> 状态：Phase 1 进行中。TASK-000 至 TASK-007 已完成并合并。
-> **TASK-012（范围裁剪）已完成文档改动，待项目所有者审阅与合并。**
+> 状态：Phase 1 进行中。TASK-000 至 TASK-007 已完成并合并，TASK-012 已完成。
+> **TASK-008（Room/Battle Service）已实现，待项目所有者审阅与验收。**
 > 阶段推进依据见 docs/02-roadmap.md 与 docs/devlog.md。
 >
 > **范围裁剪自 2026-10-02 起生效**：Kafka、etcd、多实例、Kubernetes、独立
@@ -489,6 +489,68 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
 - 提交边界：允许改动 `api/proto/`、`src/match/`、`src/gateway/`、`tests/unit/`、
   `scripts/`、顶层 `CMakeLists.txt`、`deploy/compose/.env.example`、`docs/`；
   禁止改动 `src/room/`、`web/`、`migrations/`、`deploy/compose/docker-compose.yml`。
+
+## TASK-008：Room/Battle Service：房间生命周期与权威状态
+
+- 状态：已实现（2026-10-02），待项目所有者审阅与验收
+- 依赖：TASK-007（已完成并合并，`d6695a9`）、TASK-012（范围裁剪，已完成）
+- 背景问题：TASK-007 之后「匹配成功」只得到一个占位的 `room_id`（由 `match_id`
+  派生），**不产生任何房间状态**。Phase 1 的退出标准要求「两个客户端完成一场最小
+  对战」，因此必须有一个服务真正持有房间的权威状态、推进对局并产出对局结果。
+- 本次目标：
+  - 建立 `RoomService` 契约与独立 brpc 服务进程。
+  - 实现房间生命周期状态机与权威状态推进（固定 tick）。
+  - 对局结束时**同步幂等**写入 `match_results`。
+  - Match 的 `RoomAllocator` 替换为真实的 brpc 调用。
+  - Gateway 新增加入房间、提交输入、查询房间状态、查询对局结果四个接口。
+- **对局规则（经项目所有者确认，决策 A）**：两人一局；服务端 10 Hz 推进；
+  输入只有攻击，每次扣对手 10；HP 初值 100；一方归零即结束；600 帧（60 秒）后按 HP
+  判定，相同为平局。数值集中在 `src/room/room_types.hpp`。
+- 范围：
+  - `api/proto/room.proto`：`CreateRoom` / `JoinRoom` / `SubmitInput` /
+    `GetRoomState` / `GetMatchResult`。
+  - `src/room/`：`battle_room`、`room_manager`、`match_result_writer`、
+    `mysql_match_result_writer`、`room_service`、`room_main`。
+  - `src/match/brpc_room_allocator.*`：真实房间分配；`MatchQueue` 改为
+    **两阶段配对**（锁内取人、锁外分配、锁内提交）。
+  - `src/gateway/`：`room_client.hpp` + `brpc_room_client.*`；四个 HTTP 接口。
+  - `include/common/mysql_connection.*`：原在 `src/gateway/`，现被 Gateway 与 Room
+    两个服务使用，按放置规则移入公共目录并单独成目标 `rgbt_common_mysql`。
+  - `cmake/generate_service_proto.cmake`：第三个 proto 出现，按 Backlog 记录的
+    触发条件抽取公共代码生成函数。
+  - `tests/unit/room/`、`tests/unit/match/`、`tests/unit/gateway/` 的新用例。
+  - `scripts/verify-room.sh`：端到端验收入口。
+- 非范围：
+  - 不实现 WebSocket 推送（TASK-009）；客户端通过轮询获取状态。
+  - 不实现断线重连与宽限期（Phase 2）；`connected` 字段表达「是否在房间内」，
+    不是「网络是否连通」。
+  - 不实现房间快照的持久化（Phase 2）；快照环形缓冲只存在内存里。
+  - 不实现分差/MMR、不实现多实例、不引入 etcd（ADR-0003 非目标）。
+- 相关 ADR：不修改服务边界或数据所有权（TASK-012 已把 `match_results` 定为
+  Room/Battle 所有），因此不需要新 ADR。
+- 失败场景：
+  - Room 不可用：`CreateRoom` 失败 → Match 把玩家退回队首等下一次配对，
+    **不标记为超时**；Gateway 的房间接口返回 503 `room_unavailable`。
+  - MySQL 不可用：对局结果写入失败 → 房间停在 `FINISHING` 并按 1 秒间隔重试；
+    查询返回 503 `result_pending` 而**不是** 404，也不返回内存里的胜负。
+  - 对局已结束：再加入或提交输入返回 409 `room_already_finished`。
+  - 非本局成员：加入返回 400 `not_a_member`。
+  - 玩家在房间分配期间取消：这一局作废，剩余玩家退回队列；
+    已创建但无人加入的房间由 Room 的等待超时（30 秒）自行回收。
+- 已知限制（有意保留，写在这里避免被当成缺陷）：
+  - 已结束但未落库的对局只存在于内存里，**Room 进程重启会丢失**。属 Phase 2。
+  - 匹配队列与房间都在进程内存，单进程内有效（ADR-0003 已确认不做多实例）。
+  - 结果写入失败时**无限重试**，不设放弃上限。理由是不可再生的数据优于内存占用；
+    代价是 MySQL 长期不可用会让 `FINISHING` 房间持续累积。属 Phase 2。
+- 验收命令（在 WSL 中执行）：
+  ```bash
+  cmake --preset brpc-debug && cmake --build --preset brpc-debug
+  ctest --test-dir build/brpc-debug --output-on-failure
+  bash scripts/verify-room.sh
+  ```
+- 提交边界：允许改动 `api/proto/`、`src/`、`include/`、`tests/`、`cmake/`、`scripts/`、
+  顶层 `CMakeLists.txt`、`deploy/compose/.env.example`、`docs/`；
+  禁止改动 `web/`、`migrations/`（表结构不需要变更）。
 
 ## TASK-012：范围裁剪——把非目标写进文档
 

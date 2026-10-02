@@ -998,6 +998,137 @@ Phase 1 的最小闭环要求「两个客户端能匹配进同一房间」。此
   因此也从未出现在任何 PR 或远程分支中。
 - 结果：删除后 `Test-Path` 与 WSL 侧 `test -e` 均确认目录不存在。
 
+## TASK-008 实施记录（2026-10-02）
+
+### 背景
+
+TASK-007 之后「匹配成功」只得到一个由 `match_id` 派生的占位 `room_id`，
+**不产生任何房间状态**。Phase 1 要求「两个客户端完成一场最小对战」，
+所以必须有一个服务真正持有房间的权威状态、推进对局并产出对局结果。
+
+### 对局规则（项目所有者确认，决策 A）
+
+两人一局；服务端 10 Hz 推进（100 ms/帧）；输入只有「攻击」，每次扣对手 10；
+HP 初值 100；一方归零即结束；600 帧（60 秒）后按 HP 判定，相同为平局。
+数值集中在 `src/room/room_types.hpp`，并由单元测试锁定。
+
+### 完成
+
+- `api/proto/room.proto`：`CreateRoom` / `JoinRoom` / `SubmitInput` /
+  `GetRoomState` / `GetMatchResult`，以及 `RoomState`、`FinishReason`、`RoomErrorCode`。
+- `src/room/`：`room_types`、`battle_room`（生命周期与帧推进）、`room_manager`
+  （注册表、结果落库、回收）、`match_result_writer` + `mysql_match_result_writer`、
+  `room_service`（brpc 服务）、`room_main`（进程入口 + 50 ms 推进线程）。
+- `src/match/brpc_room_allocator.*`：真实房间分配。`RoomAllocator::Allocate` 增加
+  `player_ids` 参数——房间需要知道本局都有谁，才能校验加入者的身份。
+- `MatchQueue` 改为**两阶段配对**：锁内取人并标记分配中 → 锁外 brpc 分配 →
+  锁内提交。分配失败时玩家退回队首。
+- `src/gateway/`：`room_client.hpp` + `brpc_room_client.*`；四个 HTTP 接口。
+- `include/common/mysql_connection.*`：原在 `src/gateway/`，现被两个服务使用，
+  按放置规则移入公共目录，单独成目标 `rgbt_common_mysql`（它依赖 vcpkg，
+  不能并入默认预设也会构建的 `rgbt_common`）。
+- `cmake/generate_service_proto.cmake`：`room.proto` 是第三个 proto，触发了
+  Backlog 里记录的抽取条件，三个服务现在共用同一份代码生成逻辑。
+- `tests/unit/room/`（24 个用例）、match 与 gateway 的新用例。
+- `scripts/verify-room.sh`：端到端验收入口。
+- 删除 `src/player/.gitkeep` 与 `src/settlement/.gitkeep`，与 ADR-0003 对齐。
+
+### 决策
+
+- **`FINISHING` 是独立状态**。已分出胜负但结果未落库时停在这里并按 1 秒间隔重试，
+  查询返回 `result_pending`（503）。写成功才进 `FINISHED`。理由：若直接用内存里的
+  胜负回给客户端，进程重启后客户端会拿到一个数据库里查不到的结论。
+- **`ABORTED` 不写结果**。等待玩家加入超时的房间写一行 winner 为空的记录，
+  等于把「没打成」伪装成「打平了」。
+- **结果写入失败时无限重试，不设放弃上限**。不可再生的数据优于内存占用；
+  代价是 MySQL 长期不可用会让 FINISHING 房间累积，已在 TASKS.md 记为已知限制。
+- **持锁期间绝不调用 MySQL**。写结果与读结果都在锁外完成，只在读取/更新房间状态
+  时短暂持锁。否则一次 MySQL 超时会把所有房间的 tick 一起卡住。
+- **单次 Tick 限制最大补偿帧数**（`kMaxCatchUpFrames`）。进程被挂起后一次性补完
+  几百帧会造成 CPU 尖峰，而这段时间的输入本来也已失去意义。
+- **房间推进由 Room 自己的线程驱动**，不依赖客户端请求。否则双方都不请求时对局
+  会永远停在原地。
+- **`connected` 表达「是否在房间内」，不是「网络是否连通」**。TASK-008 没有断线
+  重连（属 Phase 2），PLAYING 之后恒为 true；WAITING 期间未加入的玩家为 false。
+- **`BattleRoom` 允许移动但禁止拷贝**。允许移动是为了测试能有一个「构造并返回」的
+  工厂函数；禁止拷贝是因为房间状态被悄悄复制成两份比编译错误严重得多。
+
+### 验证（均在 WSL 的 `~/workspace/realtime-game-backend` 执行）
+
+- 命令：`cmake --preset brpc-debug && cmake --build --preset brpc-debug`
+- 结果：配置与构建成功，无新增编译警告（`-Werror` 全程生效）。
+- 命令：`ctest --test-dir build/brpc-debug --output-on-failure`
+- 结果：**144/144 通过**（TASK-007 时为 89 个，本次新增 55 个）。
+- 命令：`bash scripts/check-format.sh`
+- 结果：通过，检查 58 个文件。新文件首次提交时 13 个未过格式检查，
+  已在 WSL 格式化后回写 Windows 副本。
+- 命令：`bash scripts/verify-room.sh --no-docker`
+- 结果：**全部通过，退出码 0**。实测覆盖：双方拿到相同 match_id/room_id；
+  房间的 match_id 与匹配结果一致（幂等键生效）；alice 进房 `waiting`、
+  bob 进房 `playing`；重复加入幂等；缺 Token 返回 400；
+  一次攻击使对手 HP 100 → 90 且不继续下降；提交 10 次攻击后 `state=finished`、
+  `winner_id=p-0001`、`finish_reason=hp_zero`；结束后提交输入返回
+  **409 room_already_finished**；结果可查询且 `match_results` 只有 **1 行**，
+  重复查询后仍为 1 行；不存在的 match_id 返回 **404 result_not_found**；
+  Room 停机时查询返回 **503 room_unavailable** 且分配失败时两人留在队列
+  （alice=queued bob=queued，**未产生半成品配对**）；Room 重启后**仅靠轮询**
+  即重新匹配成功；MySQL 停机期间对局正常结束，结果查询返回
+  **503 result_pending** 且响应体不含 result 字段；MySQL 恢复后
+  **无需重启 Room** 即自动落库且 winner 正确；三个进程 SIGTERM 退出码均为 0。
+
+### 问题与风险（本轮实际踩到并解决的）
+
+- **brpc 也不把 query string 映射进 protobuf 字段**。这与此前记录的「brpc 不映射
+  HTTP 头」是同一类问题，但这次踩在查询参数上：`GET /api/v1/results?match_id=...`
+  返回 `400 match_id_required`，因为 `request->match_id()` 永远是空字符串。
+  更隐蔽的是——**它在单元测试里完全测不出来**，因为单元测试直接调用服务、
+  没有 HTTP 上下文。是端到端验收脚本第一次真实跑 HTTP 才暴露出来的。
+  修复：新增 `ExtractQueryParam`，与 `ExtractToken` 同一套取值顺序
+  （请求体优先、其次 query string）。教训：凡是来自 HTTP 而**不在 body JSON 里**
+  的输入，都必须显式读取，不能指望框架映射。
+- **brpc 的 restful 映射不支持 `{name}` 路径参数**。查证 brpc 官方文档
+  （`docs/cn/http_service.md` 的 Restful URL 一节）确认：只支持 `*` 通配符，
+  匹配部分通过 `unresolved_path()` 取回。而 `/api/v1/rooms/*` 会与
+  `/api/v1/rooms/join`、`/api/v1/rooms/input` 这类固定子路径产生歧义。
+  因此 room_id 与 match_id 最终走**查询参数**。这不是偏好，是框架约束，
+  与 TASK-007 取消匹配路径的调整性质相同。
+- **配对失败后玩家会卡在队列里**。由验收脚本第 11 步暴露：Room 重启后
+  brpc channel 惰性重连，第一次 `CreateRoom` 必然报
+  `[E112]Not connected to 127.0.0.1:8083 yet`，玩家退回队列；而配对原本只在
+  「有人入队」时触发，于是这两人要等到下一个新玩家出现才可能被配上。
+  在有真实流量的环境里它会自愈，所以很容易被忽略——**是端到端脚本把它逼出来的**。
+  修复：新增 `retry_pairing_` 标记 + `RetryPairingIfNeeded`，由客户端持续轮询的
+  `GetStatus` 顺带重试一次，并且只在真的有待重试配对时才发起远程调用
+  （有单元测试锁定「无待重试时不发 RPC」）。
+- **`<mysql/mysql.h>` 是靠传递依赖碰巧编译过的**。把 `mysql_connection` 移到
+  `include/common/` 后单独成目标，失去了 gateway 链接 brpc/protobuf 带来的
+  `${prefix}/include` 搜索路径，于是编译失败。vcpkg 的 `unofficial::libmariadb`
+  暴露的是 `${prefix}/include/mysql`，正确写法是 `<mysql.h>`。原写法属于隐患，
+  换个链接组合就会断。
+- **全仓库 `chmod 644` 会把 `build/` 下的可执行文件一起改掉**。这个坑 devlog 里
+  记录过，本轮又踩了一次：`rgbt_common_tests` 是 9 月 18 日的陈旧二进制，
+  源码未变所以没有重新链接，执行位被改掉后 `ctest` 报 `BAD_COMMAND`。
+  权限归一化必须限定在纳入版本管理的源文件上，绝不能遍历整个仓库。
+- **`GatewayServiceImpl` 新增依赖后，构造函数签名变化会波及所有测试夹具**。
+  这是签名变更的正常代价，本轮一次性改到位（`FakeRoomClient` 同时补上了
+  10 个 Gateway 侧用例）。
+- **测试里把 `Tick` 当成「一步跳到第 600 帧」是错的**。单次 Tick 有
+  `kMaxCatchUpFrames` 上限，超过的部分被有意丢弃。最初写的 11 个用例因此失败；
+  改为按帧推进的辅助函数后通过。测试必须按与生产一致的粒度调用被测代码。
+
+### 未做 / 留给后续
+
+- 不实现 WebSocket 推送（TASK-009）；客户端通过轮询获取房间状态。
+- 不实现断线重连与宽限期（Phase 2）。
+- 房间快照只存在内存的环形缓冲里，**Room 进程重启即丢失**（Phase 2）。
+- 已结束但未落库的对局只存在内存里，进程重启会丢失（Phase 2）。
+- 匹配队列与房间都在进程内存，单进程内有效（ADR-0003 已确认不做多实例）。
+
+### 下一步
+
+- 由项目所有者审阅 Diff 并运行 `bash scripts/verify-room.sh`；确认后开 PR。
+- 通过后进入 TASK-009（Gateway WebSocket 路由）。
+
 ## 日志模板
 
 ```markdown

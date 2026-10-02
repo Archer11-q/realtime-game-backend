@@ -1,0 +1,285 @@
+// Room/Battle Service 的服务间契约。
+//
+// 说明：
+//   * Room/Battle 拥有房间权威状态、快照与 match_results 表
+//     （docs/01-architecture.md 第 3、5 节，docs/adr/0003-scope-reduction.md）。
+//   * 对局同步方式为**最小状态同步**（D-003）：服务端权威快照 + 广播。
+//     TASK-008 阶段客户端通过 Gateway 轮询 GetRoomState 获取快照；
+//     WebSocket 主动推送属 TASK-009。
+//   * 字段只追加，不修改既有标签号；删除字段必须先标记 reserved。
+//   * 本文件是**第三个服务间契约**（前两个是 gateway.proto、match.proto），沿用
+//     同样的约定：每个请求带 request_id，每个响应带可判定的 error.reason。
+//   * 对局规则的最小定义（TASK-008 决策 A）：
+//       - 两人一局，与 Match 的 FIFO 两人配对一致。
+//       - 服务端按固定 tick 推进权威状态，玩家输入只有「攻击」一种。
+//       - 一方 HP 归零则该方落败；达到最大帧数时 HP 高者胜，相同为平局。
+//     具体数值集中在 src/room/battle_room.hpp，不在本契约里固化。
+
+syntax = "proto3";
+
+package rgbt.room.v1;
+
+option cc_generic_services = true;
+
+// ---------------------------------------------------------------------------
+// 公共结构
+// ---------------------------------------------------------------------------
+
+// 房间生命周期状态。
+//
+// FINISHING 必须与 FINISHED 分开：前者是「已分出胜负但结果尚未落库」，
+// 后者是「结果已确认写入」。合并成一个状态会让调用方无法区分
+// 「对局没有结果」和「结果暂时查不到」，也无法在数据库不可用时给出正确语义。
+enum RoomState {
+  ROOM_STATE_UNSPECIFIED = 0;
+
+  // 已创建，尚未有人加入。
+  ROOM_STATE_CREATED = 1;
+
+  // 至少一人加入，等待双方到齐。
+  ROOM_STATE_WAITING = 2;
+
+  // 双方到齐，tick 正在推进。
+  ROOM_STATE_PLAYING = 3;
+
+  // 已分出胜负，结果尚未写入 MySQL。每个 tick 会重试写入。
+  ROOM_STATE_FINISHING = 4;
+
+  // 结果已写入 MySQL。
+  ROOM_STATE_FINISHED = 5;
+
+  // 异常终止（人数不足、超时等），**不写**对局结果。
+  ROOM_STATE_ABORTED = 6;
+}
+
+// 对局结束原因。
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+
+  // 一方 HP 归零。
+  FINISH_REASON_HP_ZERO = 1;
+
+  // 达到最大帧数，按 HP 判定。
+  FINISH_REASON_TIMEOUT = 2;
+
+  // 异常终止，未产生胜负。
+  FINISH_REASON_ABORTED = 3;
+}
+
+// 房间错误码。与 docs/05-api-and-data.md 第 3 节的分类对应：
+//   INVALID_ARGUMENT       输入错误，调用方不应重试
+//   NOT_FOUND              房间或对局结果不存在
+//   ALREADY_FINISHED       对局已结束，不再接受输入
+//   RESULT_PENDING         已分出胜负但结果尚未落库，可稍后重试
+//   STORE_UNAVAILABLE      对端存储（MySQL）暂时不可用，可有限重试
+//   INTERNAL               未分类内部错误
+enum RoomErrorCode {
+  ROOM_ERROR_CODE_UNSPECIFIED = 0;
+  ROOM_INVALID_ARGUMENT = 1;
+  ROOM_NOT_FOUND = 2;
+  ROOM_ALREADY_FINISHED = 3;
+  ROOM_RESULT_PENDING = 4;
+  ROOM_STORE_UNAVAILABLE = 5;
+  ROOM_INTERNAL = 6;
+}
+
+// 统一错误体。
+message RoomError {
+  RoomErrorCode code = 1;
+
+  // 稳定可判定的错误标识，例如 room_not_found。
+  string reason = 2;
+
+  // 面向开发者的描述，不包含敏感信息。
+  string message = 3;
+
+  // 与请求中的 request_id 对应，便于跨服务追踪。
+  string request_id = 4;
+}
+
+// 玩家在对局中的权威状态。
+message PlayerState {
+  string player_id = 1;
+
+  // 当前 HP，不会低于 0。
+  int32 hp = 2;
+
+  // 该玩家当前是否在房间内（已加入且未离开）。
+  //
+  // 注意语义：这不是「网络是否连通」。TASK-008 没有断线重连与宽限期（属 Phase 2），
+  // 因此 PLAYING 及之后恒为 true；在 WAITING 期间尚未加入的玩家为 false。
+  bool connected = 3;
+}
+
+// 房间权威状态快照。每 tick 生成一份，Phase 1 通过查询接口下发。
+message RoomSnapshot {
+  string room_id = 1;
+  string match_id = 2;
+
+  RoomState state = 3;
+
+  // 当前帧号，从 0 开始。房间未开始时为 0。
+  int64 frame = 4;
+
+  repeated PlayerState players = 5;
+
+  // 仅在 state >= FINISHING 时有意义。
+  FinishReason finish_reason = 6;
+
+  // 胜者 player_id。平局或未结束时为空。
+  string winner_id = 7;
+
+  // 开局与结束时间（Unix 毫秒）。未开始或未结束时为 0。
+  int64 started_at_ms = 8;
+  int64 finished_at_ms = 9;
+}
+
+// 对局结果。与 MySQL 的 match_results 表一一对应。
+message MatchResult {
+  string match_id = 1;
+  string room_id = 2;
+
+  // 胜者 player_id。平局为空字符串（数据库中为 NULL）。
+  string winner_id = 3;
+
+  int32 player_count = 4;
+  int64 started_at_ms = 5;
+  int64 finished_at_ms = 6;
+}
+
+// 玩家输入。TASK-008 只有一种输入类型，因此用带 kind 的消息而不是 oneof：
+// 后续新增输入类型时只需追加枚举值，不改变既有字段语义。
+message PlayerInput {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+
+    // 攻击。对对手造成固定伤害，数值定义在服务端常量中。
+    KIND_ATTACK = 1;
+  }
+
+  Kind kind = 1;
+}
+
+// ---------------------------------------------------------------------------
+// 创建房间
+// ---------------------------------------------------------------------------
+
+message CreateRoomRequest {
+  // 幂等键。
+  string request_id = 1;
+
+  // **本接口的幂等业务键**。同一 match_id 重复调用返回同一个 room_id，
+  // 不会创建第二个房间。这保证 Match 在重试时不会造出多个房间。
+  string match_id = 2;
+
+  // 本局玩家。Phase 1 固定两人。
+  repeated string player_ids = 3;
+}
+
+message CreateRoomResponse {
+  RoomError error = 1;
+
+  string room_id = 2;
+
+  // 创建后的初始快照（state = CREATED）。
+  RoomSnapshot room = 3;
+}
+
+// ---------------------------------------------------------------------------
+// 加入房间
+// ---------------------------------------------------------------------------
+
+message JoinRoomRequest {
+  string request_id = 1;
+  string room_id = 2;
+
+  // 玩家标识。**必须由 Gateway 从会话中填充**，不得使用客户端提交的值。
+  string player_id = 3;
+}
+
+message JoinRoomResponse {
+  RoomError error = 1;
+
+  // 加入后的最新快照。双方到齐时 state 变为 PLAYING。
+  RoomSnapshot room = 2;
+}
+
+// ---------------------------------------------------------------------------
+// 提交输入
+// ---------------------------------------------------------------------------
+
+message SubmitInputRequest {
+  string request_id = 1;
+  string room_id = 2;
+  string player_id = 3;
+
+  PlayerInput input = 4;
+}
+
+message SubmitInputResponse {
+  RoomError error = 1;
+
+  // 输入是否被接受。对局已结束或玩家不在房间时为 false，
+  // 具体原因见 error。
+  bool accepted = 2;
+
+  RoomSnapshot room = 3;
+}
+
+// ---------------------------------------------------------------------------
+// 查询房间状态
+// ---------------------------------------------------------------------------
+
+message GetRoomStateRequest {
+  string request_id = 1;
+  string room_id = 2;
+}
+
+message GetRoomStateResponse {
+  RoomError error = 1;
+
+  RoomSnapshot room = 2;
+}
+
+// ---------------------------------------------------------------------------
+// 查询对局结果
+// ---------------------------------------------------------------------------
+
+message GetMatchResultRequest {
+  string request_id = 1;
+
+  // 对局标识，即 match_results 表的主键。
+  string match_id = 2;
+}
+
+message GetMatchResultResponse {
+  RoomError error = 1;
+
+  // 仅当结果已写入时有效。结果为 RESULT_PENDING 时本字段为空，
+  // 调用方**不得**据此推断对局结果，必须区分「还没有结果」与「结果是平局」。
+  MatchResult result = 2;
+
+  // 结果未落库但房间已知时的房间快照，便于调用方判断对局是否已结束。
+  RoomSnapshot room = 3;
+}
+
+// ---------------------------------------------------------------------------
+// 服务定义
+// ---------------------------------------------------------------------------
+
+service RoomService {
+  // 创建房间。以 match_id 为幂等键，重复调用返回同一房间。
+  rpc CreateRoom(CreateRoomRequest) returns (CreateRoomResponse);
+
+  // 加入房间。重复加入同一房间按幂等成功处理。
+  rpc JoinRoom(JoinRoomRequest) returns (JoinRoomResponse);
+
+  // 提交玩家输入。对局已结束时返回 accepted = false。
+  rpc SubmitInput(SubmitInputRequest) returns (SubmitInputResponse);
+
+  // 查询房间权威状态快照。TASK-008 期间客户端轮询本接口。
+  rpc GetRoomState(GetRoomStateRequest) returns (GetRoomStateResponse);
+
+  // 查询对局结果。结果尚未落库时返回 RESULT_PENDING，而不是空结果。
+  rpc GetMatchResult(GetMatchResultRequest) returns (GetMatchResultResponse);
+}

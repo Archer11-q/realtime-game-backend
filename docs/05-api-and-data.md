@@ -25,8 +25,10 @@
 | POST | `/api/v1/matches` | 进入匹配 | 已实现（TASK-007） |
 | GET | `/api/v1/matches/current` | 查询当前匹配状态 | 已实现（TASK-007） |
 | POST | `/api/v1/matches/current/cancel` | 取消匹配 | 已实现（TASK-007） |
-| GET | `/api/v1/rooms/{room_id}` | 查询房间状态 | 待 TASK-008 |
-| GET | `/api/v1/results/{match_id}` | 查询对局结果 | 待 TASK-008 |
+| POST | `/api/v1/rooms/join` | 加入房间 | 已实现（TASK-008） |
+| POST | `/api/v1/rooms/input` | 提交一次攻击输入 | 已实现（TASK-008） |
+| GET | `/api/v1/rooms/state` | 查询房间权威状态（`?room_id=`） | 已实现（TASK-008） |
+| GET | `/api/v1/results` | 查询对局结果（`?match_id=`） | 已实现（TASK-008） |
 | GET | `/health` | 健康检查 | 已实现（brpc 内置服务） |
 
 接口名称在实现前可以调整，但必须更新本文档。
@@ -35,6 +37,12 @@
 与查询接口共用同一路径。实现时确认 **brpc 的 restful 映射按路径分派，不支持按
 HTTP 方法分派**，同一路径无法同时承载 GET 与 DELETE，因此改为
 `POST /api/v1/matches/current/cancel`。这不是偏好问题，是框架约束。
+
+**已发生的调整（TASK-008）**：房间状态与对局结果原设计为
+`GET /api/v1/rooms/{room_id}` 与 `GET /api/v1/results/{match_id}`。实现时确认
+**brpc 的 restful 映射同样不支持 `{name}` 路径参数**，只支持 `*` 通配符；而
+`/api/v1/rooms/*` 会与 `/api/v1/rooms/join`、`/api/v1/rooms/input` 这类固定子路径
+产生歧义。因此 room_id 与 match_id 改走**查询参数**。同属框架约束。
 
 ### 匹配接口的错误语义
 
@@ -58,6 +66,32 @@ HTTP 方法分派**，同一路径无法同时承载 GET 与 DELETE，因此改�
 
 **安全约束**：匹配接口的 `player_id` **只能来自会话**，请求体里即使带上该字段也会被
 忽略。否则任何登录用户都能替他人入队。
+
+### 房间接口的错误语义（TASK-008）
+
+| 情形 | HTTP | `error.reason` | 调用方行为 |
+|---|---|---|---|
+| 未携带或格式非法 Token | 400 | `token_required` / `token_malformed` | 不重试，先登录 |
+| Token 合法但会话不存在 | 401 | `session_not_found` | 不重试，重新登录 |
+| 缺少 room_id / match_id | 400 | `room_id_required` / `match_id_required` | 不重试，修请求 |
+| 该玩家不是这一局的成员 | 400 | `not_a_member` | 不重试 |
+| 对局尚未开始就提交输入 | 400 | `room_not_playing` | 不重试，等对局开始 |
+| 房间或对局结果不存在 | 404 | `room_not_found` / `result_not_found` | 不重试 |
+| 对局已结束 | 409 | `room_already_finished` | 不重试 |
+| 已结束但结果尚未落库 | 503 | `result_pending` | **可重试**，稍后再查 |
+| Room 不可用 | 503 | `room_unavailable` | 可退避重试，恢复后无需重启 |
+| Room 的 MySQL 不可用 | 503 | `result_store_unavailable` | 可退避重试 |
+| Room 返回未分类错误 | 500 | `room_internal` | 记录并告警 |
+
+`result_pending` 与 `result_not_found` 的区分是关键：前者表示**结果存在但还没
+写进数据库**，后者表示**确实没有这条结果**。把前者报成 404 会让客户端以为
+这一局没有胜负，而把后者报成 503 会让客户端无限重试一个不会出现的结果。
+
+同理，`result_pending` 时响应里的 `result` 字段必须为空：调用方不得据此推断
+胜负。平局的结果本身就是一个 `winner_id` 为空的合法记录，两者不能混淆。
+
+**安全约束**：所有房间接口的 `player_id` **只能来自会话**，请求体里即使带上
+该字段也会被忽略。否则任何登录用户都能替他人加入房间或代打。
 
 ### WebSocket 消息信封
 
@@ -96,7 +130,7 @@ HTTP 方法分派**，同一路径无法同时承载 GET 与 DELETE，因此改�
 
 - `GatewayService`
 - `MatchService`（已实现，TASK-007，契约见 `api/proto/match.proto`）
-- `RoomService`
+- `RoomService`（已实现，TASK-008，契约见 `api/proto/room.proto`）
 
 **不实现** `PlayerService` 与 `SettlementService`；不要为它们创建 `.proto`。
 
@@ -114,6 +148,15 @@ HTTP 方法分派**，同一路径无法同时承载 GET 与 DELETE，因此改�
 - 调用方（Gateway）**把传输层失败与业务错误分开**：`controller.Failed()` 表示对端
   不可用（映射 503），响应里的 `error` 才是业务结果（映射 400/429/500）。
   混在一起会把「队列已满」误报成「服务不可用」。
+
+`RoomService` 是第三个契约，沿用同一套约定，并额外确立一条：
+
+- **幂等键由业务字段承担，而不是 `request_id`**。`CreateRoom` 以 `match_id` 为幂等键、
+  对局结果以 `match_id` 为主键；`request_id` 只用于跨服务日志关联。理由是幂等必须
+  在**重试方无法保证携带同一个 request_id** 时仍然成立——Match 超时后重试，
+  真正保证「不会造出第二个房间」的是 match_id，不是 request_id。
+- **把「数据还没准备好」与「数据不存在」分开**：`ROOM_RESULT_PENDING` 与
+  `ROOM_NOT_FOUND` 是两个不同的错误码，对应 503 与 404（见第 2 节的错误语义表）。
 
 错误码分类：
 

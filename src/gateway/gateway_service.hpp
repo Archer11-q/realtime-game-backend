@@ -8,13 +8,19 @@
 ///   POST /api/v1/matches                进入匹配（TASK-007）
 ///   GET  /api/v1/matches/current        查询匹配状态（TASK-007）
 ///   POST /api/v1/matches/current/cancel 取消匹配（TASK-007）
+///   POST /api/v1/rooms/join             加入房间（TASK-008）
+///   POST /api/v1/rooms/input            提交攻击输入（TASK-008）
+///   GET  /api/v1/rooms/state            查询房间状态（TASK-008）
+///   GET  /api/v1/results                查询对局结果（TASK-008）
 ///
 /// 服务边界（docs/01-architecture.md）：
-///   Gateway 负责 HTTP 接入、鉴权、路由和限流，不保存战斗状态，也**不保存匹配队列**。
-///   匹配接口只做「鉴权 -> 转给 Match -> 整理结果」，队列状态一律来自 Match Service。
+///   Gateway 负责 HTTP 接入、鉴权、路由和限流，不保存战斗状态，也**不保存匹配队列
+///   或房间状态**。相关接口只做「鉴权 -> 转给对应服务 -> 整理结果」。
+///   Gateway **不直读** match_results 表：该表的所有者是 Room/Battle
+///   （见 docs/adr/0003-scope-reduction.md）。
 ///
-/// 安全约定：匹配接口的 player_id **只能来自会话**，绝不使用请求体中的字段，
-/// 否则任何登录用户都能替别人入队。
+/// 安全约定：所有涉及玩家身份的接口，player_id **只能来自会话**，绝不使用请求体
+/// 中的字段，否则任何登录用户都能替别人入队、加入房间或代打。
 
 #ifndef RGBT_GATEWAY_GATEWAY_SERVICE_HPP
 #define RGBT_GATEWAY_GATEWAY_SERVICE_HPP
@@ -25,6 +31,7 @@
 #include "gateway.pb.h"
 #include "match_client.hpp"
 #include "player_directory.hpp"
+#include "room_client.hpp"
 #include "session_store.hpp"
 
 namespace rgbt::gateway {
@@ -41,7 +48,10 @@ inline constexpr std::size_t kMaxTokenLength = 256;
 
 class GatewayServiceImpl : public rgbt::gateway::v1::GatewayService {
 public:
+    /// @param room 房间客户端。可以为 nullptr（此时房间接口一律返回 503），
+    ///        用于只关心登录与匹配的单元测试。
     GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* players, MatchClient* match,
+                       RoomClient* room,
                        std::int32_t session_ttl_seconds = kDefaultSessionTtlSeconds);
 
     void Login(::google::protobuf::RpcController* controller,
@@ -74,6 +84,26 @@ public:
                      rgbt::gateway::v1::CancelMatchResponse* response,
                      ::google::protobuf::Closure* done) override;
 
+    void JoinRoom(::google::protobuf::RpcController* controller,
+                  const rgbt::gateway::v1::JoinRoomRequest* request,
+                  rgbt::gateway::v1::JoinRoomResponse* response,
+                  ::google::protobuf::Closure* done) override;
+
+    void SubmitInput(::google::protobuf::RpcController* controller,
+                     const rgbt::gateway::v1::SubmitInputRequest* request,
+                     rgbt::gateway::v1::SubmitInputResponse* response,
+                     ::google::protobuf::Closure* done) override;
+
+    void GetRoomState(::google::protobuf::RpcController* controller,
+                      const rgbt::gateway::v1::GetRoomStateRequest* request,
+                      rgbt::gateway::v1::GetRoomStateResponse* response,
+                      ::google::protobuf::Closure* done) override;
+
+    void GetMatchResult(::google::protobuf::RpcController* controller,
+                        const rgbt::gateway::v1::GetMatchResultRequest* request,
+                        rgbt::gateway::v1::GetMatchResultResponse* response,
+                        ::google::protobuf::Closure* done) override;
+
     /// @brief 当前是否所有依赖都可用。供健康检查使用。
     [[nodiscard]] bool DependenciesHealthy();
 
@@ -101,11 +131,24 @@ private:
     std::int32_t HandleMatchFailure(MatchCallStatus status, const std::string& request_id,
                                     rgbt::gateway::v1::Error* error);
 
+    /// 把 Room 返回的快照写入响应体。
+    static void FillRoomState(const RoomSnapshot& snapshot, rgbt::gateway::v1::RoomStateInfo* out);
+
+    /// @brief 把 Room 的调用结果转成错误体 + HTTP 状态码。
+    /// @return 200 表示调用成功，调用方应继续填充业务字段。
+    /// @param not_found_reason kNotFound 时使用的 reason。房间查询用 room_not_found、
+    ///        结果查询用 result_not_found：两者对外都是 404，但排障时需要一眼看出
+    ///        是「房间没了」还是「这一局没有结果」。
+    std::int32_t HandleRoomFailure(RoomCallStatus status, const std::string& request_id,
+                                   rgbt::gateway::v1::Error* error,
+                                   const char* not_found_reason = "room_not_found");
+
     SessionStore* sessions_;
     // 不加 const：接口方法本身不是 const（实现需要查询外部依赖），
     // 与 sessions_ 的写法保持一致。
     PlayerDirectory* players_;
     MatchClient* match_;
+    RoomClient* room_;
     std::int32_t session_ttl_seconds_;
 };
 

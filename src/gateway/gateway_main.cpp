@@ -31,14 +31,16 @@
 #include <string>
 
 #include "brpc_match_client.hpp"
+#include "brpc_room_client.hpp"
+#include "common/mysql_connection.hpp"
 #include "common/version.hpp"
 #include "database_player_directory.hpp"
 #include "gateway.pb.h"
 #include "gateway_service.hpp"
-#include "mysql_connection.hpp"
 #include "mysql_player_reader.hpp"
 #include "player_directory.hpp"
 #include "redis_session_store.hpp"
+#include "room_client.hpp"
 
 // 默认端口与 .env.example 的 GATEWAY_HTTP_PORT 保持一致（8080）。
 // 本地 8080 可能被其它开发服务占用，端口冲突时网关会启动失败，而请求会被打到
@@ -62,6 +64,12 @@ DEFINE_int32(mysql_timeout_seconds, 3, "MySQL 连接与读写超时（秒）");
 DEFINE_string(match_host, "127.0.0.1", "Match Service 主机");
 DEFINE_int32(match_port, 8082, "Match Service 端口");
 DEFINE_int32(match_timeout_ms, 500, "调用 Match Service 的超时（毫秒）");
+// Room/Battle Service 地址。TASK-008 起 Gateway 用它查询房间状态与对局结果。
+// 注意：Gateway **不直读** match_results 表——该表的所有者是 Room/Battle
+// （见 docs/adr/0003-scope-reduction.md），直读会绕过所有者。
+DEFINE_string(room_host, "127.0.0.1", "Room/Battle Service 主机");
+DEFINE_int32(room_port, 8083, "Room/Battle Service 端口");
+DEFINE_int32(room_timeout_ms, 500, "调用 Room/Battle Service 的超时（毫秒）");
 DEFINE_int32(idle_timeout_s, -1, "连接空闲超时（秒），-1 表示不超时");
 
 namespace {
@@ -90,7 +98,7 @@ int main(int argc, char* argv[]) {
                                                                        FLAGS_session_ttl_seconds);
 
     // --- 玩家档案（MySQL）---
-    rgbt::gateway::MysqlOptions mysql_options;
+    rgbt::common::MysqlOptions mysql_options;
     mysql_options.host = FLAGS_mysql_host;
     mysql_options.port = FLAGS_mysql_port;
     mysql_options.user = FLAGS_mysql_user;
@@ -101,7 +109,7 @@ int main(int argc, char* argv[]) {
     mysql_options.write_timeout_seconds = static_cast<std::uint32_t>(FLAGS_mysql_timeout_seconds);
 
     auto mysql_connection =
-        std::make_unique<rgbt::gateway::MysqlConnection>(env_prefix, mysql_options);
+        std::make_unique<rgbt::common::MysqlConnection>(env_prefix, mysql_options);
     auto player_reader = std::make_unique<rgbt::gateway::MysqlPlayerReader>(mysql_connection.get());
     std::unique_ptr<rgbt::gateway::PlayerDirectory> players =
         std::make_unique<rgbt::gateway::DatabasePlayerDirectory>(player_reader.get());
@@ -113,8 +121,15 @@ int main(int argc, char* argv[]) {
     match_options.timeout_ms = FLAGS_match_timeout_ms;
     auto match = std::make_unique<rgbt::gateway::BrpcMatchClient>(match_options);
 
+    // --- 房间与对局结果（Room/Battle Service，TASK-008）---
+    rgbt::gateway::RoomClientOptions room_options;
+    room_options.host = FLAGS_room_host;
+    room_options.port = FLAGS_room_port;
+    room_options.timeout_ms = FLAGS_room_timeout_ms;
+    auto room = std::make_unique<rgbt::gateway::BrpcRoomClient>(room_options);
+
     rgbt::gateway::GatewayServiceImpl service(sessions.get(), players.get(), match.get(),
-                                              FLAGS_session_ttl_seconds);
+                                              room.get(), FLAGS_session_ttl_seconds);
 
     brpc::Server server;
     brpc::ServerOptions options;
@@ -126,13 +141,24 @@ int main(int argc, char* argv[]) {
     // 注意取消匹配的路径：文档原先写的是 DELETE /api/v1/matches/current，与查询
     // 共用同一路径。brpc 的 restful 映射按**路径**分派，不支持按 HTTP 方法分派，
     // 因此两者不能共用路径，改为 /api/v1/matches/current/cancel。
+    // 房间与对局结果的路径说明（TASK-008）：
+    //   文档原写 `GET /api/v1/rooms/{room_id}`。实测确认 **brpc 的 restful 映射不支持
+    //   `{name}` 路径参数**，只支持 `*` 通配符（见 brpc docs/cn/http_service.md
+    //   的 Restful URL 一节）。而 `/api/v1/rooms/*` 会与 `/api/v1/rooms/join`、
+    //   `/api/v1/rooms/input` 这类固定子路径产生歧义，因此 room_id 与 match_id
+    //   改走**查询参数**。这不是偏好问题，是框架约束，与 TASK-007 取消匹配
+    //   路径的调整性质相同；docs/05-api-and-data.md 第 2 节已同步修正。
     const std::string mappings =
         "/api/v1/login => Login,"
         "/api/v1/players/me => GetCurrentPlayer,"
         "/api/v1/logout => Logout,"
         "/api/v1/matches => EnqueueMatch,"
         "/api/v1/matches/current => GetMatchStatus,"
-        "/api/v1/matches/current/cancel => CancelMatch";
+        "/api/v1/matches/current/cancel => CancelMatch,"
+        "/api/v1/rooms/join => JoinRoom,"
+        "/api/v1/rooms/input => SubmitInput,"
+        "/api/v1/rooms/state => GetRoomState,"
+        "/api/v1/results => GetMatchResult";
 
     brpc::ServiceOptions service_options;
     service_options.restful_mappings = mappings;
@@ -161,6 +187,8 @@ int main(int argc, char* argv[]) {
                 FLAGS_mysql_database.c_str(), mysql_ok ? "可用" : "当前不可用，登录将返回 503");
     std::printf("  Match(匹配): %s:%d (%s)\n", FLAGS_match_host.c_str(), FLAGS_match_port,
                 match->IsHealthy() ? "已配置" : "地址不合法");
+    std::printf("  Room(房间): %s:%d (%s)\n", FLAGS_room_host.c_str(), FLAGS_room_port,
+                room->IsHealthy() ? "已配置" : "地址不合法");
     std::printf("  Key 前缀: %s:gateway:\n", env_prefix.c_str());
     std::printf("  进程号: %d\n", static_cast<int>(::getpid()));
     std::fflush(stdout);

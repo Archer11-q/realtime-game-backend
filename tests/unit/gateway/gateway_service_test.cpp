@@ -16,6 +16,7 @@
 #include "error.hpp"
 #include "match_client.hpp"
 #include "player_directory.hpp"
+#include "room_client.hpp"
 #include "session_store.hpp"
 
 namespace {
@@ -24,9 +25,15 @@ using rgbt::gateway::CredentialStatus;
 using rgbt::gateway::GatewayServiceImpl;
 using rgbt::gateway::MatchCallStatus;
 using rgbt::gateway::MatchClient;
+using rgbt::gateway::MatchResultView;
 using rgbt::gateway::MatchSnapshot;
 using rgbt::gateway::MatchState;
 using rgbt::gateway::PlayerDirectory;
+using rgbt::gateway::RoomCallStatus;
+using rgbt::gateway::RoomClient;
+using rgbt::gateway::RoomPlayerSnapshot;
+using rgbt::gateway::RoomSnapshot;
+using rgbt::gateway::RoomState;
 using rgbt::gateway::SessionRecord;
 using rgbt::gateway::SessionStore;
 using rgbt::gateway::StoreStatus;
@@ -37,12 +44,20 @@ using rgbt::gateway::v1::EnqueueMatchResponse;
 using rgbt::gateway::v1::ErrorCode;
 using rgbt::gateway::v1::GetCurrentPlayerRequest;
 using rgbt::gateway::v1::GetCurrentPlayerResponse;
+using rgbt::gateway::v1::GetMatchResultRequest;
+using rgbt::gateway::v1::GetMatchResultResponse;
 using rgbt::gateway::v1::GetMatchStatusRequest;
 using rgbt::gateway::v1::GetMatchStatusResponse;
+using rgbt::gateway::v1::GetRoomStateRequest;
+using rgbt::gateway::v1::GetRoomStateResponse;
+using rgbt::gateway::v1::JoinRoomRequest;
+using rgbt::gateway::v1::JoinRoomResponse;
 using rgbt::gateway::v1::LoginRequest;
 using rgbt::gateway::v1::LoginResponse;
 using rgbt::gateway::v1::LogoutRequest;
 using rgbt::gateway::v1::LogoutResponse;
+using rgbt::gateway::v1::SubmitInputRequest;
+using rgbt::gateway::v1::SubmitInputResponse;
 
 /// 内存会话存储，行为对齐 Redis 实现的语义（含 request_id 幂等）。
 class FakeSessionStore : public SessionStore {
@@ -161,14 +176,79 @@ public:
     [[nodiscard]] bool IsHealthy() override { return true; }
 };
 
+/// 内存房间客户端。
+///
+/// 与 FakeMatchClient 同样的目的：让「Room 不可用」「对局已结束」「结果尚未落库」
+/// 这些依赖错误可以在单元测试里稳定复现，而不必停掉一个进程或制造 MySQL 故障。
+class FakeRoomClient : public RoomClient {
+public:
+    RoomCallStatus next_status = RoomCallStatus::kOk;
+    RoomSnapshot snapshot;
+
+    /// GetResult 返回的视图。
+    MatchResultView result_view;
+
+    /// 记录最近一次调用传入的参数，用于验证「player_id 来自会话」「room_id 被透传」。
+    std::string last_room_id;
+    std::string last_player_id;
+    std::string last_match_id;
+    int join_calls = 0;
+    int submit_calls = 0;
+    int state_calls = 0;
+    int result_calls = 0;
+
+    RoomCallStatus Join(const std::string& room_id, const std::string& player_id,
+                        RoomSnapshot* out_snapshot) override {
+        ++join_calls;
+        last_room_id = room_id;
+        last_player_id = player_id;
+        if (out_snapshot != nullptr) {
+            *out_snapshot = snapshot;
+        }
+        return next_status;
+    }
+
+    RoomCallStatus SubmitAttack(const std::string& room_id, const std::string& player_id,
+                                RoomSnapshot* out_snapshot) override {
+        ++submit_calls;
+        last_room_id = room_id;
+        last_player_id = player_id;
+        if (out_snapshot != nullptr) {
+            *out_snapshot = snapshot;
+        }
+        return next_status;
+    }
+
+    RoomCallStatus GetState(const std::string& room_id, RoomSnapshot* out_snapshot) override {
+        ++state_calls;
+        last_room_id = room_id;
+        if (out_snapshot != nullptr) {
+            *out_snapshot = snapshot;
+        }
+        return next_status;
+    }
+
+    RoomCallStatus GetResult(const std::string& match_id, MatchResultView* out_view) override {
+        ++result_calls;
+        last_match_id = match_id;
+        if (out_view != nullptr) {
+            *out_view = result_view;
+        }
+        return next_status;
+    }
+
+    [[nodiscard]] bool IsHealthy() override { return true; }
+};
+
 /// 测试夹具：构造服务与依赖。
 class GatewayServiceTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // PlayerDirectory 与 MatchClient 都是接口，需要以指针持有。
-        // 两者都使用不访问外部依赖的实现，因此这些用例不需要 Redis/MySQL/Match。
+        // PlayerDirectory、MatchClient 与 RoomClient 都是接口，需要以指针持有。
+        // 三者都使用不访问外部依赖的实现，因此这些用例不需要 Redis/MySQL/Match/Room。
         players_ = PlayerDirectory::WithBuiltinTestAccounts();
-        service_ = std::make_unique<GatewayServiceImpl>(&sessions_, players_.get(), &match_);
+        service_ =
+            std::make_unique<GatewayServiceImpl>(&sessions_, players_.get(), &match_, &room_);
     }
 
     /// 构造一个只填写必填字段的合法登录请求。
@@ -192,6 +272,7 @@ protected:
 
     FakeSessionStore sessions_;
     FakeMatchClient match_;
+    FakeRoomClient room_;
     std::unique_ptr<PlayerDirectory> players_;
     std::unique_ptr<GatewayServiceImpl> service_;
 };
@@ -790,6 +871,221 @@ TEST_F(GatewayServiceTest, MatchEndpointsReturn503WhenSessionStoreIsDown) {
     EXPECT_EQ(response.status_code(), 503);
     EXPECT_EQ(response.error().reason(), "session_store_unavailable");
     EXPECT_EQ(match_.enqueue_calls, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 房间与对局结果（TASK-008）
+// ---------------------------------------------------------------------------
+
+/// 构造一个双方都在房间内、处于 PLAYING 的快照。
+RoomSnapshot PlayingSnapshot() {
+    RoomSnapshot snapshot;
+    snapshot.room_id = "r-1";
+    snapshot.match_id = "m-1";
+    snapshot.state = RoomState::kPlaying;
+    snapshot.frame = 3;
+    snapshot.started_at_ms = 1000;
+
+    RoomPlayerSnapshot first;
+    first.player_id = "p-0001";
+    first.hp = 100;
+    first.connected = true;
+    RoomPlayerSnapshot second;
+    second.player_id = "p-0002";
+    second.hp = 70;
+    second.connected = true;
+    snapshot.players = {first, second};
+    return snapshot;
+}
+
+TEST_F(GatewayServiceTest, JoinRoomRequiresToken) {
+    JoinRoomRequest request;
+    request.set_room_id("r-1");
+    JoinRoomResponse response;
+    service_->JoinRoom(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 400);
+    EXPECT_EQ(response.error().reason(), "token_required");
+    EXPECT_EQ(room_.join_calls, 0);
+}
+
+TEST_F(GatewayServiceTest, JoinRoomRequiresRoomId) {
+    const std::string token = LoginAlice();
+
+    JoinRoomRequest request;
+    request.set_token(token);
+    JoinRoomResponse response;
+    service_->JoinRoom(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 400);
+    EXPECT_EQ(response.error().reason(), "room_id_required");
+    EXPECT_EQ(room_.join_calls, 0);
+}
+
+TEST_F(GatewayServiceTest, JoinRoomUsesPlayerIdFromSession) {
+    const std::string token = LoginAlice();
+    room_.snapshot = PlayingSnapshot();
+
+    JoinRoomRequest request;
+    request.set_token(token);
+    request.set_room_id("r-1");
+    JoinRoomResponse response;
+    service_->JoinRoom(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 200) << response.error().message();
+    // player_id 必须来自会话，绝不能来自请求体——否则任何登录用户都能替别人进房。
+    EXPECT_EQ(room_.last_player_id, "p-0001");
+    EXPECT_EQ(room_.last_room_id, "r-1");
+    EXPECT_EQ(response.room().state(), "playing");
+    ASSERT_EQ(response.room().players_size(), 2);
+    EXPECT_EQ(response.room().players(1).hp(), 70);
+}
+
+TEST_F(GatewayServiceTest, JoinRoomUnavailableReturns503) {
+    const std::string token = LoginAlice();
+    room_.next_status = RoomCallStatus::kUnavailable;
+
+    JoinRoomRequest request;
+    request.set_token(token);
+    request.set_room_id("r-1");
+    JoinRoomResponse response;
+    service_->JoinRoom(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 503);
+    EXPECT_EQ(response.error().reason(), "room_unavailable");
+}
+
+TEST_F(GatewayServiceTest, JoinRoomNotFoundReturns404) {
+    const std::string token = LoginAlice();
+    room_.next_status = RoomCallStatus::kNotFound;
+
+    JoinRoomRequest request;
+    request.set_token(token);
+    request.set_room_id("r-gone");
+    JoinRoomResponse response;
+    service_->JoinRoom(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 404);
+    EXPECT_EQ(response.error().reason(), "room_not_found");
+}
+
+TEST_F(GatewayServiceTest, SubmitInputUsesPlayerIdFromSession) {
+    const std::string token = LoginAlice();
+    room_.snapshot = PlayingSnapshot();
+
+    SubmitInputRequest request;
+    request.set_token(token);
+    request.set_room_id("r-1");
+    SubmitInputResponse response;
+    service_->SubmitInput(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 200) << response.error().message();
+    EXPECT_EQ(room_.last_player_id, "p-0001");
+    EXPECT_EQ(room_.submit_calls, 1);
+}
+
+TEST_F(GatewayServiceTest, SubmitInputAfterFinishReturns409) {
+    const std::string token = LoginAlice();
+    room_.next_status = RoomCallStatus::kAlreadyFinished;
+
+    SubmitInputRequest request;
+    request.set_token(token);
+    request.set_room_id("r-1");
+    SubmitInputResponse response;
+    service_->SubmitInput(nullptr, &request, &response, nullptr);
+
+    // 409 而不是 400：请求格式没问题，是当前状态不允许这个操作。
+    EXPECT_EQ(response.status_code(), 409);
+    EXPECT_EQ(response.error().reason(), "room_already_finished");
+}
+
+TEST_F(GatewayServiceTest, GetRoomStateReturnsSnapshot) {
+    const std::string token = LoginAlice();
+    room_.snapshot = PlayingSnapshot();
+
+    GetRoomStateRequest request;
+    request.set_token(token);
+    request.set_room_id("r-1");
+    GetRoomStateResponse response;
+    service_->GetRoomState(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 200) << response.error().message();
+    EXPECT_EQ(response.room().room_id(), "r-1");
+    EXPECT_EQ(response.room().match_id(), "m-1");
+    EXPECT_EQ(response.room().frame(), 3);
+}
+
+TEST_F(GatewayServiceTest, GetMatchResultReturnsResult) {
+    const std::string token = LoginAlice();
+    room_.result_view.has_result = true;
+    room_.result_view.result.match_id = "m-1";
+    room_.result_view.result.room_id = "r-1";
+    room_.result_view.result.winner_id = "p-0001";
+    room_.result_view.result.player_count = 2;
+    room_.result_view.result.started_at_ms = 1000;
+    room_.result_view.result.finished_at_ms = 61000;
+
+    GetMatchResultRequest request;
+    request.set_token(token);
+    request.set_match_id("m-1");
+    GetMatchResultResponse response;
+    service_->GetMatchResult(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 200) << response.error().message();
+    EXPECT_EQ(response.result().winner_id(), "p-0001");
+    EXPECT_EQ(response.result().player_count(), 2);
+}
+
+TEST_F(GatewayServiceTest, GetMatchResultPendingReturns503Not404) {
+    const std::string token = LoginAlice();
+    room_.next_status = RoomCallStatus::kResultPending;
+    room_.result_view.has_room = true;
+    room_.result_view.room = PlayingSnapshot();
+
+    GetMatchResultRequest request;
+    request.set_token(token);
+    request.set_match_id("m-1");
+    GetMatchResultResponse response;
+    service_->GetMatchResult(nullptr, &request, &response, nullptr);
+
+    // 结果**存在**，只是还没落库。返回 404 会让客户端以为这局没有结果。
+    EXPECT_EQ(response.status_code(), 503);
+    EXPECT_EQ(response.error().reason(), "result_pending");
+    // result 必须留空：调用方不得据此推断胜负。
+    EXPECT_FALSE(response.has_result());
+    // 但房间快照要给出，便于判断对局是否已结束。
+    EXPECT_TRUE(response.has_room());
+}
+
+TEST_F(GatewayServiceTest, GetMatchResultStoreDownReturnsStoreReason) {
+    const std::string token = LoginAlice();
+    room_.next_status = RoomCallStatus::kStoreUnavailable;
+
+    GetMatchResultRequest request;
+    request.set_token(token);
+    request.set_match_id("m-1");
+    GetMatchResultResponse response;
+    service_->GetMatchResult(nullptr, &request, &response, nullptr);
+
+    // 与 room_unavailable 分开：排障时「哪个依赖挂了」是第一个要回答的问题。
+    EXPECT_EQ(response.status_code(), 503);
+    EXPECT_EQ(response.error().reason(), "result_store_unavailable");
+}
+
+TEST_F(GatewayServiceTest, RoomEndpointsReturn503WhenSessionStoreIsDown) {
+    const std::string token = LoginAlice();
+    sessions_.unavailable = true;
+
+    // 会话存储不可用时，鉴权阶段就应该失败，且不应触碰 Room。
+    GetRoomStateRequest request;
+    request.set_token(token);
+    request.set_room_id("r-1");
+    GetRoomStateResponse response;
+    service_->GetRoomState(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 503);
+    EXPECT_EQ(response.error().reason(), "session_store_unavailable");
+    EXPECT_EQ(room_.state_calls, 0);
 }
 
 }  // namespace

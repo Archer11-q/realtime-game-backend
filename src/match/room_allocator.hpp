@@ -1,25 +1,25 @@
 /// @file room_allocator.hpp
-/// @brief 房间分配接口与 Phase 1 的占位实现。
+/// @brief 房间分配接口。
 ///
 /// 为什么需要这个接口（TASK-007 决策 3 选 A）：
 ///   匹配成功后，同一局的玩家必须拿到**同一个 room_id**，否则客户端无法进入同一
-///   房间。但 Room/Battle Service 属 TASK-008，其契约（room.proto）应由拥有房间的
-///   那个任务来定型。若在 TASK-007 里提前定义 room.proto，TASK-008 就被迫迁就一个
-///   在没有房间语义的情况下拍出来的接口。
+///   房间。TASK-007 期间 Room/Battle Service 尚不存在，因此只抽象「拿到一个房间号」
+///   这一件事，用一个不产生任何房间状态的占位实现。
 ///
-/// 因此这里只抽象「拿到一个房间号」这一件事：
-///   * Phase 1（本文件）：DerivedRoomAllocator，由 match_id 派生 room_id，
-///     只保证同一局的双方拿到同一个号，**不产生任何房间状态**。
-///   * TASK-008：替换为调用 Room Service 的实现，并在那里引入 room.proto。
+/// TASK-008 起：真实实现为 BrpcRoomAllocator（见 brpc_room_allocator.hpp），
+/// 它调用 RoomService.CreateRoom。**接口因此增加了 player_ids 参数**——房间需要
+/// 知道本局都有谁，才能校验加入者的身份；只传 match_id 的话，Room 无法判断
+/// 谁是这一局的人。
 ///
-/// 这个接口刻意保持最小：只有一个方法，且失败用空字符串表达而不是抛异常或返回
-/// 复杂错误码——因为 Phase 1 的占位实现不可能失败，多余的错误类型是未经验证的抽象。
+/// 失败用空字符串表达而不是抛异常或返回复杂错误码：调用方的处理方式只有一种
+/// ——「这次配对不成立，把玩家放回队列」。多余的错误类型是未经验证的抽象。
 
 #ifndef RGBT_MATCH_ROOM_ALLOCATOR_HPP
 #define RGBT_MATCH_ROOM_ALLOCATOR_HPP
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace rgbt::match {
 
@@ -34,19 +34,26 @@ public:
     virtual ~RoomAllocator() = default;
 
     /// @brief 为一次匹配结果分配房间号。
-    /// @param match_id 已生成的匹配 ID。占位实现由它派生 room_id；真实实现会把它
-    ///        交给 Room Service 作为幂等键，保证重复分配得到同一个房间。
+    /// @param match_id 已生成的匹配 ID。实现应把它交给 Room Service 作为**幂等键**，
+    ///        保证重复分配得到同一个房间。
+    /// @param player_ids 本局玩家。Room 据此建立成员名单。
     /// @return 房间号；无法分配时返回空字符串，调用方按失败处理。
-    [[nodiscard]] virtual std::string Allocate(std::string_view match_id) = 0;
+    ///
+    /// **调用约定**：本方法会发起网络调用，调用方**不得在持有自己的锁时调用它**，
+    /// 否则一次对端超时会把整个匹配队列卡住。
+    [[nodiscard]] virtual std::string Allocate(std::string_view match_id,
+                                               const std::vector<std::string>& player_ids) = 0;
 };
 
-/// @brief Phase 1 占位实现：由 match_id 直接派生 room_id。
+/// @brief 占位实现：由 match_id 直接派生 room_id。
 ///
 /// 规则：`room_id = "room-" + match_id`。因为 match_id 一局一个，同一局的双方自然
-/// 得到同一个 room_id。**这个号目前不代表任何真实房间**，TASK-008 会替换本实现。
+/// 得到同一个 room_id。**这个号不代表任何真实房间**，只用于不关心房间的测试。
+/// 生产路径使用 BrpcRoomAllocator。
 class DerivedRoomAllocator final : public RoomAllocator {
 public:
-    [[nodiscard]] std::string Allocate(std::string_view match_id) override;
+    [[nodiscard]] std::string Allocate(std::string_view match_id,
+                                       const std::vector<std::string>& player_ids) override;
 };
 
 }  // namespace rgbt::match

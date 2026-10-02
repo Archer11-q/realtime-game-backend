@@ -92,6 +92,32 @@ Match Service      Room/Battle Service
 - 全局匹配策略。
 - 玩家长期档案。
 
+#### 房间生命周期（TASK-008 落地）
+
+```text
+CREATED ──► WAITING ──► PLAYING ──► FINISHING ──► FINISHED ──► CLOSED
+   │           │            │
+   └───────────┴────────────┴──► ABORTED ──► CLOSED
+```
+
+- `FINISHING` 是**必须存在的独立状态**：已分出胜负但结果尚未落库。写入失败时房间
+  停在此状态并按固定间隔重试，查询接口返回 `result_pending`（503），
+  **不会**返回内存里的胜负。这样进程崩溃后客户端不会拿到一个查不到的结论。
+- `ABORTED`：等待玩家加入超时等异常终止。**不写** `match_results`——
+  写一行 winner 为空的记录等于把「没打成」伪装成「打平了」。
+- `CLOSED` 不是显式状态：房间在结束后保留一段固定时长（供客户端轮询领取结果），
+  到期由 Room 自己的 tick 回收；回收后历史对局仍可从 MySQL 查询。
+
+#### 对局规则（TASK-008 决策 A，数值定义在 `src/room/room_types.hpp`）
+
+- 两人一局，与 Match 的 FIFO 两人配对一致。
+- 服务端按 10 Hz 推进权威状态；客户端只提交输入，不参与判定。
+- 输入只有「攻击」。**每个玩家每帧最多结算一次**：伤害按帧结算，允许同帧多次
+  会变成「谁点得快谁赢」，那是延迟决定胜负，不是对局规则。
+- 一方 HP 归零则该方落败；达到最大帧数时 HP 高者胜，相同为平局。
+- 单次 tick 最多推进固定帧数，超出的部分丢弃。进程被挂起后的补偿会造成 CPU 尖峰，
+  而这段时间的输入本来也已失去意义。
+
 ### 已取消的服务（不实现）
 
 以下服务**不实现**，见 [ADR-0003](adr/0003-scope-reduction.md)。
@@ -122,22 +148,27 @@ Match Service      Room/Battle Service
   -> Gateway 发起匹配（HTTP）
   -> Gateway 从会话取出 player_id，调用 MatchService.EnqueueMatch
   -> Match 入队并尝试配对（FIFO，两人一局）
-  -> 匹配成功，分配 room_id
+  -> 配对成立后，Match 在**锁外**调用 RoomService.CreateRoom
+  -> Room 以 match_id 为幂等键创建房间，返回 room_id
   -> Gateway 返回当前状态；客户端轮询 /api/v1/matches/current 领取结果
-  -> 玩家通过 WebSocket 进入房间
+  -> 玩家通过 HTTP 加入房间（WebSocket 属 TASK-009）
 ```
 
-Phase 1 的落地差异（TASK-007 记录，避免把计划当成已实现）：
+落地情况（TASK-008 更新，避免把计划当成已实现）：
 
-- 「Match 请求 Room 创建房间」这一步**尚未发生**。Room/Battle Service 属 TASK-008，
-  因此匹配成功只分配一个 `room_id`（由 `match_id` 派生），不产生任何房间状态。
-  接口已抽象为 `RoomAllocator`，TASK-008 替换实现即可。
-- 「通知玩家」当前用**轮询**实现，WebSocket 推送属 TASK-009。轮询接口在
+- **「Match 请求 Room 创建房间」已经发生**（TASK-008）。`RoomAllocator` 的真实实现
+  `BrpcRoomAllocator` 调用 `RoomService.CreateRoom`，以 `match_id` 为幂等键。
+- **分配在队列锁之外**：配对拆成「锁内取人并标记分配中 → 锁外 brpc 调用 →
+  锁内提交」三步。持锁调用远程会让一次对端超时卡住整个队列。
+  分配失败时玩家退回队首，而不是被标记为超时——Room 不可用不是玩家的错。
+- 「通知玩家」仍用**轮询**实现，WebSocket 推送属 TASK-009。轮询接口在
   WebSocket 落地后仍作为兜底保留。
 - 配对规则只有 FIFO 两人一局，**没有分差放宽**：当前没有任何分数体系，
   先实现等于把未验证的评分模型固化进契约。
 
 ### 4.3 对战
+
+目标形态（WebSocket 落地后）：
 
 ```text
 浏览器输入
@@ -145,9 +176,25 @@ Phase 1 的落地差异（TASK-007 记录，避免把计划当成已实现）：
   -> Room 校验输入并推进逻辑帧
   -> Room 广播状态或帧数据
   -> Gateway 推送至房间内玩家
-  -> 结算条件满足
+  -> 结束条件满足
   -> Room 同步幂等写入对局结果（不走消息队列）
 ```
+
+**TASK-008 的实际形态**（WebSocket 属 TASK-009，因此这里用 HTTP 轮询）：
+
+```text
+浏览器轮询 /api/v1/rooms/state?room_id=...
+  -> Gateway 鉴权后转发 RoomService.GetRoomState
+  -> Room 返回权威快照（帧号、双方 HP、状态）
+浏览器提交输入 POST /api/v1/rooms/input
+  -> Gateway 从会话取 player_id，转发 RoomService.SubmitInput
+  -> Room 记录本帧攻击，在下一个 tick 结算
+Room 自己的推进线程每 50 ms 调用一次 RoomManager::Tick
+  -> 服务端权威推进，客户端不参与判定
+```
+
+关键点：**推进不依赖客户端请求**。房间的帧推进由 Room 进程自己的定时线程驱动，
+否则「双方都不请求」就会让对局永远停在原地。
 
 ### 4.4 断线重连
 

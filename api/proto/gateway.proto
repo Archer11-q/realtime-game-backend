@@ -36,6 +36,7 @@ message PlayerInfo {
 //   UNAVAILABLE        依赖暂时失败，可有限重试
 //   INTERNAL           未分类内部错误
 //   RESOURCE_EXHAUSTED 限流，退避后重试（TASK-007 新增：匹配队列已满）
+//   CONFLICT           状态冲突，操作在当前状态下不被接受（TASK-008 新增：对局已结束）
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   INVALID_ARGUMENT = 1;
@@ -44,6 +45,7 @@ enum ErrorCode {
   UNAVAILABLE = 4;
   INTERNAL = 5;
   RESOURCE_EXHAUSTED = 6;
+  CONFLICT = 7;
 }
 
 // 统一错误体。
@@ -207,6 +209,119 @@ message CancelMatchResponse {
 }
 
 // ---------------------------------------------------------------------------
+// 房间与对局结果（TASK-008）
+// ---------------------------------------------------------------------------
+//
+// Gateway 自己不保存房间状态：它把请求转给 Room/Battle Service
+// （契约见 api/proto/room.proto），把结果整理后返回。
+//
+// 路径说明：文档原写 `GET /api/v1/rooms/{room_id}`，但实测确认 **brpc 的 restful
+// 映射不支持 `{name}` 路径参数**，只支持 `*` 通配符；而 `/api/v1/rooms/*` 会与
+// `/api/v1/rooms/join`、`/api/v1/rooms/input` 这类固定子路径产生歧义。
+// 因此 room_id 与 match_id 改走**查询参数**。这是框架约束，不是偏好。
+//
+// 错误语义：
+//   * Room 不可用            -> 503 UNAVAILABLE，reason = room_unavailable
+//   * 房间/结果不存在         -> 404 NOT_FOUND
+//   * 对局已结束              -> 409 CONFLICT，reason = room_already_finished
+//   * 已结束但结果尚未落库     -> 503 UNAVAILABLE，reason = result_pending（可稍后重试）
+//   * 玩家标识                -> 一律取自会话，忽略请求体，避免冒名加入或代打
+
+// 玩家在对局中的权威状态。
+message RoomPlayerInfo {
+  string player_id = 1;
+  int32 hp = 2;
+  bool connected = 3;
+}
+
+// 房间权威状态快照。state 取值：
+// created / waiting / playing / finishing / finished / aborted。
+// finish_reason 取值：none / hp_zero / timeout / aborted。
+message RoomStateInfo {
+  string room_id = 1;
+  string match_id = 2;
+  string state = 3;
+  int64 frame = 4;
+  repeated RoomPlayerInfo players = 5;
+  string finish_reason = 6;
+
+  // 胜者 player_id。平局或未结束时为空。**空字符串表示平局**，与「没有结果」不同。
+  string winner_id = 7;
+
+  int64 started_at_ms = 8;
+  int64 finished_at_ms = 9;
+}
+
+message JoinRoomRequest {
+  string token = 1;
+  string request_id = 2;
+
+  // 要加入的房间。必须来自匹配结果，不能由客户端随意构造后当成有效房间使用：
+  // Room 会校验调用者是否是这一局的成员。
+  string room_id = 3;
+}
+
+message JoinRoomResponse {
+  int32 status_code = 1;
+  RoomStateInfo room = 2;
+  Error error = 3;
+}
+
+message SubmitInputRequest {
+  string token = 1;
+  string request_id = 2;
+  string room_id = 3;
+}
+
+message SubmitInputResponse {
+  int32 status_code = 1;
+
+  // 提交后的房间快照。调用方据此更新血量显示，不必再查一次。
+  RoomStateInfo room = 2;
+  Error error = 3;
+}
+
+message GetRoomStateRequest {
+  string token = 1;
+  string request_id = 2;
+  string room_id = 3;
+}
+
+message GetRoomStateResponse {
+  int32 status_code = 1;
+  RoomStateInfo room = 2;
+  Error error = 3;
+}
+
+// 对局结果。与 MySQL 的 match_results 表一一对应。
+message MatchResultInfo {
+  string match_id = 1;
+  string room_id = 2;
+  string winner_id = 3;
+  int32 player_count = 4;
+  int64 started_at_ms = 5;
+  int64 finished_at_ms = 6;
+}
+
+message GetMatchResultRequest {
+  string token = 1;
+  string request_id = 2;
+  string match_id = 3;
+}
+
+message GetMatchResultResponse {
+  int32 status_code = 1;
+
+  // 结果已落库时有效。reason = result_pending 时本字段为空，调用方不得据此推断胜负。
+  MatchResultInfo result = 2;
+
+  // 结果尚未落库时，Room 会一并返回房间快照，便于判断对局是否已结束。
+  RoomStateInfo room = 3;
+
+  Error error = 4;
+}
+
+// ---------------------------------------------------------------------------
 // 服务定义
 // ---------------------------------------------------------------------------
 
@@ -237,4 +352,22 @@ service GatewayService {
   // 映射按**路径**分派，不支持按 HTTP 方法分派，因此取消与查询不能共用同一路径。
   // docs/05-api-and-data.md 第 2 节的接口表已同步修正。
   rpc CancelMatch(CancelMatchRequest) returns (CancelMatchResponse);
+
+  // 加入房间。重复加入按幂等成功处理。
+  // HTTP: POST /api/v1/rooms/join
+  rpc JoinRoom(JoinRoomRequest) returns (JoinRoomResponse);
+
+  // 提交一次攻击输入。
+  // HTTP: POST /api/v1/rooms/input
+  // 说明：TASK-009 落地 WebSocket 后，本接口与房间状态轮询一起作为兜底保留
+  // （与匹配的轮询接口同一考虑）。
+  rpc SubmitInput(SubmitInputRequest) returns (SubmitInputResponse);
+
+  // 查询房间权威状态。客户端轮询本接口获取对局进展。
+  // HTTP: GET /api/v1/rooms/state?room_id=...
+  rpc GetRoomState(GetRoomStateRequest) returns (GetRoomStateResponse);
+
+  // 查询对局结果。结果尚未落库时返回 503 result_pending，而不是空结果。
+  // HTTP: GET /api/v1/results?match_id=...
+  rpc GetMatchResult(GetMatchResultRequest) returns (GetMatchResultResponse);
 }

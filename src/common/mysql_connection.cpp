@@ -1,18 +1,27 @@
-#include "mysql_connection.hpp"
+#include "common/mysql_connection.hpp"
 
 // mysql.h 内部已经包含 mariadb_stmt.h（预处理语句与 MYSQL_BIND 的定义都在那里），
 // 因此这里只包含 mysql.h；重复包含会触发类型重定义错误。
-#include <mysql/mysql.h>
+//
+// 为什么写 <mysql.h> 而不是 <mysql/mysql.h>：vcpkg 的 unofficial::libmariadb 把
+// `${prefix}/include/mysql` 作为 INTERFACE_INCLUDE_DIRECTORIES 暴露出来（见
+// share/unofficial-libmariadb/unofficial-libmariadb-targets.cmake），因此正确的
+// 引用形式就是 <mysql.h>。
+//
+// 该模块原先在 src/gateway/ 时写的是 <mysql/mysql.h>，能编过是因为 gateway 同时
+// 链接了 brpc/protobuf，那些包额外把 `${prefix}/include` 加进了搜索路径——属于
+// 靠传递依赖碰巧成立。移到公共目录后不再享有这个副作用，因此修正为正确写法。
+#include <mysql.h>
 
 #include <array>
 #include <cstdio>
 #include <utility>
 
-namespace rgbt::gateway {
+namespace rgbt::common {
 namespace {
 
-/// 预处理语句的参数个数上限。当前查询最多 1 个参数，留出余量。
-constexpr unsigned int kMaxBindParams = 4;
+/// 预处理语句的参数个数上限。Room 写 match_results 时需要 6 个参数。
+constexpr unsigned int kMaxBindParams = 8;
 
 /// 一行结果允许的最大列数。players 与 match_results 都不超过 10 列。
 constexpr unsigned int kMaxResultColumns = 16;
@@ -275,4 +284,4 @@ bool MysqlConnection::Query(const std::string& sql, const std::vector<std::strin
     return false;
 }
 
-}  // namespace rgbt::gateway
+}  // namespace rgbt::common
