@@ -80,12 +80,30 @@ void MysqlConnection::Disconnect() {
 }
 
 bool MysqlConnection::EnsureConnected() {
-    if (connection_ != nullptr && mysql_ping(connection_) == 0) {
-        return true;
-    }
-    // 连接不可用（或尚未建立）：关闭后重建。
+    // 已有连接就直接用，**不做 mysql_ping 预检**。
+    //
+    // 为什么去掉预检（TASK-014 实测，有 gdb 栈为证）：
+    //   在**一次成功的预处理查询之后**再调用 mysql_ping，会让进程 abort：
+    //
+    //     OPENSSL_die("refcount error")        <- libmariadb 内嵌 OpenSSL
+    //     SSL_CTX_free <- SSL_free <- ma_tls_close
+    //     <- ma_pvio_close <- end_server <- ma_net_safe_read <- mysql_ping
+    //
+    //   即 mysql_ping 的读失败后关闭 TLS 连接时，libmariadb 与 OpenSSL 之间
+    //   的引用计数对不上，直接 abort。这是 libmariadb 3.4.8 + vcpkg OpenSSL
+    //   在「先查后 ping」这个顺序下的问题，不是本项目的代码错误。
+    //
+    //   触发它需要"成功查询 → ping"这个顺序。本项目原有代码从不产生这个顺序
+    //   （探活只在启动时做一次，那时还没有查询），是 TASK-014 的
+    //   `RoomManager::Restore` 先读快照、紧接着启动探活才把它暴露出来。
+    //
+    // 去掉预检不会降低可靠性：连接失效时 `QueryOnce` 会在
+    // `mysql_stmt_prepare` / `mysql_stmt_execute` 上拿到 2002/2003/2006/2013，
+    //   `IsConnectionLostError` 把它们判为"连接已失效"，`Query` 随即换一条
+    //   新连接重试一次。这条路径本来就是为依赖恢复设计的，比 ping 更贴近真实
+    //   使用（它检验的是"能不能真的执行语句"，而不只是"套接字还在不在"）。
     if (connection_ != nullptr) {
-        Disconnect();
+        return true;
     }
 
     connection_ = mysql_init(nullptr);
@@ -125,7 +143,18 @@ bool MysqlConnection::EnsureConnected() {
 }
 
 bool MysqlConnection::Ping() {
-    return EnsureConnected();
+    // 探活走**与真实查询完全相同**的代码路径，而不是 mysql_ping。
+    //
+    // 两个理由：
+    //   1. `mysql_ping` 走 libmariadb 的旧协议路径，而本类所有业务查询都走预处理
+    //      接口。用一条路径探活、另一条路径干活，"探活通过"并不保证查询能成功。
+    //   2. 更要紧的是 `mysql_ping` 在本环境下会崩（原因见 EnsureConnected 的注释）。
+    //      与其在调用顺序上绕开它，不如根本不碰它。
+    //
+    // `Query` 内部已经包含"连接失效则换新连接重试一次"的逻辑，因此这里不需要
+    // 任何额外处理。
+    std::vector<SqlRow> rows;
+    return Query("SELECT 1", {}, &rows);
 }
 
 bool MysqlConnection::QueryOnce(const std::string& sql, const std::vector<std::string>& params,

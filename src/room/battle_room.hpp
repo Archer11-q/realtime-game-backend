@@ -76,6 +76,29 @@ public:
     BattleRoom& operator=(BattleRoom&&) = default;
     ~BattleRoom() = default;
 
+    /// @brief 从快照记录重建房间（TASK-014，进程重启后的恢复路径）。
+    ///
+    /// 前提：调用方已经用 `ValidateRoomSnapshot` 确认过这条记录可用。
+    /// 本函数只负责把状态装回去，不重复做合法性判断——两处都判会让
+    /// "到底谁说了算"变得含糊，而校验逻辑已经是一个可单独测试的纯函数。
+    ///
+    /// **时间基准的处理是本函数最关键的部分**：
+    ///   * PLAYING 房间的推进基准被重置为 `now_ms`，**不是** `snapshot_at_ms`。
+    ///     这意味着停机期间本应推进的帧被**丢弃**，而不是在启动瞬间一次性补上。
+    ///     理由与 `kMaxCatchUpFrames` 相同：补几百帧只会造成 CPU 尖峰，而那段
+    ///     时间的输入本来就已经失去意义。代价是"对局在墙钟上被拉长"——
+    ///     这是恢复边界的一部分，写在 docs/01-architecture.md 里。
+    ///   * CREATED / WAITING 的等待超时基准用 `snapshot_at_ms` **近似**。
+    ///     `rooms` 表没有 created_at_ms 这一列（TASK-013 的 schema 没有，
+    ///     而 TASK-014 不新增列），因此恢复后的等待超时最多比未中断的房间
+    ///     晚一个快照间隔。这是一个有上界的近似，不是不确定行为。
+    ///   * FINISHING 房间把下一次落库重试设为**立即到期**：结果已经在内存里
+    ///     消失过一次，没有必要再等一个完整的重试间隔。
+    ///
+    /// @return 记录不可用（例如玩家标识重复）时返回 nullopt。
+    [[nodiscard]] static std::optional<BattleRoom> RestoreFrom(const RoomSnapshotRecord& record,
+                                                               std::int64_t now_ms);
+
     [[nodiscard]] const std::string& room_id() const noexcept { return room_id_; }
     [[nodiscard]] const std::string& match_id() const noexcept { return match_id_; }
     [[nodiscard]] RoomPhase phase() const noexcept { return phase_; }
@@ -120,6 +143,13 @@ public:
     [[nodiscard]] bool ShouldRetryPersist(std::int64_t now_ms) const;
 
 private:
+    /// 只给 RestoreFrom 用的默认构造。
+    ///
+    /// 为什么放在 private：公开一个"什么都不填"的构造函数，就等于允许造出一个
+    /// 没有房间号、没有玩家、状态还是 CREATED 的空壳房间。那种对象一旦流出，
+    /// 出错的位置离原因就很远了。
+    BattleRoom() = default;
+
     /// 找到一个玩家的可变状态。找不到返回 nullptr。
     [[nodiscard]] PlayerSnapshot* FindPlayer(const std::string& player_id);
 

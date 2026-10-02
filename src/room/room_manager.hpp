@@ -26,14 +26,32 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "battle_room.hpp"
 #include "match_result_writer.hpp"
+#include "room_snapshot_reader.hpp"
 #include "room_snapshot_writer.hpp"
 #include "room_types.hpp"
 
 namespace rgbt::room {
+
+/// 启动恢复的结果统计。
+///
+/// 为什么要有一个结构而不是只打日志：启动日志会被后续输出冲掉，而
+/// 「这次到底恢复了几个房间、拒绝了几个」是排障时必须能一眼看到的事实。
+/// 验收脚本也靠它断言"确实发生了恢复"，而不是只看房间还能不能查到。
+struct RestoreReport {
+    /// 存储里扫描到的**未结束**快照行数。
+    std::size_t scanned = 0;
+    /// 成功重建的房间数。
+    std::size_t restored = 0;
+    /// 因快照损坏被拒绝、并已标记为 ABORTED 的数量。
+    std::size_t rejected = 0;
+    /// 存储不可用导致整体失败。此时一个房间也没有恢复。
+    bool load_failed = false;
+};
 
 /// 创建房间的结果。
 enum class CreateOutcome {
@@ -68,7 +86,10 @@ public:
     ///        下一次周期覆盖；对局结果写失败必须持续重试。见 room_snapshot_writer.hpp。
     /// @param room_id_factory 房间号生成器；默认使用随机 Token。
     ///        注入的目的只是让测试可得到确定结果，生产路径不需要自定义。
+    /// @param snapshot_reader 房间快照读取器（TASK-014）。可以为 nullptr
+    ///        （此时 Restore 什么也不做），用于不关心恢复的测试。
     explicit RoomManager(MatchResultWriter* writer, RoomSnapshotWriter* snapshot_writer = nullptr,
+                         RoomSnapshotReader* snapshot_reader = nullptr,
                          std::function<std::string()> room_id_factory = {});
 
     RoomManager(const RoomManager&) = delete;
@@ -109,6 +130,21 @@ public:
     [[nodiscard]] ResultOutcome GetResult(const std::string& match_id, std::int64_t now_ms,
                                           MatchResultRecord* out_record,
                                           RoomSnapshot* out_snapshot);
+
+    /// @brief 从存储恢复未结束的房间（TASK-014）。**在开始接受请求之前调用一次。**
+    ///
+    /// 行为：
+    ///   * 只恢复未结束的房间；已结束的没有恢复价值。
+    ///   * 快照损坏的房间**不静默丢弃**：记下原因，并把该行改写成 ABORTED，
+    ///     这样它在表里有一个明确的终态，而不是永远停在"看起来还在打"。
+    ///   * `FINISHING` 的房间恢复后**立即**纳入落库重试，不等一个完整间隔。
+    ///     这是 TASK-008 留下的已知限制（已结束但未落库的对局重启即丢失）的正解。
+    ///   * 存储不可用时不恢复任何房间，并如实报告 `load_failed`
+    ///     ——空手启动比"以为恢复了其实没有"安全。
+    ///
+    /// @param now_ms 恢复时刻。由调用方注入，理由与 Tick 相同：
+    ///        让"停机期间的帧被丢弃"这条边界能被单元测试精确验证。
+    [[nodiscard]] RestoreReport Restore(std::int64_t now_ms);
 
     /// @brief 推进所有房间，并处理结果落库与房间回收。由定时线程调用。
     void Tick(std::int64_t now_ms);
@@ -166,8 +202,18 @@ private:
     /// 把本轮到期的快照写入存储。**不持锁**。
     void FlushSnapshots(const std::vector<RoomSnapshotRecord>& records);
 
+    /// 把恢复时被拒绝的快照改写成 ABORTED 并落库。**不持锁**。
+    ///
+    /// 为什么要有这一步：如果只是记一条日志然后把行留在原地，表里那一行会永远
+    /// 停在 `playing`，下次启动又会被扫出来、又被拒绝——形成"每次启动都报同一个
+    /// 错"的噪音，而且事后核对时看不出这一局到底怎么了。
+    /// 日志也在这里打，而不是在持锁的扫描循环里打：持锁做 I/O 是本项目明确避免的。
+    void RejectSnapshots(const std::vector<std::pair<RoomSnapshotRecord, std::string>>& rejected,
+                         std::int64_t now_ms);
+
     MatchResultWriter* writer_;
     RoomSnapshotWriter* snapshot_writer_;
+    RoomSnapshotReader* snapshot_reader_;
     std::function<std::string()> room_id_factory_;
 
     mutable std::mutex mutex_;

@@ -137,14 +137,25 @@ for bin in "$room_bin" "$match_bin" "$gw_bin"; do
 done
 ok "三个可执行文件均存在"
 
-"$room_bin" -port "$room_port" -env_prefix dev \
-  -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
-  -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
-  -mysql_database "$MYSQL_DATABASE" >/tmp/room.out 2>&1 &
-room_pid=$!
-for _ in $(seq 1 30); do curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$room_port/health" && break; sleep 0.5; done
-curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$room_port/health" && ok "Room 就绪" ||
-  { fail "Room 未就绪"; cat /tmp/room.out; exit 1; }
+# 启动（或重启）Room。抽成函数是因为 TASK-014 的恢复验收要反复 kill -9 再拉起它。
+start_room() {
+  "$room_bin" -port "$room_port" -env_prefix dev \
+    -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
+    -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
+    -mysql_database "$MYSQL_DATABASE" >/tmp/room.out 2>&1 &
+  room_pid=$!
+  for _ in $(seq 1 30); do
+    curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$room_port/health" 2>/dev/null && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+if start_room; then
+  ok "Room 就绪"
+else
+  fail "Room 未就绪"; cat /tmp/room.out; exit 1
+fi
 
 "$match_bin" -match_port "$match_port" -match_timeout_seconds 30 -match_result_ttl_seconds 4 \
   -room_host 127.0.0.1 -room_port "$room_port" >/tmp/match.out 2>&1 &
@@ -384,8 +395,210 @@ else
 fi
 echo
 
-# ---------- 7. 优雅退出 ----------
-echo "===== 7. 优雅退出 ====="
+# ---------- 7. 重启恢复（TASK-014） ----------
+echo "===== 7. 重启恢复 ====="
+
+# 等两人回到 idle（上一局的结果保留期过去）。
+wait_idle() {
+  local s1 s2
+  for _ in $(seq 1 40); do
+    http_get /api/v1/matches/current "$alice_token" >/dev/null; s1=$(json_path match.state)
+    http_get /api/v1/matches/current "$bob_token" >/dev/null; s2=$(json_path match.state)
+    [ "$s1" = "idle" ] && [ "$s2" = "idle" ] && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# --- 7a. 对局进行中 kill -9 Room：房间仍在，且量出丢失了多少帧 ---
+wait_idle
+room3=$(open_playing_room)
+if [ -z "$room3" ]; then
+  fail "无法为恢复验收开出对局"
+else
+  http_get "/api/v1/rooms/state?room_id=$room3" "$alice_token" >/dev/null
+  match3=$(json_path room.match_id)
+  hp_before_p2=$(json_path room.players.1.hp)
+
+  # 让它多跑几帧，确保快照与实时状态之间确实存在差距（否则丢帧量恒为 0，
+  # 断言就退化成"什么都没验证"）。
+  sleep 3
+
+  # kill 之前的实时帧号。
+  frame_before=$(curl -s --max-time 5 -H "Authorization: Bearer $alice_token" \
+    "http://127.0.0.1:$gateway_port/api/v1/rooms/state?room_id=$room3" |
+    python3 -c "import json,sys; print(json.load(sys.stdin).get('room',{}).get('frame',-1))")
+  # 最后一次落库的帧号（= 恢复后应当回到的位置）。
+  frame_snapshot=$(sql_field frame "$match3")
+
+  kill -9 "$room_pid" 2>/dev/null || true
+  wait "$room_pid" 2>/dev/null
+  room_pid=""
+  ok "已 kill -9 Room（对局进行中，实时帧 $frame_before，最后快照帧 $frame_snapshot）"
+
+  code=$(http_get "/api/v1/rooms/state?room_id=$room3" "$alice_token")
+  if [ "$code" = "503" ]; then
+    ok "Room 停止期间查询返回 503（不是伪造成功）"
+  else
+    fail "Room 停止期间查询异常：HTTP $code"
+  fi
+
+  if start_room; then
+    ok "Room 已重启（进程号 $room_pid）"
+    sleep 1
+    code=$(http_get "/api/v1/rooms/state?room_id=$room3" "$alice_token")
+    if [ "$code" = "200" ] && [ "$(json_path room.state)" = "playing" ]; then
+      ok "重启后房间仍在且状态为 playing（room_id 未变）"
+    else
+      fail "重启后房间丢失或状态异常：HTTP $code state=$(json_path room.state)"
+    fi
+
+    frame_after=$(json_path room.frame)
+    hp_after_p2=$(json_path room.players.1.hp)
+    if [ "$hp_after_p2" = "$hp_before_p2" ]; then
+      ok "重启后血量与快照一致（p-0002 HP=$hp_after_p2）"
+    else
+      fail "重启后血量与快照不一致：kill 前 $hp_before_p2，恢复后 $hp_after_p2"
+    fi
+
+    # **实测的进度丢失量**：这是 TASK-014 要求必须给出的数字，Phase 4 会用它做基线。
+    frames_lost=$((frame_before - frame_after))
+    frames_lost_measured="$frames_lost"
+    if [ "$frames_lost" -ge 0 ] 2>/dev/null && [ "$frames_lost" -le 10 ]; then
+      ok "进度丢失量实测：$frames_lost 帧（约 $((frames_lost * 100)) 毫秒），上界 10 帧"
+    else
+      fail "进度丢失量超出预期：$frames_lost 帧（kill 前 $frame_before，恢复后 $frame_after）"
+    fi
+    # 恢复位置应当**等于最后一次快照**，而不是别的什么中间值。
+    if [ "$frame_after" = "$frame_snapshot" ]; then
+      ok "恢复位置精确等于最后一次快照帧（$frame_snapshot）"
+    else
+      fail "恢复位置不等于最后快照：恢复后 $frame_after，快照 $frame_snapshot"
+    fi
+
+    # 恢复后还能正常打完。
+    for attempt in $(seq 1 40); do
+      http_get "/api/v1/rooms/state?room_id=$room3" "$alice_token" >/dev/null
+      [ "$(json_path room.state)" != "playing" ] && break
+      http_post /api/v1/rooms/input \
+        "{\"token\":\"$alice_token\",\"request_id\":\"vp-recover-$attempt\",\"room_id\":\"$room3\"}" \
+        >/dev/null
+      sleep 0.25
+    done
+    sleep 2
+    if [ "$(sql_field state "$match3")" = "finished" ]; then
+      ok "恢复后的对局能打完并落终态"
+    else
+      fail "恢复后的对局未能打完：state=[$(sql_field state "$match3")]"
+    fi
+  else
+    fail "Room 重启失败"
+  fi
+fi
+echo
+
+# --- 7b. FINISHING 房间重启后仍能落库（TASK-008 的已知限制） ---
+echo "===== 7b. FINISHING 房间重启后仍能落库 ====="
+wait_idle
+docker stop rgbt-mysql >/dev/null 2>&1 && ok "MySQL 已停止" || fail "无法停止 MySQL"
+
+room4=$(open_playing_room)
+if [ -z "$room4" ]; then
+  fail "无法为 FINISHING 验收开出对局"
+else
+  http_get "/api/v1/rooms/state?room_id=$room4" "$alice_token" >/dev/null
+  match4=$(json_path room.match_id)
+  for attempt in $(seq 1 40); do
+    http_get "/api/v1/rooms/state?room_id=$room4" "$alice_token" >/dev/null
+    [ "$(json_path room.state)" != "playing" ] && break
+    http_post /api/v1/rooms/input \
+      "{\"token\":\"$alice_token\",\"request_id\":\"vp-finishing-$attempt\",\"room_id\":\"$room4\"}" \
+      >/dev/null
+    sleep 0.25
+  done
+  http_get "/api/v1/rooms/state?room_id=$room4" "$alice_token" >/dev/null
+  if [ "$(json_path room.state)" = "finishing" ]; then
+    ok "MySQL 停机使对局停在 finishing（结果尚未落库）"
+  else
+    fail "对局状态异常：$(json_path room.state)（期望 finishing）"
+  fi
+
+  kill -9 "$room_pid" 2>/dev/null || true
+  wait "$room_pid" 2>/dev/null
+  room_pid=""
+  if start_room; then
+    ok "Room 在 MySQL 仍停机时重启成功"
+    http_get "/api/v1/rooms/state?room_id=$room4" "$alice_token" >/dev/null
+    if [ "$(json_path room.state)" = "finishing" ]; then
+      ok "FINISHING 房间被恢复（没有被当成已结束而丢弃）"
+    else
+      fail "FINISHING 房间恢复失败：$(json_path room.state)"
+    fi
+
+    docker start rgbt-mysql >/dev/null 2>&1 && ok "MySQL 已重启" || fail "无法重启 MySQL"
+    for _ in $(seq 1 60); do
+      [ "$(docker inspect -f '{{.State.Health.Status}}' rgbt-mysql 2>/dev/null)" = "healthy" ] && break
+      sleep 2
+    done
+    recovered=0
+    for _ in $(seq 1 30); do
+      if docker exec rgbt-mysql mysql -N -B -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" \
+        -e "SELECT 1 FROM match_results WHERE match_id='$match4';" 2>/dev/null | grep -q 1; then
+        recovered=1
+        break
+      fi
+      sleep 1
+    done
+    if [ "$recovered" -eq 1 ]; then
+      ok "重启后的 FINISHING 房间把结果补写进了 match_results（TASK-008 的限制已解除）"
+    else
+      fail "重启后 30 秒内结果仍未落库，match_id=$match4"
+    fi
+  else
+    fail "Room 重启失败"
+  fi
+fi
+echo
+
+# --- 7c. 损坏快照被标记 ABORTED，不静默丢弃 ---
+echo "===== 7c. 损坏快照被标记 ABORTED ====="
+# 直接塞一条越界血量的行：它会被 ValidateRoomSnapshot 拒绝。
+docker exec rgbt-mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -e "
+INSERT INTO rooms (match_id, room_id, state, frame,
+  p1_id, p1_hp, p1_joined, p2_id, p2_hp, p2_joined,
+  winner_id, finish_reason, started_at_ms, finished_at_ms, snapshot_at_ms)
+VALUES ('m-corrupt-1', 'r-corrupt-1', 'playing', 5,
+  'p-0001', 999, 1, 'p-0002', 100, 1,
+  NULL, 'none', 0, 0, 1000)
+ON DUPLICATE KEY UPDATE snapshot_at_ms = 1000;" >/dev/null 2>&1 &&
+  ok "已写入一条损坏快照（p1_hp=999，超出 [0,100]）" || fail "无法写入损坏快照"
+
+kill -9 "$room_pid" 2>/dev/null || true
+wait "$room_pid" 2>/dev/null
+room_pid=""
+if start_room; then
+  ok "Room 已重启"
+  # 启动日志必须说明拒绝了什么、为什么——这是"不静默丢弃"的可观测证据。
+  if grep -q '房间快照不可用，标记为 ABORTED' /tmp/room.out; then
+    ok "启动日志记录了拒绝原因"
+  else
+    fail "启动日志没有记录拒绝原因"
+  fi
+  if [ "$(sql_field state m-corrupt-1)" = "aborted" ]; then
+    ok "损坏快照已被改写为 aborted（不会每次启动都被重新扫出来）"
+  else
+    fail "损坏快照未被改写：state=[$(sql_field state m-corrupt-1)]"
+  fi
+else
+  fail "Room 重启失败"
+fi
+# 清理这条测试数据，避免污染后续运行。
+docker exec rgbt-mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" \
+  -e "DELETE FROM rooms WHERE match_id='m-corrupt-1';" >/dev/null 2>&1 || true
+echo
+
+# ---------- 8. 优雅退出 ----------
+echo "===== 8. 优雅退出 ====="
 for pair in "Gateway:$gateway_pid" "Match:$match_pid" "Room:$room_pid"; do
   name="${pair%%:*}"; pid="${pair#*:}"
   [ -z "$pid" ] && continue
@@ -405,13 +618,16 @@ echo
 # ---------- 结果 ----------
 echo "===== 验收结果 ====="
 if [ "${#failures[@]}" -eq 0 ]; then
-  echo "验收通过：迁移 005 幂等且 rooms 表结构符合预期；房间创建后立刻落快照；"
+  echo "验收通过："
+  echo "  [写入路径，TASK-013] 迁移 005 幂等且 rooms 表结构符合预期；房间创建后立刻落快照；"
   echo "          对局中 frame 与血量随服务端推进更新，且快照不超前于实时状态；"
   echo "          结束后落终态（finished / winner / finish_reason）；"
   echo "          MySQL 停机期间对局继续推进并能打完，恢复后快照自动继续"
+  echo "  [恢复路径，TASK-014] 对局进行中 kill -9 Room 后重启，房间仍在、血量与快照一致、"
+  echo "          恢复位置精确等于最后一次快照；FINISHING 房间重启后仍能落库；"
+  echo "          损坏快照被标记 ABORTED 并记录原因，不静默丢弃"
   echo
-  echo "本任务只覆盖**写入路径**。读取路径（启动时从快照恢复）属 TASK-014，"
-  echo "届时会往本脚本追加「重启恢复」一节。"
+  echo "  实测进度丢失量：${frames_lost_measured:-未取到} 帧"
   exit 0
 fi
 
