@@ -148,12 +148,16 @@ TEST(DatabasePlayerDirectoryTest, ReturnsUnavailableWhenReaderFails) {
 
 TEST(DatabasePlayerDirectoryTest, AccountInDatabaseWithoutTestCredentialIsRejected) {
     FakePlayerReader reader;
-    // 档案里有 dave，但代码中没有它的测试凭据：属于配置不一致，按凭据无效处理。
-    reader.Add(MakeRecord("dave", "p-0004", "Dave", "active"));
+    // 档案里有 erin，但代码中没有它的测试凭据：属于配置不一致，按凭据无效处理。
+    //
+    // 刻意不用 dave：dave 从 2026-10-02 起是**真实存在的第三个测试身份**
+    // （见 src/gateway/test_credentials.cpp），用它就构造不出「档案有、凭据没有」
+    // 这个场景了。erin 是纯粹的虚构账号，只用于本用例。
+    reader.Add(MakeRecord("erin", "p-0005", "Erin", "active"));
     DatabasePlayerDirectory directory(&reader);
 
     PlayerInfo player;
-    EXPECT_EQ(directory.Authenticate("dave", "any_password", &player),
+    EXPECT_EQ(directory.Authenticate("erin", "any_password", &player),
               CredentialStatus::kInvalidCredential);
 }
 

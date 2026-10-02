@@ -79,6 +79,31 @@ std::string ExtractToken(::google::protobuf::RpcController* controller,
     return {};
 }
 
+/// 从 query string 中取一个参数。
+///
+/// 与 ExtractToken 同样的理由：brpc 只把 HTTP body（JSON）映射到 protobuf 字段，
+/// **query string 不会被映射进任何字段**。TASK-008 的房间与结果接口把 room_id /
+/// match_id 放在查询参数里（因为 brpc 的 restful 映射不支持 `{name}` 路径参数，
+/// 而 `*` 通配又会与 /rooms/join 这类固定子路径冲突），因此必须在这里显式读取，
+/// 否则请求里的同名字段永远是空字符串，表现为「所有查询都报 xxx_required」。
+///
+/// 取值顺序与 ExtractToken 一致：请求体优先（纯 RPC 调用），其次 query string。
+/// 无 HTTP 上下文时（单元测试直接调用服务）只使用请求体字段。
+std::string ExtractQueryParam(::google::protobuf::RpcController* controller, const char* name,
+                              const std::string& body_value) {
+    if (!body_value.empty()) {
+        return body_value;
+    }
+    auto* cntl = static_cast<brpc::Controller*>(controller);
+    if (cntl == nullptr || !cntl->has_http_request()) {
+        return {};
+    }
+    if (const std::string* value = cntl->http_request().uri().GetQuery(name); value != nullptr) {
+        return *value;
+    }
+    return {};
+}
+
 /// 校验登录请求的输入。返回空字符串表示通过，否则返回失败原因。
 std::string ValidateLoginRequest(const rgbt::gateway::v1::LoginRequest& request) {
     if (request.account().empty()) {
@@ -139,10 +164,12 @@ std::string MatchStateName(MatchState state) {
 }  // namespace
 
 GatewayServiceImpl::GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* players,
-                                       MatchClient* match, std::int32_t session_ttl_seconds)
+                                       MatchClient* match, RoomClient* room,
+                                       std::int32_t session_ttl_seconds)
     : sessions_(sessions),
       players_(players),
       match_(match),
+      room_(room),
       session_ttl_seconds_(session_ttl_seconds > 0 ? session_ttl_seconds
                                                    : kDefaultSessionTtlSeconds) {}
 
@@ -369,6 +396,98 @@ std::int32_t GatewayServiceImpl::HandleMatchFailure(MatchCallStatus status,
                      request_id);
 }
 
+namespace {
+
+/// 房间状态的稳定字符串表示。与 api/proto/gateway.proto 的 RoomStateInfo.state 一致。
+const char* RoomStateName(RoomState state) {
+    switch (state) {
+        case RoomState::kWaiting:
+            return "waiting";
+        case RoomState::kPlaying:
+            return "playing";
+        case RoomState::kFinishing:
+            return "finishing";
+        case RoomState::kFinished:
+            return "finished";
+        case RoomState::kAborted:
+            return "aborted";
+        case RoomState::kCreated:
+        default:
+            return "created";
+    }
+}
+
+}  // namespace
+
+void GatewayServiceImpl::FillRoomState(const RoomSnapshot& snapshot,
+                                       rgbt::gateway::v1::RoomStateInfo* out) {
+    if (out == nullptr) {
+        return;
+    }
+    out->set_room_id(snapshot.room_id);
+    out->set_match_id(snapshot.match_id);
+    out->set_state(RoomStateName(snapshot.state));
+    out->set_frame(snapshot.frame);
+    out->set_finish_reason(snapshot.finish_reason);
+    out->set_winner_id(snapshot.winner_id);
+    out->set_started_at_ms(snapshot.started_at_ms);
+    out->set_finished_at_ms(snapshot.finished_at_ms);
+
+    for (const RoomPlayerSnapshot& player : snapshot.players) {
+        rgbt::gateway::v1::RoomPlayerInfo* item = out->add_players();
+        item->set_player_id(player.player_id);
+        item->set_hp(player.hp);
+        item->set_connected(player.connected);
+    }
+}
+
+std::int32_t GatewayServiceImpl::HandleRoomFailure(RoomCallStatus status,
+                                                   const std::string& request_id,
+                                                   rgbt::gateway::v1::Error* error,
+                                                   const char* not_found_reason) {
+    switch (status) {
+        case RoomCallStatus::kOk:
+            return 200;
+        case RoomCallStatus::kUnavailable:
+            // 对端未启动、超时或连接失败。503 而不是 500：这是依赖不可用，
+            // 恢复后无需重启 Gateway 即可继续。
+            return FillError(error, ErrorCode::UNAVAILABLE, "room_unavailable",
+                             "房间服务暂时不可用，请稍后重试", request_id);
+        case RoomCallStatus::kStoreUnavailable:
+            // Room 在，但它的存储（MySQL）不可用。与 room_unavailable 分开：
+            // 排障时「哪个依赖挂了」是第一个要回答的问题。
+            return FillError(error, ErrorCode::UNAVAILABLE, "result_store_unavailable",
+                             "对局结果存储暂时不可用，请稍后重试", request_id);
+        case RoomCallStatus::kResultPending:
+            // 已分出胜负但结果尚未落库。503 而不是 404：结果**存在**，只是还查不到，
+            // 调用方稍后重试即可。返回 404 会让客户端以为这局没有结果。
+            return FillError(error, ErrorCode::UNAVAILABLE, "result_pending",
+                             "对局已结束，结果仍在写入，请稍后重试", request_id);
+        case RoomCallStatus::kNotFound:
+            return FillError(error, ErrorCode::NOT_FOUND, not_found_reason, "房间或对局结果不存在",
+                             request_id);
+        case RoomCallStatus::kAlreadyFinished:
+            return FillError(error, ErrorCode::CONFLICT, "room_already_finished",
+                             "对局已结束，不再接受该操作", request_id);
+        case RoomCallStatus::kInvalidArgument:
+            return FillError(error, ErrorCode::INVALID_ARGUMENT, "room_invalid_argument",
+                             "房间请求参数不合法", request_id);
+        case RoomCallStatus::kNotAMember:
+            // 与 room_invalid_argument 分开：房间确实存在，只是这个玩家不在名单里。
+            // 合并成一个 reason 会让排障时无法区分「请求写错了」和「走错房间了」。
+            return FillError(error, ErrorCode::INVALID_ARGUMENT, "not_a_member",
+                             "该玩家不是这一局的成员", request_id);
+        case RoomCallStatus::kNotPlaying:
+            return FillError(error, ErrorCode::INVALID_ARGUMENT, "room_not_playing",
+                             "对局尚未开始，此时不能提交输入", request_id);
+        case RoomCallStatus::kInternal:
+            return FillError(error, ErrorCode::INTERNAL, "room_internal", "房间服务返回未分类错误",
+                             request_id);
+    }
+    return FillError(error, ErrorCode::INTERNAL, "room_internal", "房间服务返回未知结果",
+                     request_id);
+}
+
 void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* controller,
                                       const rgbt::gateway::v1::EnqueueMatchRequest* request,
                                       rgbt::gateway::v1::EnqueueMatchResponse* response,
@@ -471,6 +590,234 @@ void GatewayServiceImpl::CancelMatch(::google::protobuf::RpcController* controll
     response->set_status_code(200);
     ApplyHttpStatus(controller, 200);
     FillMatchStatus(snapshot, response->mutable_match());
+}
+
+void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
+                                  const rgbt::gateway::v1::JoinRoomRequest* request,
+                                  rgbt::gateway::v1::JoinRoomResponse* response,
+                                  ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    const std::string token = ExtractToken(controller, request->token());
+    const std::string request_id = request->request_id();
+    const std::string room_id = ExtractQueryParam(controller, "room_id", request->room_id());
+
+    std::string player_id;
+    rgbt::gateway::v1::Error error;
+    const std::int32_t auth = ResolvePlayerId(token, request_id, &player_id, &error);
+    if (auth != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(auth);
+        ApplyHttpStatus(controller, auth);
+        return;
+    }
+
+    if (room_id.empty()) {
+        const std::int32_t status =
+            FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
+                      "缺少 room_id", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    if (room_ == nullptr) {
+        const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
+                                              "room_unavailable", "房间服务未配置", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    RoomSnapshot snapshot;
+    const RoomCallStatus call = room_->Join(room_id, player_id, &snapshot);
+    const std::int32_t status = HandleRoomFailure(call, request_id, &error);
+    if (status != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    response->set_status_code(200);
+    ApplyHttpStatus(controller, 200);
+    FillRoomState(snapshot, response->mutable_room());
+}
+
+void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controller,
+                                     const rgbt::gateway::v1::SubmitInputRequest* request,
+                                     rgbt::gateway::v1::SubmitInputResponse* response,
+                                     ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    const std::string token = ExtractToken(controller, request->token());
+    const std::string request_id = request->request_id();
+    const std::string room_id = ExtractQueryParam(controller, "room_id", request->room_id());
+
+    std::string player_id;
+    rgbt::gateway::v1::Error error;
+    const std::int32_t auth = ResolvePlayerId(token, request_id, &player_id, &error);
+    if (auth != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(auth);
+        ApplyHttpStatus(controller, auth);
+        return;
+    }
+
+    if (room_id.empty()) {
+        const std::int32_t status =
+            FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
+                      "缺少 room_id", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    if (room_ == nullptr) {
+        const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
+                                              "room_unavailable", "房间服务未配置", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    RoomSnapshot snapshot;
+    // player_id 来自会话，请求体里即使带同名字段也会被忽略：
+    // 否则任何登录用户都能替别人提交输入。
+    const RoomCallStatus call = room_->SubmitAttack(room_id, player_id, &snapshot);
+    const std::int32_t status = HandleRoomFailure(call, request_id, &error);
+    if (status != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    response->set_status_code(200);
+    ApplyHttpStatus(controller, 200);
+    FillRoomState(snapshot, response->mutable_room());
+}
+
+void GatewayServiceImpl::GetRoomState(::google::protobuf::RpcController* controller,
+                                      const rgbt::gateway::v1::GetRoomStateRequest* request,
+                                      rgbt::gateway::v1::GetRoomStateResponse* response,
+                                      ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    const std::string token = ExtractToken(controller, request->token());
+    const std::string request_id = request->request_id();
+    const std::string room_id = ExtractQueryParam(controller, "room_id", request->room_id());
+
+    std::string player_id;
+    rgbt::gateway::v1::Error error;
+    const std::int32_t auth = ResolvePlayerId(token, request_id, &player_id, &error);
+    if (auth != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(auth);
+        ApplyHttpStatus(controller, auth);
+        return;
+    }
+    // 这里只校验身份，不使用 player_id：房间快照对同局玩家是共享信息，
+    // 而「谁能看这个房间」的判定在 Room 侧（非成员无法加入，因此也拿不到匹配结果）。
+    (void)player_id;
+
+    if (room_id.empty()) {
+        const std::int32_t status =
+            FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
+                      "缺少 room_id", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    if (room_ == nullptr) {
+        const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
+                                              "room_unavailable", "房间服务未配置", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    RoomSnapshot snapshot;
+    const RoomCallStatus call = room_->GetState(room_id, &snapshot);
+    const std::int32_t status = HandleRoomFailure(call, request_id, &error);
+    if (status != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    response->set_status_code(200);
+    ApplyHttpStatus(controller, 200);
+    FillRoomState(snapshot, response->mutable_room());
+}
+
+void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* controller,
+                                        const rgbt::gateway::v1::GetMatchResultRequest* request,
+                                        rgbt::gateway::v1::GetMatchResultResponse* response,
+                                        ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    const std::string token = ExtractToken(controller, request->token());
+    const std::string request_id = request->request_id();
+    const std::string match_id = ExtractQueryParam(controller, "match_id", request->match_id());
+
+    std::string player_id;
+    rgbt::gateway::v1::Error error;
+    const std::int32_t auth = ResolvePlayerId(token, request_id, &player_id, &error);
+    if (auth != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(auth);
+        ApplyHttpStatus(controller, auth);
+        return;
+    }
+    (void)player_id;
+
+    if (match_id.empty()) {
+        const std::int32_t status =
+            FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "match_id_required",
+                      "缺少 match_id", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    if (room_ == nullptr) {
+        const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
+                                              "room_unavailable", "房间服务未配置", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    MatchResultView view;
+    const RoomCallStatus call = room_->GetResult(match_id, &view);
+    const std::int32_t status = HandleRoomFailure(call, request_id, &error, "result_not_found");
+
+    // 房间快照在成功与「结果待落库」两种情况下都可能存在，先填上。
+    if (view.has_room) {
+        FillRoomState(view.room, response->mutable_room());
+    }
+
+    if (status != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    response->set_status_code(200);
+    ApplyHttpStatus(controller, 200);
+    if (view.has_result) {
+        rgbt::gateway::v1::MatchResultInfo* result = response->mutable_result();
+        result->set_match_id(view.result.match_id);
+        result->set_room_id(view.result.room_id);
+        result->set_winner_id(view.result.winner_id);
+        result->set_player_count(view.result.player_count);
+        result->set_started_at_ms(view.result.started_at_ms);
+        result->set_finished_at_ms(view.result.finished_at_ms);
+    }
 }
 
 bool GatewayServiceImpl::DependenciesHealthy() {

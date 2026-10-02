@@ -9,19 +9,19 @@
 #include <string>
 #include <string_view>
 
-#include "mysql_connection.hpp"
+#include "common/mysql_connection.hpp"
 #include "player_reader.hpp"
 
 namespace rgbt::gateway {
 
 /// 只读玩家档案。
 ///
-/// 只提供读取方法，没有写入方法——这是刻意的：本表在 Phase 1 期间由 Gateway
-/// 只读，写入由迁移脚本负责（见 ADR-0002）。
+/// 只提供读取方法，没有写入方法——这是刻意的：players 表由 Gateway 拥有且当前
+/// 只读，写入由迁移脚本负责（见 ADR-0002 与 ADR-0003）。
 class MysqlPlayerReader : public PlayerReader {
 public:
     /// 不接管 connection 的所有权，调用方需保证其生命周期覆盖本对象。
-    explicit MysqlPlayerReader(MysqlConnection* connection);
+    explicit MysqlPlayerReader(rgbt::common::MysqlConnection* connection);
 
     ReaderStatus FindByAccount(std::string_view account,
                                std::optional<PlayerRecord>* out_record) override;
@@ -37,7 +37,7 @@ private:
     ReaderStatus QueryOne(const std::string& sql, std::string_view param,
                           std::optional<PlayerRecord>* out_record);
 
-    MysqlConnection* connection_;
+    rgbt::common::MysqlConnection* connection_;
 };
 
 }  // namespace rgbt::gateway

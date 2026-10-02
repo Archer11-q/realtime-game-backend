@@ -29,9 +29,13 @@ class FakeRoomAllocator : public RoomAllocator {
 public:
     bool fail = false;
     int allocate_calls = 0;
+    /// 最近一次分配收到的玩家列表。用于验证 Match 把完整成员名单交给了 Room。
+    std::vector<std::string> last_player_ids;
 
-    std::string Allocate(std::string_view match_id) override {
+    std::string Allocate(std::string_view match_id,
+                         const std::vector<std::string>& player_ids) override {
         ++allocate_calls;
+        last_player_ids = player_ids;
         if (fail || match_id.empty()) {
             return {};
         }
@@ -308,16 +312,91 @@ TEST_F(MatchQueueTest, UnknownPlayerIsIdle) {
 // 房间分配失败
 // ---------------------------------------------------------------------------
 
-TEST_F(MatchQueueTest, AllocatorFailureMarksPlayersAsTimedOut) {
+TEST_F(MatchQueueTest, AllocatorFailureReturnsPlayersToQueue) {
     allocator_.fail = true;
     queue_->Enqueue("p-0001", "req-1", kT0);
     queue_->Enqueue("p-0002", "req-2", kT0);
 
-    // 分配不出房间号时不能让玩家无限期留在队列里：标记为超时，
-    // 客户端据此提示「重新匹配」。
-    EXPECT_EQ(queue_->GetStatus("p-0001", kT0).state, MatchStatusSnapshot::State::kTimeout);
-    EXPECT_EQ(queue_->GetStatus("p-0002", kT0).state, MatchStatusSnapshot::State::kTimeout);
-    EXPECT_EQ(queue_->QueueSize(), 0U);
+    // 分配不出房间号时**不把玩家判为超时**：Room 不可用不是玩家的错，
+    // 把他们标记为超时会强迫所有人重新排队。正确行为是退回队列等下一次配对。
+    EXPECT_EQ(queue_->GetStatus("p-0001", kT0).state, MatchStatusSnapshot::State::kQueued);
+    EXPECT_EQ(queue_->GetStatus("p-0002", kT0).state, MatchStatusSnapshot::State::kQueued);
+    EXPECT_EQ(queue_->QueueSize(), 2U);
+    EXPECT_EQ(queue_->AllocatingCount(), 0U);
+
+    // Room 恢复后，下一次入队应当把这两人配成同一局。
+    allocator_.fail = false;
+    queue_->Enqueue("p-0003", "req-3", kT0);
+    EXPECT_EQ(queue_->GetStatus("p-0001", kT0).state, MatchStatusSnapshot::State::kMatched);
+    EXPECT_EQ(queue_->GetStatus("p-0002", kT0).state, MatchStatusSnapshot::State::kMatched);
+}
+
+TEST_F(MatchQueueTest, AllocatorReceivesFullPlayerList) {
+    queue_->Enqueue("p-0001", "req-1", kT0);
+    queue_->Enqueue("p-0002", "req-2", kT0);
+
+    // Room 需要知道这一局都有谁，才能校验加入者的身份。
+    ASSERT_EQ(allocator_.last_player_ids.size(), 2U);
+    EXPECT_EQ(allocator_.last_player_ids[0], "p-0001");
+    EXPECT_EQ(allocator_.last_player_ids[1], "p-0002");
+}
+
+TEST_F(MatchQueueTest, FailedPairingIsRetriedOnNextStatusQuery) {
+    // 这条覆盖 Room 重启后的真实窗口：brpc channel 惰性重连，第一次分配必然失败。
+    // 若不做惰性重试，退回队列的玩家要等到下一个新玩家入队才可能被配上。
+    allocator_.fail = true;
+    queue_->Enqueue("p-0001", "req-1", kT0);
+    queue_->Enqueue("p-0002", "req-2", kT0);
+    EXPECT_EQ(queue_->GetStatus("p-0001", kT0).state, MatchStatusSnapshot::State::kQueued);
+
+    // Room 恢复。客户端下一次轮询应当顺带完成配对，玩家不需要重新入队。
+    allocator_.fail = false;
+    const MatchStatusSnapshot before = queue_->GetStatus("p-0001", kT0 + 100);
+    // 本次返回的是重试之前的快照：新事实从下一次轮询开始可见。
+    EXPECT_EQ(before.state, MatchStatusSnapshot::State::kQueued);
+
+    const MatchStatusSnapshot after = queue_->GetStatus("p-0001", kT0 + 200);
+    EXPECT_EQ(after.state, MatchStatusSnapshot::State::kMatched);
+    EXPECT_EQ(after.room_id, "room-m-fixed");
+    EXPECT_EQ(queue_->GetStatus("p-0002", kT0 + 200).state, MatchStatusSnapshot::State::kMatched);
+}
+
+TEST_F(MatchQueueTest, NoRemoteCallWhenNothingToRetry) {
+    // 重试是惰性的，但不能变成「每次查询都发一次 RPC」。
+    queue_->Enqueue("p-0001", "req-1", kT0);
+    const int before = allocator_.allocate_calls;
+    for (int i = 0; i < 5; ++i) {
+        queue_->GetStatus("p-0001", kT0 + 10 * (i + 1));
+    }
+    EXPECT_EQ(allocator_.allocate_calls, before);
+}
+
+TEST_F(MatchQueueTest, CancelDuringAllocationAbandonsTheMatch) {
+    // 模拟「分配期间玩家点了取消」：用一个在 Allocate 内部回调的分配器，
+    // 这样取消发生在分配进行中，正好覆盖那条竞态路径。
+    class CancellingAllocator : public RoomAllocator {
+    public:
+        MatchQueue* queue = nullptr;
+        std::string Allocate(std::string_view match_id,
+                             const std::vector<std::string>& /*player_ids*/) override {
+            // 分配期间取消 p-0002。
+            queue->Cancel("p-0002", kT0);
+            return "room-" + std::string(match_id);
+        }
+    };
+
+    CancellingAllocator allocator;
+    MatchQueue queue(&allocator, []() { return std::string("m-fixed"); }, 1000, 5000);
+    allocator.queue = &queue;
+
+    queue.Enqueue("p-0001", "req-1", kT0);
+    queue.Enqueue("p-0002", "req-2", kT0);
+
+    // 取消的人不该被塞进对局，也不该残留记录。
+    EXPECT_EQ(queue.GetStatus("p-0002", kT0).state, MatchStatusSnapshot::State::kIdle);
+    // 未取消的人退回队列重新配对，而不是被判为超时。
+    EXPECT_EQ(queue.GetStatus("p-0001", kT0).state, MatchStatusSnapshot::State::kQueued);
+    EXPECT_EQ(queue.QueueSize(), 1U);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,8 +405,9 @@ TEST_F(MatchQueueTest, AllocatorFailureMarksPlayersAsTimedOut) {
 
 TEST(DerivedRoomAllocatorTest, SameMatchIdYieldsSameRoomId) {
     DerivedRoomAllocator allocator;
-    const std::string first = allocator.Allocate("m-abc");
-    const std::string second = allocator.Allocate("m-abc");
+    const std::vector<std::string> players = {"p-0001", "p-0002"};
+    const std::string first = allocator.Allocate("m-abc", players);
+    const std::string second = allocator.Allocate("m-abc", players);
 
     // 幂等：同一个 match_id 必须得到同一个 room_id，否则同局双方会进入不同房间。
     EXPECT_EQ(first, second);
@@ -336,12 +416,13 @@ TEST(DerivedRoomAllocatorTest, SameMatchIdYieldsSameRoomId) {
 
 TEST(DerivedRoomAllocatorTest, DifferentMatchIdsYieldDifferentRoomIds) {
     DerivedRoomAllocator allocator;
-    EXPECT_NE(allocator.Allocate("m-abc"), allocator.Allocate("m-def"));
+    const std::vector<std::string> players = {"p-0001", "p-0002"};
+    EXPECT_NE(allocator.Allocate("m-abc", players), allocator.Allocate("m-def", players));
 }
 
 TEST(DerivedRoomAllocatorTest, EmptyMatchIdIsRejected) {
     DerivedRoomAllocator allocator;
-    EXPECT_TRUE(allocator.Allocate("").empty());
+    EXPECT_TRUE(allocator.Allocate("", {"p-0001", "p-0002"}).empty());
 }
 
 }  // namespace

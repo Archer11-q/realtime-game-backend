@@ -14,13 +14,23 @@
 --   alice / p-0001 / active
 --   bob   / p-0002 / active
 --   carol / p-0003 / disabled   —— 刻意保留一个禁用账号，用于覆盖失败路径
+--   dave  / p-0004 / active     —— 第三个启用身份
+--
+-- 为什么需要 dave（2026-10-02 补上）：
+--   有两条不变量需要**三个启用身份**才能在端到端层面覆盖，
+--   而此前只有 alice 与 bob 两个：
+--     * 匹配：第三个玩家不会被并入一个已配满的局
+--     * 房间：非本局成员无法加入（不是这一局的人，即使房间还有空位也进不去）
+--   此前这两条只能靠单元测试覆盖，端到端脚本里显式打印为「未覆盖项」。
+--   是否新增第三个启用身份在 docs/devlog.md 里记为待项目所有者决定，本文件是结论。
 --
 -- 幂等：重复执行只更新展示名与状态，不产生重复行，也不会覆盖 player_id。
 
 INSERT INTO players (player_id, account, display_name, status)
 VALUES ('p-0001', 'alice', 'Alice', 'active'),
        ('p-0002', 'bob', 'Bob', 'active'),
-       ('p-0003', 'carol', 'Carol', 'disabled')
+       ('p-0003', 'carol', 'Carol', 'disabled'),
+       ('p-0004', 'dave', 'Dave', 'active')
 ON DUPLICATE KEY UPDATE display_name = VALUES(display_name), status = VALUES(status);
 
 INSERT INTO schema_migrations (version, description)

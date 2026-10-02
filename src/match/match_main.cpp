@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <memory>
 
+#include "brpc_room_allocator.hpp"
 #include "common/version.hpp"
 #include "match_queue.hpp"
 #include "match_service.hpp"
@@ -34,6 +35,10 @@ DEFINE_int32(match_port, 8082, "Match Service 监听端口");
 DEFINE_int32(match_timeout_seconds, 30, "排队超时（秒），超过后被惰性淘汰");
 DEFINE_int32(match_result_ttl_seconds, 120, "匹配结果保留时长（秒），供客户端轮询领取");
 DEFINE_int32(match_max_queue_size, 1000, "匹配队列长度上限，超过后拒绝新请求");
+// Room/Battle Service 地址。TASK-008 起匹配成功后由 Match 调用它创建房间。
+DEFINE_string(room_host, "127.0.0.1", "Room/Battle Service 主机");
+DEFINE_int32(room_port, 8083, "Room/Battle Service 端口");
+DEFINE_int32(room_timeout_ms, 500, "调用 Room/Battle Service 的超时（毫秒）");
 DEFINE_int32(idle_timeout_s, -1, "连接空闲超时（秒），-1 表示不超时");
 
 namespace {
@@ -49,9 +54,19 @@ void HandleSignal(int /*sig*/) {
 int main(int argc, char* argv[]) {
     google::ParseCommandLineFlags(&argc, &argv, true);
 
-    // 房间分配：Phase 1 用占位实现，只保证同一局的双方拿到同一个 room_id，
-    // 不产生任何房间状态。TASK-008 落地 Room Service 后替换这里即可。
-    rgbt::match::DerivedRoomAllocator room_allocator;
+    // 房间分配：TASK-008 起调用真实的 Room/Battle Service。
+    //
+    // 分配发生在**匹配队列的锁之外**（见 match_queue.hpp 的第三条设计决定）：
+    // 一次 brpc 超时不应该把整个队列卡住。
+    //
+    // 分配失败时 MatchQueue 会把玩家退回队首，因此 Room 不可用表现为
+    // 「暂时匹配不上」，而不是「玩家被莫名其妙判为超时」。
+    rgbt::match::RoomAllocatorOptions room_options;
+    room_options.host = FLAGS_room_host;
+    room_options.port = FLAGS_room_port;
+    room_options.timeout_ms = FLAGS_room_timeout_ms;
+    rgbt::match::BrpcRoomAllocator room_allocator(room_options);
+
     rgbt::match::MatchQueue queue(&room_allocator, {}, FLAGS_match_timeout_seconds * 1000LL,
                                   FLAGS_match_result_ttl_seconds * 1000LL,
                                   static_cast<std::size_t>(FLAGS_match_max_queue_size));
@@ -80,7 +95,9 @@ int main(int argc, char* argv[]) {
     std::printf("  队列: 进程内存，两人一局，超时 %d 秒，结果保留 %d 秒，上限 %d\n",
                 FLAGS_match_timeout_seconds, FLAGS_match_result_ttl_seconds,
                 FLAGS_match_max_queue_size);
-    std::printf("  房间分配: 占位实现（room_id 由 match_id 派生，无房间状态）\n");
+    std::printf("  房间分配: Room/Battle Service %s:%d (%s)，超时 %d ms\n", FLAGS_room_host.c_str(),
+                FLAGS_room_port, room_allocator.IsHealthy() ? "已配置" : "地址不合法",
+                FLAGS_room_timeout_ms);
     std::printf("  进程号: %d\n", static_cast<int>(::getpid()));
     std::fflush(stdout);
 

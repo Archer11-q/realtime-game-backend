@@ -15,7 +15,8 @@ constexpr const char* kSelectByPlayerId =
 
 }  // namespace
 
-MysqlPlayerReader::MysqlPlayerReader(MysqlConnection* connection) : connection_(connection) {}
+MysqlPlayerReader::MysqlPlayerReader(rgbt::common::MysqlConnection* connection)
+    : connection_(connection) {}
 
 ReaderStatus MysqlPlayerReader::QueryOne(const std::string& sql, std::string_view param,
                                          std::optional<PlayerRecord>* out_record) {
@@ -24,7 +25,7 @@ ReaderStatus MysqlPlayerReader::QueryOne(const std::string& sql, std::string_vie
     }
     out_record->reset();
 
-    std::vector<SqlRow> rows;
+    std::vector<rgbt::common::SqlRow> rows;
     if (!connection_->Query(sql, {std::string(param)}, &rows)) {
         return ReaderStatus::kUnavailable;
     }
@@ -32,7 +33,7 @@ ReaderStatus MysqlPlayerReader::QueryOne(const std::string& sql, std::string_vie
         return ReaderStatus::kNotFound;
     }
 
-    const SqlRow& row = rows.front();
+    const rgbt::common::SqlRow& row = rows.front();
     // 期望 4 列；列数不符说明查询与实现不一致，按依赖故障处理而不是猜测。
     if (row.size() != 4) {
         return ReaderStatus::kUnavailable;

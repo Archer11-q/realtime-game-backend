@@ -1,13 +1,14 @@
-# gateway 服务：TASK-005 登录切片 + TASK-006 玩家档案走数据库。
+# gateway 服务：TASK-005 登录切片 + TASK-006 玩家档案走数据库 + TASK-007 匹配 + TASK-008 房间与对局结果。
 #
-# 依赖 vcpkg 提供的 brpc、hiredis 与 libmariadb，因此本目录只在启用 vcpkg
-# 工具链时加入（见 src/CMakeLists.txt），保证默认构建与 CI 不受影响。
+# 依赖 vcpkg 提供的 brpc、hiredis 与 libmariadb（后者经 rgbt_common_mysql 传递），
+# 因此本目录只在启用 vcpkg 工具链时加入（见 src/CMakeLists.txt），
+# 保证默认构建与 CI 不受影响。
 #
-# 本目录还负责生成 api/proto 下的 Protobuf 代码：契约是接口真相来源，
-# 生成物放在构建目录，不进入版本库。
+# Protobuf 代码生成走公共函数 rgbt_add_service_proto（定义在
+# cmake/generate_service_proto.cmake，顶层 CMakeLists.txt 已 include）。
 
 # ---------------------------------------------------------------------------
-# Protobuf 代码生成
+# 依赖
 # ---------------------------------------------------------------------------
 
 find_package(Protobuf REQUIRED)
@@ -15,37 +16,15 @@ find_package(Protobuf REQUIRED)
 # 必须先 find_package，否则链接时找不到该 IMPORTED 目标。
 find_package(unofficial-brpc CONFIG REQUIRED)
 find_package(hiredis CONFIG REQUIRED)
-# MySQL 客户端。TASK-006 起用于读取玩家档案（Phase 1 临时安排，见 ADR-0002）。
-find_package(unofficial-libmariadb CONFIG REQUIRED)
 # 密码摘要使用 OpenSSL 的 EVP 接口。openssl 已由 brpc 与 libmariadb 引入，
 # 这里显式声明以便直接使用其头文件，不新增组件。
 find_package(OpenSSL REQUIRED)
 
-set(RGBT_PROTO_DIR "${PROJECT_SOURCE_DIR}/api/proto")
-set(RGBT_PROTO_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto-gen")
+# ---------------------------------------------------------------------------
+# Protobuf 代码生成
+# ---------------------------------------------------------------------------
 
-file(MAKE_DIRECTORY "${RGBT_PROTO_OUT_DIR}")
-
-add_custom_command(
-  OUTPUT "${RGBT_PROTO_OUT_DIR}/gateway.pb.cc" "${RGBT_PROTO_OUT_DIR}/gateway.pb.h"
-  COMMAND protobuf::protoc
-  ARGS
-    --cpp_out "${RGBT_PROTO_OUT_DIR}"
-    --proto_path "${RGBT_PROTO_DIR}"
-    "${RGBT_PROTO_DIR}/gateway.proto"
-  DEPENDS "${RGBT_PROTO_DIR}/gateway.proto"
-  COMMENT "生成 gateway.proto 的 C++ 代码"
-  VERBATIM
-)
-
-add_library(rgbt_gateway_proto STATIC "${RGBT_PROTO_OUT_DIR}/gateway.pb.cc")
-target_include_directories(rgbt_gateway_proto PUBLIC "${RGBT_PROTO_OUT_DIR}")
-target_link_libraries(rgbt_gateway_proto PUBLIC protobuf::libprotobuf)
-
-# 生成代码属于第三方产出，不使用 -Werror 以免因 protoc 版本差异导致构建失败。
-if(NOT MSVC)
-  target_compile_options(rgbt_gateway_proto PRIVATE -w)
-endif()
+rgbt_add_service_proto(rgbt_gateway_proto gateway)
 
 # ---------------------------------------------------------------------------
 # 服务实现
@@ -54,11 +33,11 @@ endif()
 add_library(
   rgbt_gateway_lib STATIC
   brpc_match_client.cpp
+  brpc_room_client.cpp
   database_player_directory.cpp
   error.cpp
   gateway_service.cpp
   in_memory_player_directory.cpp
-  mysql_connection.cpp
   mysql_player_reader.cpp
   password_hash.cpp
   redis_session_store.cpp
@@ -71,13 +50,17 @@ target_link_libraries(
   rgbt_gateway_lib
   PUBLIC
     rgbt_common
+    # MySQL 连接辅助（原在本目录，TASK-008 起被 Room 与 Gateway 共用，
+    # 按放置规则移入 include/common/）。
+    rgbt_common_mysql
     rgbt_gateway_proto
   PRIVATE
-    # Gateway 调用 Match Service（TASK-007），需要 match 的生成代码与服务桩。
+    # Gateway 调用 Match Service（TASK-007）与 Room/Battle Service（TASK-008），
+    # 需要两者的生成代码与服务桩。
     rgbt_match_proto
+    rgbt_room_proto
     unofficial::brpc::brpc
     hiredis::hiredis
-    unofficial::libmariadb
     OpenSSL::Crypto
 )
 

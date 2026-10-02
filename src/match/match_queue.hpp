@@ -6,24 +6,36 @@
 ///   保证同一玩家不重复进入多个有效队列或匹配结果。
 ///   本文件只做队列与配对，不保存战斗状态、不直接向客户端发消息。
 ///
-/// 三条关键设计决定：
+/// 四条关键设计决定：
 ///
-/// 1. **队列放进程内存**（TASK-007 决策 1 选 A）。与架构文档第 8 节把队列所有者
-///    记为 Match（「内存 + Redis 快照」）一致，快照与重启恢复留 Phase 2。
+/// 1. **队列放进程内存**（TASK-007 决策 1 选 A）。与架构文档把队列所有者记为 Match
+///    一致，快照与重启恢复留 Phase 2。
 ///
 /// 2. **单个互斥锁保护全部状态**。这直接给出「同一玩家不会同时出现在两个有效
 ///    队列或匹配结果中」这一架构要求：队列和结果表都以 player_id 为键，且所有
-///    状态变更都在同一把锁内完成，配对过程不存在中间可见状态。
+///    状态变更都在同一把锁内完成。
 ///    **已知限制**：这把锁只在单进程内有效。本项目**不做多实例部署**
 ///    （见 docs/adr/0003-scope-reduction.md），因此该限制不会在项目范围内触发；
 ///    不要为此引入分布式锁、etcd 或分片机制。
 ///
-/// 3. **时间由调用方注入**（`now_ms` 参数）。因此超时与结果过期可以用单元测试
+/// 3. **绝不在持锁期间调用远程**（TASK-008 起）。房间分配是一次 brpc 调用，
+///    持锁调用意味着一次对端超时会把整个队列卡住。因此配对拆成两阶段：
+///      阶段一（持锁）：从队列取出可配对的玩家，生成 match_id，标记为「分配中」
+///      阶段二（放锁）：调用 RoomAllocator::Allocate
+///      阶段三（持锁）：成功则提交为 matched，失败则把玩家放回队首
+///    对外语义不变：分配期间玩家的状态仍报告为 kQueued，客户端只会在 queued 与
+///    matched 之间切换，不会看到中间态。
+///
+/// 4. **时间由调用方注入**（`now_ms` 参数）。因此超时与结果过期可以用单元测试
 ///    精确验证，不需要 sleep，也不会出现「测试偶发失败」。
 ///
-/// 惰性淘汰：本类不创建定时器或后台线程，超时与过期只在每次调用时顺带结算。
-/// 队列长度为 0 且无人查询时不会有任何额外开销；代价是「超时」这个事实要等下一次
-/// 调用才会被记录，Phase 1 可接受。
+/// 5. **配对失败后惰性重试**。房间分配失败时玩家退回队列，但配对原本只在「有人入队」
+///    时触发，于是这些人会一直等到下一个新玩家出现才可能被配上。Room 重启后
+///    brpc channel 需要惰性重连，第一次调用必然失败，这个窗口很容易被撞上。
+///    因此 `retry_pairing_` 记录「有失败的分配合并待重试」，并由客户端会持续调用的
+///    `GetStatus` 顺带重试一次。玩家不需要重新入队。
+///
+/// 惰性淘汰：本类不创建定时器或后台线程，超时、过期与重试都只在每次调用时顺带结算。
 
 #ifndef RGBT_MATCH_MATCH_QUEUE_HPP
 #define RGBT_MATCH_MATCH_QUEUE_HPP
@@ -113,11 +125,14 @@ public:
     ///   * 玩家已有未领取的匹配结果 -> kAlreadyQueued，返回该结果。
     ///     **不覆盖结果**，否则玩家会丢掉已经配好的局。
     ///   * 玩家处于超时状态 -> 允许重新入队（超时状态会被覆盖）。
+    ///
+    /// 本方法内部会调用 RoomAllocator（网络调用），但**不会持有锁**。
     EnqueueOutcome Enqueue(const std::string& player_id, const std::string& request_id,
                            std::int64_t now_ms);
 
     /// @brief 取消匹配。
-    /// @return true 表示确实从队列中移除；false 表示玩家本来就不在队列中。
+    /// @return true 表示确实从队列中移除，或玩家正处于房间分配中（取消请求已登记，
+    ///         分配完成后不会让该玩家进入这一局）；false 表示玩家本来就不在队列中。
     ///         调用方按幂等成功处理 false，与登出的处理方式保持一致。
     bool Cancel(const std::string& player_id, std::int64_t now_ms);
 
@@ -126,6 +141,9 @@ public:
 
     /// @brief 当前队列长度。仅供测试与可观测性使用。
     [[nodiscard]] std::size_t QueueSize();
+
+    /// @brief 当前处于房间分配中的人数。仅供测试与可观测性使用。
+    [[nodiscard]] std::size_t AllocatingCount();
 
 private:
     struct Entry {
@@ -138,13 +156,37 @@ private:
         /// 状态最近一次变化的时间。排队中是入队时间；配对或超时后是结果生成时间，
         /// 用于结算结果保留时长。
         std::int64_t stamp_ms = 0;
+        /// 正在等待房间分配。此时玩家已从 queue_ 移出，但对外仍报告 kQueued。
+        bool allocating = false;
+        /// 分配期间收到了取消请求。分配完成后据此决定是否放弃这一局。
+        bool cancel_requested = false;
+    };
+
+    /// 一次待分配的房间请求。
+    struct PendingGroup {
+        std::string match_id;
+        std::vector<std::string> player_ids;
     };
 
     /// 惰性结算：淘汰超时的排队项，清理过期结果。调用方必须已持有 mutex_。
     void SweepLocked(std::int64_t now_ms);
 
-    /// 尝试配对。调用方必须已持有 mutex_。
-    void TryPairLocked(std::int64_t now_ms);
+    /// 阶段一：从队列取出可配对的组并标记为分配中。调用方必须已持有 mutex_。
+    [[nodiscard]] std::vector<PendingGroup> TakePairGroupsLocked();
+
+    /// 阶段三：提交一次分配结果。调用方必须已持有 mutex_。
+    ///
+    /// @param room_id 分配到的房间号；空字符串表示分配失败。
+    void CommitGroupLocked(const PendingGroup& group, const std::string& room_id,
+                           std::int64_t now_ms);
+
+    /// 阶段一 + 阶段三的组合：取组 -> **锁外**分配 -> 锁内提交。
+    /// 调用方**不得**持有 mutex_。
+    void RunPairingRound(std::int64_t now_ms);
+
+    /// 如果上一次分配失败且玩家已退回队列，顺带重试一次配对。
+    /// 只在真的有待重试的配对时才发起远程调用。
+    void RetryPairingIfNeeded(std::int64_t now_ms);
 
     /// 从 FIFO 队列中移除指定玩家。调用方必须已持有 mutex_。
     void RemoveFromQueueLocked(const std::string& player_id);
@@ -158,11 +200,13 @@ private:
     std::size_t max_queue_size_;
 
     mutable std::mutex mutex_;
-    /// FIFO 顺序的 player_id。只保存仍在排队中的玩家。
+    /// FIFO 顺序的 player_id。只保存仍在排队中的玩家（分配中的不在其中）。
     std::deque<std::string> queue_;
     /// 玩家 -> 状态。**以 player_id 为键**，这是「同一玩家不会重复出现在两个有效
     /// 匹配结果中」的实现基础。
     std::unordered_map<std::string, Entry> entries_;
+    /// 是否存在一次失败的分配合并待重试。见文件头的第 5 条设计决定。
+    bool retry_pairing_ = false;
 };
 
 }  // namespace rgbt::match

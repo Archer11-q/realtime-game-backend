@@ -15,6 +15,10 @@ std::int32_t HttpStatusOf(rgbt::gateway::v1::ErrorCode code) noexcept {
             // 限流（例如匹配队列已满）。429 而不是 503：请求本身没错，
             // 是当前容量不足，调用方应退避后重试。
             return 429;
+        case ErrorCode::CONFLICT:
+            // 状态冲突（例如对局已结束，不再接受输入）。409 而不是 400：
+            // 请求格式没问题，是当前状态不允许这个操作，重试也没有意义。
+            return 409;
         case ErrorCode::UNAVAILABLE:
             return 503;
         case ErrorCode::INTERNAL:
@@ -44,6 +48,8 @@ std::string_view ErrorCodeName(rgbt::gateway::v1::ErrorCode code) noexcept {
             return "NOT_FOUND";
         case ErrorCode::RESOURCE_EXHAUSTED:
             return "RESOURCE_EXHAUSTED";
+        case ErrorCode::CONFLICT:
+            return "CONFLICT";
         case ErrorCode::UNAVAILABLE:
             return "UNAVAILABLE";
         case ErrorCode::INTERNAL:

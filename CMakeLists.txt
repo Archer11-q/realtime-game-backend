@@ -115,6 +115,10 @@ function(rgbt_apply_sanitizer target)
   target_link_options(${target} PRIVATE -fsanitize=address)
 endfunction()
 
+# 公共 CMake 函数：为 api/proto 下的契约生成 C++ 代码。
+# TASK-008 引入第三个 proto（room.proto）时从三个服务目录中抽取出来。
+include(cmake/generate_service_proto.cmake)
+
 # 子目录顺序：先 src 再 tests。
 #
 # 服务目录只负责编译自己，不判断测试依赖是否可用——那是 tests 的职责。

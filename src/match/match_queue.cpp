@@ -34,36 +34,74 @@ EnqueueOutcome MatchQueue::Enqueue(const std::string& player_id, const std::stri
         return EnqueueOutcome::kInvalidArgument;
     }
 
-    const std::lock_guard<std::mutex> lock(mutex_);
-    SweepLocked(now_ms);
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        SweepLocked(now_ms);
 
-    const auto existing = entries_.find(player_id);
-    if (existing != entries_.end()) {
-        // 排队中或已有未领取的结果：一律按幂等处理，不新建条目。
-        // 后者尤其重要——覆盖匹配结果会让玩家丢掉已经配好的局。
-        if (existing->second.state == MatchStatusSnapshot::State::kQueued ||
-            existing->second.state == MatchStatusSnapshot::State::kMatched) {
-            return EnqueueOutcome::kAlreadyQueued;
+        const auto existing = entries_.find(player_id);
+        if (existing != entries_.end()) {
+            // 排队中、正在分配房间、或已有未领取的结果：一律按幂等处理，不新建条目。
+            // 后者尤其重要——覆盖匹配结果会让玩家丢掉已经配好的局。
+            if (existing->second.state == MatchStatusSnapshot::State::kQueued ||
+                existing->second.state == MatchStatusSnapshot::State::kMatched) {
+                return EnqueueOutcome::kAlreadyQueued;
+            }
+            // 超时状态允许重新排队：旧的超时记录被覆盖。
+            entries_.erase(existing);
         }
-        // 超时状态允许重新排队：旧的超时记录被覆盖。
-        entries_.erase(existing);
+
+        if (queue_.size() >= max_queue_size_) {
+            return EnqueueOutcome::kQueueFull;
+        }
+
+        Entry entry;
+        entry.state = MatchStatusSnapshot::State::kQueued;
+        entry.request_id = request_id;
+        entry.queued_at_ms = now_ms;
+        entry.stamp_ms = now_ms;
+        entries_.emplace(player_id, std::move(entry));
+        queue_.push_back(player_id);
     }
 
-    if (queue_.size() >= max_queue_size_) {
-        return EnqueueOutcome::kQueueFull;
-    }
+    // 阶段一（锁内取人）-> 阶段二（锁外分配）-> 阶段三（锁内提交），见
+    // RunPairingRound 的注释。
+    RunPairingRound(now_ms);
 
-    Entry entry;
-    entry.state = MatchStatusSnapshot::State::kQueued;
-    entry.request_id = request_id;
-    entry.queued_at_ms = now_ms;
-    entry.stamp_ms = now_ms;
-    entries_.emplace(player_id, std::move(entry));
-    queue_.push_back(player_id);
-
-    // 入队后立刻尝试配对，让第二个入队的玩家在同一次调用内就拿到结果。
-    TryPairLocked(now_ms);
     return EnqueueOutcome::kQueued;
+}
+
+void MatchQueue::RunPairingRound(std::int64_t now_ms) {
+    std::vector<PendingGroup> groups;
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        // 阶段一：只取人、生成 match_id、标记分配中，不做任何远程调用。
+        groups = TakePairGroupsLocked();
+    }
+
+    // 阶段二：在**锁外**分配房间。这一步会发起 brpc 调用，持锁会让整个队列停顿。
+    //
+    // 阶段三：回到锁内提交。分配失败时把玩家放回队首等下一次配对，因此「Room 不可用」
+    // 不会让玩家被莫名标记为超时，也不会产生半成品匹配。
+    for (const PendingGroup& group : groups) {
+        std::string room_id;
+        if (allocator_ != nullptr) {
+            room_id = allocator_->Allocate(group.match_id, group.player_ids);
+        }
+        const std::lock_guard<std::mutex> lock(mutex_);
+        CommitGroupLocked(group, room_id, now_ms);
+    }
+}
+
+void MatchQueue::RetryPairingIfNeeded(std::int64_t now_ms) {
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (!retry_pairing_) {
+            return;
+        }
+        // 先清掉标记再重试：重试若再失败，CommitGroupLocked 会重新置上。
+        retry_pairing_ = false;
+    }
+    RunPairingRound(now_ms);
 }
 
 bool MatchQueue::Cancel(const std::string& player_id, std::int64_t now_ms) {
@@ -71,9 +109,19 @@ bool MatchQueue::Cancel(const std::string& player_id, std::int64_t now_ms) {
     SweepLocked(now_ms);
 
     const auto it = entries_.find(player_id);
-    if (it == entries_.end() || it->second.state != MatchStatusSnapshot::State::kQueued) {
-        // 不在队列中（从未入队 / 已被配对 / 已超时 / 已取消）都按幂等成功处理，
-        // 由调用方决定返回 200。这与登出「重复调用不报错」保持一致。
+    if (it == entries_.end()) {
+        return false;
+    }
+
+    if (it->second.allocating) {
+        // 正在分配房间。此刻不能直接删除条目——阶段三还需要它来判断这一局是否成立。
+        // 只登记取消意图，由 CommitGroupLocked 落实「不把取消的人塞进对局」。
+        it->second.cancel_requested = true;
+        return true;
+    }
+
+    if (it->second.state != MatchStatusSnapshot::State::kQueued) {
+        // 不在队列中（已被配对 / 已超时 / 已取消）都按幂等成功处理。
         return false;
     }
 
@@ -83,9 +131,21 @@ bool MatchQueue::Cancel(const std::string& player_id, std::int64_t now_ms) {
 }
 
 MatchStatusSnapshot MatchQueue::GetStatus(const std::string& player_id, std::int64_t now_ms) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    SweepLocked(now_ms);
-    return SnapshotLocked(player_id);
+    MatchStatusSnapshot snapshot;
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        SweepLocked(now_ms);
+        snapshot = SnapshotLocked(player_id);
+    }
+
+    // 惰性重试：上一次房间分配失败时玩家已退回队列。客户端会持续轮询本接口，
+    // 因此在这里顺带重试一次配对，玩家不需要重新入队。
+    //
+    // 返回的是重试**之前**的快照：这一次调用可能把玩家从 queued 变成 matched，
+    // 但那是本次调用产生的新事实，下一次轮询才应该看到。假装它已经发生会让调用方
+    // 拿到一个与本次请求无关的状态。
+    RetryPairingIfNeeded(now_ms);
+    return snapshot;
 }
 
 std::size_t MatchQueue::QueueSize() {
@@ -93,8 +153,19 @@ std::size_t MatchQueue::QueueSize() {
     return queue_.size();
 }
 
+std::size_t MatchQueue::AllocatingCount() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    std::size_t count = 0;
+    for (const auto& entry : entries_) {
+        if (entry.second.allocating) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 void MatchQueue::SweepLocked(std::int64_t now_ms) {
-    // 1. 淘汰排队超时的玩家。先改状态再从队列里移除，保证两者一致。
+    // 1. 淘汰排队超时的玩家。分配中的玩家已不在 queue_ 中，因此不会被误淘汰。
     if (!queue_.empty()) {
         std::vector<std::string> timed_out;
         for (const std::string& player_id : queue_) {
@@ -135,7 +206,9 @@ void MatchQueue::SweepLocked(std::int64_t now_ms) {
     }
 }
 
-void MatchQueue::TryPairLocked(std::int64_t now_ms) {
+std::vector<MatchQueue::PendingGroup> MatchQueue::TakePairGroupsLocked() {
+    std::vector<PendingGroup> groups;
+
     while (queue_.size() >= kPlayersPerMatch) {
         std::vector<std::string> group;
         group.reserve(kPlayersPerMatch);
@@ -158,36 +231,102 @@ void MatchQueue::TryPairLocked(std::int64_t now_ms) {
             for (auto it = group.rbegin(); it != group.rend(); ++it) {
                 queue_.push_front(*it);
             }
-            return;
+            break;
         }
 
         const std::string match_id = match_id_factory_();
-        const std::string room_id = allocator_ != nullptr ? allocator_->Allocate(match_id) : "";
-
-        if (match_id.empty() || room_id.empty()) {
-            // 分配失败：把两人标记为超时，让客户端知道需要重新匹配，
-            // 而不是让他们无限期留在队列里。
-            for (const std::string& player_id : group) {
-                auto it = entries_.find(player_id);
-                if (it != entries_.end()) {
-                    it->second.state = MatchStatusSnapshot::State::kTimeout;
-                    it->second.stamp_ms = now_ms;
-                }
+        if (match_id.empty()) {
+            // 生成失败：放回队首，等下一次入队再试。不把玩家标成超时——
+            // 这不是玩家的错，也不该让他们重新排队。
+            for (auto it = group.rbegin(); it != group.rend(); ++it) {
+                queue_.push_front(*it);
             }
-            continue;
+            break;
         }
+
+        PendingGroup pending;
+        pending.match_id = match_id;
+        pending.player_ids = group;
 
         for (const std::string& player_id : group) {
             auto it = entries_.find(player_id);
             if (it == entries_.end()) {
                 continue;
             }
-            it->second.state = MatchStatusSnapshot::State::kMatched;
+            // 状态仍保持 kQueued：分配期间客户端看到的语义不变。
+            it->second.allocating = true;
             it->second.match_id = match_id;
-            it->second.room_id = room_id;
             it->second.player_ids = group;
+        }
+        groups.push_back(std::move(pending));
+    }
+
+    return groups;
+}
+
+void MatchQueue::CommitGroupLocked(const PendingGroup& group, const std::string& room_id,
+                                   std::int64_t now_ms) {
+    // 先把这一组的玩家分类：取消的、以及需要退回队列的。
+    std::vector<std::string> cancelled;
+    std::vector<std::string> requeue;
+    for (const std::string& player_id : group.player_ids) {
+        const auto it = entries_.find(player_id);
+        if (it == entries_.end()) {
+            continue;
+        }
+        if (it->second.cancel_requested) {
+            cancelled.push_back(player_id);
+        } else {
+            requeue.push_back(player_id);
+        }
+    }
+
+    const bool group_viable = room_id.empty() ? false : cancelled.empty();
+
+    if (group_viable) {
+        for (const std::string& player_id : requeue) {
+            auto it = entries_.find(player_id);
+            if (it == entries_.end()) {
+                continue;
+            }
+            it->second.state = MatchStatusSnapshot::State::kMatched;
+            it->second.allocating = false;
+            it->second.room_id = room_id;
+            it->second.player_ids = group.player_ids;
             it->second.stamp_ms = now_ms;
         }
+        return;
+    }
+
+    // 走到这里有两种可能：
+    //   1. 房间分配失败（room_id 为空）——所有人退回队列。
+    //   2. 分配成功但有人在这期间取消了——这一局不成立，剩余的人退回队列。
+    //
+    // 第 2 种情况下，Room 侧已经创建了房间。这里**不回收它**：Room 的「等待玩家加入
+    // 超时」会在 kWaitingTimeoutMs 之后把无人加入的房间标记为 ABORTED 并回收。
+    // 让空闲房间自己过期，比在两个服务之间加一次反向删除调用更简单可靠。
+    if (room_id.empty()) {
+        // 记下「有失败的分配合并待重试」。配对原本只在有人入队时触发，
+        // 不记这个标记的话，退回队列的玩家要等到下一个新玩家出现才可能被配上。
+        // Room 重启后 brpc channel 惰性重连，第一次调用必然失败，这个窗口很容易被撞上。
+        retry_pairing_ = true;
+    }
+
+    for (const std::string& player_id : cancelled) {
+        entries_.erase(player_id);
+    }
+
+    // 退回队首而不是队尾：这些人比新来的人等待更久，排到队尾会无限延长等待。
+    // 逆序 push_front 才能保持原来的相对顺序。
+    for (auto it = requeue.rbegin(); it != requeue.rend(); ++it) {
+        auto entry = entries_.find(*it);
+        if (entry == entries_.end()) {
+            continue;
+        }
+        entry->second.allocating = false;
+        entry->second.match_id.clear();
+        entry->second.player_ids.clear();
+        queue_.push_front(*it);
     }
 }
 

@@ -79,6 +79,7 @@ LOG_LEVEL
 GATEWAY_HTTP_PORT
 GATEWAY_WS_PORT
 MATCH_HTTP_PORT
+ROOM_HTTP_PORT
 REDIS_HOST
 REDIS_PORT
 MYSQL_HOST
@@ -133,6 +134,27 @@ docker compose -f deploy/compose/docker-compose.yml up -d
 1. 确认写请求是否立刻失败（**不允许写假成功**）。
 2. 恢复后验证幂等：重复的对局结果写入不产生重复行。
 3. 检查是否需要补偿。
+
+### Room/Battle Service 不可用
+
+1. 确认影响范围：当前表现为「匹配成功但分不到房间」。
+2. **不要**把分配失败当作玩家超时处理：Match 会把玩家退回队列等下一次配对，
+   而不是把他们标记为 timeout。若在 Match 日志里看到玩家被标记为超时，
+   说明这里的行为与设计不符，需要排查。
+3. 恢复 Room 后无需重启 Match：下一次入队即可正常配对。
+4. 需要注意的是，已经创建但没人加入的房间会在 `kWaitingTimeoutMs`（30 秒）后
+   自动转为 ABORTED 并被回收，不需要人工清理。
+
+### 对局结果停留在 FINISHING
+
+`PendingResultCount()` 持续大于 0 说明 Room 一直在重试写入 MySQL 而没成功。
+
+1. 查 Room 日志里的 `[room] 对局结果写入失败`，确认是连接问题还是语句问题。
+2. 恢复 MySQL。结果会在下一个重试周期（1 秒）内写入，无需重启 Room。
+3. **不要**在结果未落库时把房间状态改成 FINISHED：那会让客户端拿到一个
+   进程重启后就查不到的胜负结果。
+4. 已结束但未落库的对局只存在于内存里，**进程重启会丢失**。这是 Phase 1 的
+   已知限制，持久化队列属 Phase 2。
 
 ### 业务进程崩溃
 
