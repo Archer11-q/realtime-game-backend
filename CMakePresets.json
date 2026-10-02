@@ -54,6 +54,32 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "RGBT_USE_VCPKG_TOOLCHAIN": "ON"
       }
+    },
+    {
+      "name": "brpc-asan",
+      "displayName": "brpc Debug + ASan (vcpkg, Ninja)",
+      "description": "在 brpc 目标（Gateway / Match / Room）上启用 ASan。asan 预设不接 vcpkg，因此覆盖不到 MysqlConnection / RedisSessionStore 这些只在 vcpkg 构建里存在的目标；TASK-014 修并发缺陷时发现这一点，补上本预设。",
+      "inherits": "base",
+      "generator": "Ninja",
+      "toolchainFile": "$env{HOME}/tools/vcpkg/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "RGBT_USE_VCPKG_TOOLCHAIN": "ON",
+        "RGBT_ENABLE_SANITIZER": "ON"
+      }
+    },
+    {
+      "name": "brpc-tsan",
+      "displayName": "brpc Debug + TSan (vcpkg, Ninja)",
+      "description": "在 brpc 目标上启用 ThreadSanitizer，用于验证并发访问共享连接对象（MysqlConnection / RedisSessionStore）。与 brpc-asan 互斥。注意：vcpkg 提供的 brpc 未用 TSan 插桩，因此实测报告全部落在 brpc 内部（butil::Mutex、cpuwide_time_ns 等），对本项目代码没有指向性；要让它成为可用的门禁，需要先用 TSan 重建 brpc 依赖链。结论记录在 docs/devlog.md 的「TASK-014 实施记录」。",
+      "inherits": "base",
+      "generator": "Ninja",
+      "toolchainFile": "$env{HOME}/tools/vcpkg/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "RGBT_USE_VCPKG_TOOLCHAIN": "ON",
+        "RGBT_ENABLE_TSAN": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -72,6 +98,14 @@
     {
       "name": "brpc-debug",
       "configurePreset": "brpc-debug"
+    },
+    {
+      "name": "brpc-asan",
+      "configurePreset": "brpc-asan"
+    },
+    {
+      "name": "brpc-tsan",
+      "configurePreset": "brpc-tsan"
     }
   ],
   "testPresets": [
@@ -97,6 +131,16 @@
       },
       "environment": {
         "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1"
+      }
+    },
+    {
+      "name": "brpc-tsan",
+      "configurePreset": "brpc-tsan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=0:second_deadlock_stack=1"
       }
     }
   ]

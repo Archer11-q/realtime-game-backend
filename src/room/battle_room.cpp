@@ -23,6 +23,62 @@ BattleRoom::BattleRoom(std::string room_id, std::string match_id,
     PushSnapshot();
 }
 
+std::optional<BattleRoom> BattleRoom::RestoreFrom(const RoomSnapshotRecord& record,
+                                                  std::int64_t now_ms) {
+    // 玩家数是硬前提：少一个人就凑不成一局，这里直接拒绝而不是补一个空位。
+    if (record.players.size() != kPlayersPerRoom) {
+        return std::nullopt;
+    }
+    // 标识必须非空且互不相同。这两条 ValidateRoomSnapshot 也会查，
+    // 这里重复一次是**有意的第二道防线**：RestoreFrom 的契约是"调用方已验证"，
+    // 但一个不校验的调用方不应该能把"两个位置是同一个人"的房间装进内存。
+    for (std::size_t i = 0; i < record.players.size(); ++i) {
+        if (record.players[i].player_id.empty()) {
+            return std::nullopt;
+        }
+        for (std::size_t j = i + 1; j < record.players.size(); ++j) {
+            if (record.players[i].player_id == record.players[j].player_id) {
+                return std::nullopt;
+            }
+        }
+    }
+
+    BattleRoom room;
+    room.room_id_ = record.room_id;
+    room.match_id_ = record.match_id;
+    room.phase_ = record.phase;
+    room.finish_reason_ = record.finish_reason;
+    room.frame_ = record.frame;
+    room.winner_id_ = record.winner_id;
+    room.started_at_ms_ = record.started_at_ms;
+    room.finished_at_ms_ = record.finished_at_ms;
+    room.player_count_ = static_cast<std::int32_t>(kPlayersPerRoom);
+
+    room.players_.reserve(kPlayersPerRoom);
+    for (const RoomPlayerRecord& player : record.players) {
+        PlayerSnapshot snapshot;
+        snapshot.player_id = player.player_id;
+        snapshot.hp = player.hp;
+        // 表里叫 joined、内存里叫 connected，指的是同一件事：
+        // 「是否已在房间内」，不是网络是否连通（见 room_types.hpp）。
+        snapshot.connected = player.joined;
+        room.players_.push_back(std::move(snapshot));
+    }
+    room.pending_attack_.assign(kPlayersPerRoom, false);
+
+    // 等待超时的基准用快照时刻近似。表里没有 created_at_ms，而本任务不新增列；
+    // 代价是恢复后的等待超时最多晚一个快照间隔（有上界，见头文件说明）。
+    room.created_at_ms_ = record.snapshot_at_ms > 0 ? record.snapshot_at_ms : now_ms;
+    // 推进基准重置为重启时刻：停机期间的帧被丢弃，不做补偿。
+    room.last_tick_ms_ = now_ms;
+    // 立即到期：FINISHING 的结果已经在内存里消失过一次，再等一个完整间隔没有意义。
+    room.last_persist_attempt_ms_ = now_ms - kResultRetryIntervalMs;
+
+    // 把恢复后的状态推入快照环形缓冲：重连的客户端取历史帧时应当能拿到当前状态。
+    room.PushSnapshot();
+    return room;
+}
+
 PlayerSnapshot* BattleRoom::FindPlayer(const std::string& player_id) {
     for (PlayerSnapshot& player : players_) {
         if (player.player_id == player_id) {

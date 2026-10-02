@@ -244,7 +244,7 @@ Gateway 直接读 Redis 中的队列状态，必须先写 ADR。
 - 战绩和结算使用唯一约束保护幂等。
 - 不使用 MySQL 保存高频帧日志。
 
-#### 已实现的表（截至 TASK-006）
+#### 已实现的表（截至 TASK-014）
 
 **`players` — 玩家档案**
 
@@ -279,6 +279,35 @@ Gateway 直接读 Redis 中的队列状态，必须先写 ADR。
   原定的 Settlement 所有者已取消。
 - 访问方式：对局结束时由 Room/Battle **同步幂等**写入，以 `match_id` 为幂等业务键；
   **不经过任何消息队列**。重复写入同一 `match_id` 返回已有结果，不产生第二行。
+
+**`rooms` — 房间权威状态快照**
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `match_id` | `VARCHAR(64)` | 主键，产生本房间的匹配标识 |
+| `room_id` | `VARCHAR(64)` | 房间标识 |
+| `state` | `VARCHAR(16)` | `created` / `waiting` / `playing` / `finishing` / `finished` / `aborted` |
+| `frame` | `INT` | 已推进的帧号 |
+| `p1_id` / `p2_id` | `VARCHAR(64)` | 两位玩家的 `player_id`，顺序即快照中的玩家顺序 |
+| `p1_hp` / `p2_hp` | `INT` | 双方血量 |
+| `p1_joined` / `p2_joined` | `TINYINT` | 该玩家是否已进入房间 |
+| `winner_id` | `VARCHAR(64)` | 胜者，平局或未结束为 NULL |
+| `finish_reason` | `VARCHAR(16)` | `none` / `hp_zero` / `timeout` / `aborted` |
+| `started_at_ms` / `finished_at_ms` | `BIGINT` | 开局与结束时间（毫秒） |
+| `snapshot_at_ms` | `BIGINT` | 本行写入时刻（毫秒），用于"新快照覆盖旧快照" |
+
+- 所有者：**Room/Battle**，依据 [ADR-0003](adr/0003-scope-reduction.md)。
+- 字段离散成列，**不用 JSON 快照列**：schema 本身就是"能恢复什么"的文档；
+  把快照塞进一个不透明字段会立刻带来格式版本管理问题。`p1_*` / `p2_*` 两列
+  不是未经验证的假设——`kPlayersPerRoom = 2` 是已确认的对局规则。
+- 每局**只保留最新一份快照**，不是审计日志；没有消费者的历史查询不在范围内。
+- 写入时机：房间创建后立刻写一次，之后每 1 秒（10 帧）一次，进入终态时再写一次。
+- **写入失败不重试、不阻塞对局**，下一个周期天然覆盖。这与 `match_results`
+  的失败策略**相反**（对局结果不可丢弃，所以无限重试）。
+- 读取时机：**仅 Room 进程启动时**，扫出 `state` 非 `finished` / `aborted` 的行
+  重建房间。语义参见 `docs/01-architecture.md` 第 5 节的「恢复边界」。
+- 恢复时会重新校验每一行；校验不通过的行**不静默丢弃**，而是改写为 `aborted`
+  并记录原因，避免它每次启动都被重新扫出来。
 
 迁移文件位于 `migrations/`，按 `NNN_描述.sql` 命名且必须幂等。
 注意：`/docker-entrypoint-initdb.d` 只在数据目录为空时执行一次，
