@@ -76,8 +76,46 @@ match_pid=""
 room_pid=""
 web_pid=""
 stream_pid=""
+
+# 结束 Vite 及其全部子进程。
+#
+# 为什么要按**进程组**结束：`npm run dev` 的进程树是
+#     npm run dev  ->  sh -c vite  ->  node .../node_modules/.bin/vite
+# 只 kill 最外层，后两层会活下来继续占用端口。第一版就是这么漏的：
+# 脚本报告「Vite 已退出」，但 5173 仍被占着，下一次运行直接报端口冲突。
+# 因此启动时用 setsid 让它成为独立的进程组，结束时对整组发信号。
+#
+# 兜底再按端口找一遍：不同 util-linux 版本的 setsid 行为有差异
+# （已经在进程组里时它会 fork 一次，`$!` 就不是真正的组长）。
+# 监听我们**自己挑的这个端口**的进程必须被清掉，否则泄漏会一次次累积。
+stop_web_server() {
+  if [ -n "$web_pid" ]; then
+    # 负号表示整个进程组。
+    kill -TERM -"$web_pid" 2>/dev/null || kill -TERM "$web_pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      kill -0 "$web_pid" 2>/dev/null || break
+      sleep 0.5
+    done
+  fi
+
+  local leaked
+  leaked=$(ss -ltnp 2>/dev/null | grep -E "[:.]$web_port\b" |
+    grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+  for pid in $leaked; do
+    echo "  结束残留的 Vite 进程 $pid"
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep 1
+  leaked=$(ss -ltnp 2>/dev/null | grep -E "[:.]$web_port\b" |
+    grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+  for pid in $leaked; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  web_pid=""
+}
+
 cleanup() {
-  for pid in "$stream_pid" "$web_pid" "$gateway_pid" "$match_pid" "$room_pid"; do
+  for pid in "$stream_pid" "$gateway_pid" "$match_pid" "$room_pid"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       if [ "$keep_running" -eq 1 ]; then
         echo "已保留进程 $pid（--keep）"
@@ -86,6 +124,13 @@ cleanup() {
       fi
     fi
   done
+  if [ -n "$web_pid" ]; then
+    if [ "$keep_running" -eq 1 ]; then
+      echo "已保留 Vite（--keep）"
+    else
+      stop_web_server
+    fi
+  fi
 }
 trap cleanup EXIT
 
@@ -312,8 +357,12 @@ echo
 echo "===== 5. 启动 Vite 开发服务器 ====="
 # RGBT_GATEWAY_PORT 让 vite.config.ts 的代理指向本次实际使用的端口，
 # 而不是写死的 8080——验收脚本会挑空闲端口，所以这条必须传。
-( cd web && RGBT_WEB_PORT="$web_port" RGBT_GATEWAY_PORT="$gateway_port" \
-  npm run dev >/tmp/vite.out 2>&1 ) &
+#
+# setsid：让 npm 及其子进程形成独立进程组，退出时才能整组结束。
+# `npm --prefix web` 而不是先 cd：这样可以保持脚本的工作目录不变，
+# 后面用相对路径找日志与产物不会出错。
+setsid env RGBT_WEB_PORT="$web_port" RGBT_GATEWAY_PORT="$gateway_port" \
+  npm --prefix web run dev >/tmp/vite.out 2>&1 &
 web_pid=$!
 
 web_ready=0
@@ -540,7 +589,24 @@ echo
 
 # ---------- 10. 优雅退出 ----------
 echo "===== 10. 优雅退出 ====="
-for pair in "Vite:$web_pid" "Gateway:$gateway_pid" "Match:$match_pid" "Room:$room_pid"; do
+
+# Vite 单独处理：它是一棵进程树，必须按进程组结束。
+if [ -n "$web_pid" ] && kill -0 "$web_pid" 2>/dev/null; then
+  stop_web_server
+  ok "Vite 收到 SIGTERM 后已退出（含 npm 与 vite 子进程）"
+else
+  fail "Vite 进程不存在"
+fi
+
+# 这条断言是进程泄漏的守门测试：脚本报告"已退出"但端口还被占着，
+# 是真实发生过的 bug，而且它的后果是**下一次运行失败**，不是在本次暴露。
+if ss -ltn 2>/dev/null | grep -qE "[:.]$web_port\b"; then
+  fail "Vite 退出后端口 $web_port 仍被占用（进程泄漏）"
+else
+  ok "Vite 退出后端口 $web_port 已释放"
+fi
+
+for pair in "Gateway:$gateway_pid" "Match:$match_pid" "Room:$room_pid"; do
   name="${pair%%:*}"; pid="${pair#*:}"
   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
     fail "$name 进程不存在"
@@ -573,13 +639,34 @@ if [ "${#failures[@]}" -eq 0 ]; then
   echo "          Vite 与三个后端进程都能优雅退出"
   echo
   echo "本脚本覆盖不到「渲染」：Canvas 画面、按钮可用状态、四个视图的切换。"
-  echo "人工检查步骤："
-  echo "  1. 启动依赖与三个服务（scripts/verify-stream.sh 的日志里有启动命令）"
-  echo "  2. cd web && RGBT_GATEWAY_PORT=<Gateway 端口> npm run dev"
-  echo "  3. 浏览器打开 http://127.0.0.1:5173 ，在**两个窗口**分别登录 alice / bob"
-  echo "  4. 两个窗口都点「开始匹配」，确认自动进入对战页"
-  echo "  5. 反复点「攻击」，确认血条下降、帧号增长、'最近推送序号' 在变"
-  echo "  6. 打到一方 HP 归零，确认自动进入结算页且胜负正确、'结果已落库' 为「是」"
+  echo "人工检查步骤（端口固定，照抄即可，不需要先去别处找端口）："
+  echo
+  echo "  # 终端 A —— 起依赖与三个后端"
+  echo "  cd <仓库根目录>"
+  echo "  docker compose -f deploy/compose/docker-compose.yml up -d"
+  echo "  set -a; . deploy/compose/.env; set +a"
+  echo "  for f in migrations/*.sql; do docker exec -i rgbt-mysql mysql \\"
+  echo "      -u\"\$MYSQL_USER\" -p\"\$MYSQL_PASSWORD\" \"\$MYSQL_DATABASE\" <\"\$f\"; done"
+  echo "  build/brpc-debug/bin/rgbt_room -port 8083 -env_prefix dev \\"
+  echo "      -mysql_host 127.0.0.1 -mysql_port 3306 -mysql_user \"\$MYSQL_USER\" \\"
+  echo "      -mysql_password \"\$MYSQL_PASSWORD\" -mysql_database \"\$MYSQL_DATABASE\" &"
+  echo "  build/brpc-debug/bin/rgbt_match -match_port 8082 \\"
+  echo "      -room_host 127.0.0.1 -room_port 8083 &"
+  echo "  build/brpc-debug/bin/rgbt_gateway -port 8080 -env_prefix dev \\"
+  echo "      -mysql_host 127.0.0.1 -mysql_port 3306 -mysql_user \"\$MYSQL_USER\" \\"
+  echo "      -mysql_password \"\$MYSQL_PASSWORD\" -mysql_database \"\$MYSQL_DATABASE\" \\"
+  echo "      -match_host 127.0.0.1 -match_port 8082 -room_host 127.0.0.1 -room_port 8083 &"
+  echo
+  echo "  # 终端 B —— 起前端。RGBT_GATEWAY_PORT 必须等于上面 Gateway 的 -port"
+  echo "  cd web && RGBT_GATEWAY_PORT=8080 npm run dev"
+  echo
+  echo "  # 浏览器开 http://127.0.0.1:5173"
+  echo "  1. 窗口 1 填 alice（页面上有「填 alice」按钮），窗口 2 填 bob，各自登录"
+  echo "  2. 两个窗口都点「开始匹配」，确认配对后自动进入对战页"
+  echo "  3. 反复点「攻击」，确认：血条下降、帧号增长、最近推送序号在变"
+  echo "  4. 打到一方 HP 归零，确认自动进入结算页、胜负正确、「结果已落库」为「是」"
+  echo
+  echo "  TASK-011 会把上面这段收敛成一条命令，本任务先保留显式步骤。"
   exit 0
 fi
 
