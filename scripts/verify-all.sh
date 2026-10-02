@@ -28,9 +28,10 @@ cd "$(dirname "$0")/.." || exit 1
 run_dir="$(pwd)/.run"
 mkdir -p "$run_dir"
 
-# 顺序有依赖关系：先构建与格式，再按「登录 -> 匹配 -> 房间 -> 推送 -> 前端」
-# 由下而上。前一个失败时后面的通常也会失败，因此默认不用 fail-fast，
+# 顺序有依赖关系：先构建与格式，再按「登录 -> 匹配 -> 房间 -> 推送 -> 前端 ->
+# 持久化」由下而上。前一个失败时后面的通常也会失败，因此默认不用 fail-fast，
 # 一次性看到全部结果更有用。
+all_scripts=(verify verify-login verify-match verify-room verify-stream verify-web verify-persistence)
 all_scripts=(verify verify-login verify-match verify-room verify-stream verify-web)
 
 fail_fast=0

@@ -9,6 +9,7 @@
 #ifndef RGBT_ROOM_ROOM_TYPES_HPP
 #define RGBT_ROOM_ROOM_TYPES_HPP
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -131,6 +132,41 @@ struct MatchResultRecord {
     std::int32_t player_count = 0;
     std::int64_t started_at_ms = 0;
     std::int64_t finished_at_ms = 0;
+};
+
+/// 快照间隔（毫秒）。到达间隔才把房间快照写入 MySQL（TASK-013）。
+///
+/// 取值理由：对战 10 Hz、最长 600 帧（60 秒）。1 秒间隔意味着重启后最多回退
+/// 1 秒进度，也就是最多重放或少算一次攻击（每次 10 点血，占满血 10%）。
+/// 1 Hz/房间 对 MySQL 的压力可以忽略；更密不划算，更疏则偏差难以解释。
+inline constexpr std::int64_t kSnapshotIntervalMs = 1000;
+
+/// 单个玩家的快照记录。与 rooms 表的 p1_* / p2_* 列对应。
+struct RoomPlayerRecord {
+    std::string player_id;
+    std::int32_t hp = kInitialHp;
+    /// 是否已加入房间。注意它表达的是"在不在名单里"，不是网络是否连通。
+    bool joined = false;
+};
+
+/// 房间快照记录。与 MySQL 的 rooms 表一一对应。
+///
+/// 为什么与 RoomSnapshot 分开而不是复用：RoomSnapshot 用 `std::vector` 存玩家，
+/// 而表结构是固定的两组列。分开之后，"写进去的玩家数正好是 kPlayersPerRoom"
+/// 这件事由**类型系统**保证，而不是等到插入时才发现少了一个人。
+struct RoomSnapshotRecord {
+    std::string match_id;
+    std::string room_id;
+    RoomPhase phase = RoomPhase::kCreated;
+    std::int64_t frame = 0;
+    std::array<RoomPlayerRecord, kPlayersPerRoom> players{};
+    /// 胜者 player_id。平局或未结束为空字符串，落库时为 NULL。
+    std::string winner_id;
+    FinishReason finish_reason = FinishReason::kNone;
+    std::int64_t started_at_ms = 0;
+    std::int64_t finished_at_ms = 0;
+    /// 快照写入时间（Unix 毫秒）。TASK-014 的恢复边界要靠它说明"落后了多少"。
+    std::int64_t snapshot_at_ms = 0;
 };
 
 /// 把状态转成可读字符串。仅用于日志与验收脚本的可读输出，不参与协议。

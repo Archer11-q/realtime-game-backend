@@ -33,6 +33,7 @@
 #include "common/mysql_connection.hpp"
 #include "common/version.hpp"
 #include "mysql_match_result_writer.hpp"
+#include "mysql_room_snapshot_writer.hpp"
 #include "room_manager.hpp"
 #include "room_service.hpp"
 #include "room_types.hpp"
@@ -89,8 +90,12 @@ int main(int argc, char* argv[]) {
         std::make_unique<rgbt::common::MysqlConnection>(env_prefix, mysql_options);
     auto result_writer =
         std::make_unique<rgbt::room::MysqlMatchResultWriter>(mysql_connection.get());
+    // 快照写入器（TASK-013）。它与 result_writer 共用一条 MySQL 连接，
+    // 但**失败策略相反**：快照写失败只记日志、不重试，下一个周期覆盖。
+    auto snapshot_writer =
+        std::make_unique<rgbt::room::MysqlRoomSnapshotWriter>(mysql_connection.get());
 
-    rgbt::room::RoomManager manager(result_writer.get());
+    rgbt::room::RoomManager manager(result_writer.get(), snapshot_writer.get());
     rgbt::room::RoomServiceImpl service(&manager);
 
     brpc::Server server;

@@ -20,8 +20,21 @@
 namespace rgbt::common {
 namespace {
 
-/// 预处理语句的参数个数上限。Room 写 match_results 时需要 6 个参数。
-constexpr unsigned int kMaxBindParams = 8;
+/// 预处理语句的参数个数上限。
+///
+/// 2026-10-02 由 8 提升到 32（TASK-013）。原值 8 是按当时的最大用量定的
+/// （「Room 写 match_results 时需要 6 个参数」），但当 TASK-013 要写 15 列的
+/// 房间快照时，这个上限直接变成 `too many params` 失败，一个参数也绑不上。
+///
+/// 为什么用「提高上限」而不是「拆小语句」解决：这个上限只是
+/// `param_binds` 定长数组的容量，32 个 MYSQL_BIND 约 2 KB 栈空间，代价可忽略；
+/// 而拆语句会把一条原子 upsert 变成多条需要自己保证顺序的语句，
+/// 引入的复杂度远大于收益。
+///
+/// 取值 32 而不是刚好 15：给后续新增列留出余量，避免每加一列就要改这里。
+/// 仍保留上限本身是有价值的——它把「参数个数失控」变成一次明确失败，
+/// 而不是让定长数组越界。
+constexpr unsigned int kMaxBindParams = 32;
 
 /// 一行结果允许的最大列数。players 与 match_results 都不超过 10 列。
 constexpr unsigned int kMaxResultColumns = 16;
@@ -256,7 +269,11 @@ bool MysqlConnection::Query(const std::string& sql, const std::vector<std::strin
     out_rows->clear();
 
     if (params.size() > kMaxBindParams) {
-        last_error_ = "too many params";
+        // 错误信息必须带上实际值与上限。原来的 "too many params" 两头都没有，
+        // 调用方只看到一句"参数太多"，既不知道该减到多少，也不知道这个限制
+        // 来自哪里——TASK-013 为此多花了好几轮排查。
+        last_error_ = "too many params: got " + std::to_string(params.size()) + ", limit is " +
+                      std::to_string(kMaxBindParams);
         return false;
     }
 

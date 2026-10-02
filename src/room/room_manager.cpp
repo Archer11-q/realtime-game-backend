@@ -18,8 +18,10 @@ std::string GenerateRoomId() {
 
 }  // namespace
 
-RoomManager::RoomManager(MatchResultWriter* writer, std::function<std::string()> room_id_factory)
+RoomManager::RoomManager(MatchResultWriter* writer, RoomSnapshotWriter* snapshot_writer,
+                         std::function<std::string()> room_id_factory)
     : writer_(writer),
+      snapshot_writer_(snapshot_writer),
       room_id_factory_(room_id_factory ? std::move(room_id_factory) : GenerateRoomId) {}
 
 std::string RoomManager::MakeRoomId() const {
@@ -183,6 +185,7 @@ ResultOutcome RoomManager::GetResult(const std::string& match_id, std::int64_t n
 
 void RoomManager::Tick(std::int64_t now_ms) {
     std::vector<std::string> to_persist;
+    std::vector<RoomSnapshotRecord> snapshots;
 
     {
         const std::lock_guard<std::mutex> lock(mutex_);
@@ -197,8 +200,29 @@ void RoomManager::Tick(std::int64_t now_ms) {
             }
         }
 
+        // 收集本轮到期的房间快照。**只在这里取副本**，写库放到锁外。
+        // 快照与结果落库共用同一条"锁内取、锁外写"的规则，理由相同：
+        // 一次 MySQL 超时不能让所有房间的 tick 一起停摆。
+        if (snapshot_writer_ != nullptr) {
+            for (auto& entry : rooms_) {
+                BattleRoom& room = *entry.second;
+                SnapshotState& state = snapshot_state_[room.match_id()];
+                if (!ShouldSnapshot(state, room.phase(), now_ms)) {
+                    continue;
+                }
+                snapshots.push_back(MakeSnapshotRecord(room, now_ms));
+                state.last_write_ms = now_ms;
+                state.last_phase = room.phase();
+                state.written = true;
+            }
+        }
+
         ReapExpiredLocked(now_ms);
     }
+
+    // 快照先写。它与结果落库互不依赖，但快照是旁路、失败也无所谓，
+    // 放在前面可以让"本轮有没有快照要写"这件事更早看到。
+    FlushSnapshots(snapshots);
 
     // 持久化放在锁外：MySQL 调用可能耗时数百毫秒甚至超时，
     // 持锁会让所有房间的 tick 一起停顿。
@@ -245,8 +269,86 @@ void RoomManager::ReapExpiredLocked(std::int64_t now_ms) {
             continue;
         }
         match_index_.erase(it->second->match_id());
+        // 快照调度状态必须跟着房间一起清掉，否则这张表会随对局数无限增长，
+        // 而且残留的状态会让同 match_id 的后续房间以为"已经写过快照"。
+        snapshot_state_.erase(it->second->match_id());
         it = rooms_.erase(it);
     }
+}
+
+bool RoomManager::ShouldSnapshot(const SnapshotState& state, RoomPhase phase, std::int64_t now_ms) {
+    const bool terminal = (phase == RoomPhase::kFinished || phase == RoomPhase::kAborted);
+    if (terminal && (!state.written || state.last_phase != phase)) {
+        // 进入终态时立刻写一次，别让快照停在中间态（例如结果已落库但表里还是
+        // FINISHING）。判据是"阶段变了"而不是"隔了多久"，因为这里不该有延迟。
+        return true;
+    }
+    if (!state.written) {
+        // 第一个快照立刻写：让"这里曾经有一局"从一开始就成立。
+        return true;
+    }
+    return now_ms - state.last_write_ms >= kSnapshotIntervalMs;
+}
+
+RoomSnapshotRecord RoomManager::MakeSnapshotRecord(const BattleRoom& room, std::int64_t now_ms) {
+    const RoomSnapshot snapshot = room.Snapshot();
+    RoomSnapshotRecord record;
+    record.match_id = snapshot.match_id;
+    record.room_id = snapshot.room_id;
+    record.phase = snapshot.phase;
+    record.frame = snapshot.frame;
+    record.winner_id = snapshot.winner_id;
+    record.finish_reason = snapshot.finish_reason;
+    record.started_at_ms = snapshot.started_at_ms;
+    record.finished_at_ms = snapshot.finished_at_ms;
+    record.snapshot_at_ms = now_ms;
+
+    // 定长数组与固定两人一局一一对应。房间的玩家数由 BattleRoom 的不变量保证，
+    // 这里再夹一次下标，是为了即便上游出错也不会越界写内存。
+    for (std::size_t i = 0; i < kPlayersPerRoom && i < snapshot.players.size(); ++i) {
+        record.players[i].player_id = snapshot.players[i].player_id;
+        record.players[i].hp = snapshot.players[i].hp;
+        // connected 表达的是"已在房间内"（见 room_types.hpp 的说明），
+        // 正好就是 rooms.pN_joined 要存的东西。
+        record.players[i].joined = snapshot.players[i].connected;
+    }
+    return record;
+}
+
+void RoomManager::FlushSnapshots(const std::vector<RoomSnapshotRecord>& records) {
+    if (snapshot_writer_ == nullptr || records.empty()) {
+        return;
+    }
+
+    std::uint64_t succeeded = 0;
+    std::uint64_t failed = 0;
+    for (const RoomSnapshotRecord& record : records) {
+        if (snapshot_writer_->Save(record) == SnapshotWriteStatus::kOk) {
+            ++succeeded;
+            continue;
+        }
+        ++failed;
+        // **故意不重试**：快照可以丢弃，下一个周期会天然覆盖它。
+        // 把它做成"必须成功"会让一次 MySQL 抖动在内存里堆起一批过期快照，
+        // 而收益为零——过期快照本来就没有价值。这是它与对局结果的根本区别。
+        //
+        // 失败原因由 writer 记录（只有它知道 MySQL 的错误），这里只计数，
+        // 避免同一个失败被记两遍、把日志刷满。
+    }
+
+    const std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_write_count_ += succeeded;
+    snapshot_failure_count_ += failed;
+}
+
+std::uint64_t RoomManager::SnapshotWriteCount() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return snapshot_write_count_;
+}
+
+std::uint64_t RoomManager::SnapshotFailureCount() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return snapshot_failure_count_;
 }
 
 std::size_t RoomManager::RoomCount() {
