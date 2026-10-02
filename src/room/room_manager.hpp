@@ -30,6 +30,7 @@
 
 #include "battle_room.hpp"
 #include "match_result_writer.hpp"
+#include "room_snapshot_writer.hpp"
 #include "room_types.hpp"
 
 namespace rgbt::room {
@@ -61,9 +62,13 @@ class RoomManager {
 public:
     /// @param writer 对局结果存储。可以为 nullptr（此时任何落库都会失败），
     ///        主要用于不关心持久化的测试。
+    /// @param snapshot_writer 房间快照存储（TASK-013）。可以为 nullptr
+    ///        （此时不写快照），用于不关心快照的测试。
+    ///        **它的失败策略与 writer 相反**：快照写失败只记日志、不重试，
+    ///        下一次周期覆盖；对局结果写失败必须持续重试。见 room_snapshot_writer.hpp。
     /// @param room_id_factory 房间号生成器；默认使用随机 Token。
     ///        注入的目的只是让测试可得到确定结果，生产路径不需要自定义。
-    explicit RoomManager(MatchResultWriter* writer,
+    explicit RoomManager(MatchResultWriter* writer, RoomSnapshotWriter* snapshot_writer = nullptr,
                          std::function<std::string()> room_id_factory = {});
 
     RoomManager(const RoomManager&) = delete;
@@ -120,6 +125,16 @@ public:
     /// 而不是等到客户端查不到结果才发现。
     [[nodiscard]] std::size_t PendingResultCount();
 
+    /// @brief 累计写入成功的房间快照数。仅供验收脚本与指标使用。
+    [[nodiscard]] std::uint64_t SnapshotWriteCount();
+
+    /// @brief 累计写入失败的房间快照数。
+    ///
+    /// **它大于 0 本身不是故障信号**——快照可以丢弃，下一次周期会覆盖。
+    /// 但若它随快照总数一起增长，说明快照存储长期不可用，
+    /// 此时"重启可恢复"这件事实际上已经不成立了，需要被看到。
+    [[nodiscard]] std::uint64_t SnapshotFailureCount();
+
 private:
     /// 生成房间号。
     [[nodiscard]] std::string MakeRoomId() const;
@@ -127,7 +142,32 @@ private:
     /// 回收已过期房间。调用方必须已持有 mutex_。
     void ReapExpiredLocked(std::int64_t now_ms);
 
+    /// 每个房间的快照调度状态。
+    struct SnapshotState {
+        /// 上一次写快照的时间。
+        std::int64_t last_write_ms = 0;
+        /// 上一次写快照时房间处于哪个阶段。用于识别"刚刚进入终态"。
+        RoomPhase last_phase = RoomPhase::kCreated;
+        /// 是否已经写过至少一次。
+        ///
+        /// 为什么第一个快照不等间隔、立刻写：`rooms` 表的用途之一是"事后能查到
+        /// 这里曾经有一局"。等一秒再写会让一个刚创建就异常退出的房间完全消失。
+        bool written = false;
+    };
+
+    /// 判断某个房间本轮是否需要写快照。调用方必须已持有 mutex_。
+    [[nodiscard]] static bool ShouldSnapshot(const SnapshotState& state, RoomPhase phase,
+                                             std::int64_t now_ms);
+
+    /// 由房间生成快照记录。调用方必须已持有 mutex_。
+    [[nodiscard]] static RoomSnapshotRecord MakeSnapshotRecord(const BattleRoom& room,
+                                                               std::int64_t now_ms);
+
+    /// 把本轮到期的快照写入存储。**不持锁**。
+    void FlushSnapshots(const std::vector<RoomSnapshotRecord>& records);
+
     MatchResultWriter* writer_;
+    RoomSnapshotWriter* snapshot_writer_;
     std::function<std::string()> room_id_factory_;
 
     mutable std::mutex mutex_;
@@ -135,6 +175,10 @@ private:
     std::unordered_map<std::string, std::unique_ptr<BattleRoom>> rooms_;
     /// match_id -> room_id。创建幂等的实现基础。
     std::unordered_map<std::string, std::string> match_index_;
+    /// match_id -> 快照调度状态。房间被回收时一并清理。
+    std::unordered_map<std::string, SnapshotState> snapshot_state_;
+    std::uint64_t snapshot_write_count_ = 0;
+    std::uint64_t snapshot_failure_count_ = 0;
 };
 
 }  // namespace rgbt::room

@@ -120,18 +120,34 @@ MySQL：players（Gateway 拥有）、match_results（Room/Battle 拥有）
 
 ## 当前状态
 
-当前处于 `Phase 1：最小业务闭环`。Phase 0 已完成（2026-09-17），其退出标准均已
-验证：CI 在功能分支与 main 上均为 success，登录链路的单元测试与端到端验收全部通过。
+当前处于 `Phase 1：最小业务闭环`，**功能范围已全部实现并验证**，等待项目所有者
+对 TASK-011 的合并确认后即可推进到 Phase 2。
 
 已完成的能力：
 
-- Gateway 提供登录、查询当前玩家、登出三个接口，会话存于 Redis。
-- 玩家档案存于 MySQL，登录时从 `players` 表读取（Gateway 拥有该表，见
-  ADR-0002 与 ADR-0003）。
-- brpc + Protobuf 的构建与运行链路已验证（vcpkg 提供依赖）。
+- 三个服务：Gateway（HTTP/SSE）、Match（匹配队列）、Room/Battle（房间与对战）。
+- 登录、匹配、进房、对战、结算的完整链路，服务端权威推进（10 Hz）。
+- 对局结束时由 Room/Battle **同步幂等**写入 `match_results`。
+- 服务端推送走 **SSE**（不用 WebSocket，理由见
+  [ADR-0004](docs/adr/0004-sse-instead-of-websocket.md)）。
+- Vue 3 + TypeScript + Vite + Canvas 的演示前端，四个视图（登录/大厅/对战/结算）。
 - Redis 与 MySQL 通过 Docker Compose 启动，含健康检查与数据卷。
-- 两者的不可用路径均返回 503，且恢复后无需重启服务。
+- 依赖不可用路径均返回明确错误码（503 / 409 / 404）且恢复后无需重启服务。
 - CI 覆盖三个构建预设与代码格式检查。
+
+## 快速开始
+
+```bash
+bash scripts/dev-up.sh      # 一条命令起齐：依赖 + 三个服务 + 前端
+# 浏览器打开 http://127.0.0.1:5173，两个标签页分别登录 alice / bob
+
+bash scripts/verify-all.sh  # 跑完整套端到端验收（实测 142 秒）
+bash scripts/dev-down.sh    # 停干净（加 --with-docker 连容器一起停）
+```
+
+测试账号（开发种子数据，见 `migrations/004_seed_test_players.sql`）：
+`alice` / `bob` / `dave` 为启用身份，`carol` 为禁用身份（用于覆盖失败路径）。
+密码为 `<账号>_dev_pw`。
 
 当前任务见 [TASKS.md](docs/TASKS.md)，开发过程见
 [devlog.md](docs/devlog.md)。

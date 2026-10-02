@@ -1,4 +1,4 @@
-# room 服务：TASK-008 房间生命周期与权威状态。
+# room 服务：TASK-008 房间生命周期与权威状态 + TASK-013 房间快照写入。
 #
 # 依赖 vcpkg 提供的 brpc 与 libmariadb，因此本目录只在启用 vcpkg 工具链时加入
 # （见 src/CMakeLists.txt），保证默认构建与 CI 不受影响。
@@ -22,6 +22,7 @@ add_library(
   rgbt_room_lib STATIC
   battle_room.cpp
   mysql_match_result_writer.cpp
+  mysql_room_snapshot_writer.cpp
   room_manager.cpp
   room_service.cpp
 )

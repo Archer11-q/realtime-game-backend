@@ -80,9 +80,39 @@ export PATH="$HOME/tools/node/bin:$PATH"
 
 ### 集成环境
 
-- 所有 C++ 服务、Web、Redis、MySQL 通过 Docker Compose 启动。
-- 使用固定网络、卷、端口和配置。
-- 用于端到端测试和现场演示。
+**一条命令启动（TASK-011 起）**：
+
+```bash
+bash scripts/dev-up.sh      # 起依赖 + 三个服务 + 前端，并打印人工验证步骤
+bash scripts/dev-down.sh    # 停掉它们（加 --with-docker 连容器一起停）
+```
+
+- 端口固定：Gateway `8080` / Match `8082` / Room `8083` / 前端 `5173`，
+  可用同名环境变量覆盖（`GATEWAY_PORT=9080 bash scripts/dev-up.sh`）。
+- 运行时产物（pid、日志）落在 `.run/`，已加入 `.gitignore`。
+- 用于端到端测试与人工演示。
+
+**关于「全部容器化」——一个此前文档与实现不符的地方**
+
+本节原先写的是「所有 C++ 服务、Web、Redis、MySQL 通过 Docker Compose 启动」，
+但 `deploy/compose/docker-compose.yml` 里**只有 Redis 与 MySQL**，
+`README.md` 写的也是「仅 Redis + MySQL」。也就是说这条描述对应的是一个
+**从未实现过的目标**，两个文档口径不一致。
+
+TASK-011 期间项目所有者确认：**当前不把应用服务容器化**。理由：
+
+- 容器化要引入 4 个 Dockerfile（三个 C++ 服务 + 前端），并在容器里用 vcpkg
+  从源码重建 brpc。这是**「现场演示可复现」与「故障注入」的前置条件**，
+  属于 Phase 4/5 的题目。
+- Phase 1 的退出标准只要求「能用一条命令启动集成环境」，`dev-up.sh` 已满足。
+- 在收益兑现之前先承担成本，不符合 `CLAUDE.md` 第 6 条
+  （不以「更工程化」为理由增加组件）。
+
+**首次构建耗时未实测**，因此不做承诺；真要容器化时，第一步应该是
+**先做一次限时构建实测**，拿到真实数字与内存占用后再决定，
+而不是先写完 Dockerfile 才发现 11 GiB 内存不够。
+
+应用服务容器化已记入 `docs/TASKS.md` 的 Backlog。
 
 ### 故障环境
 
