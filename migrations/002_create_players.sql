@@ -2,12 +2,12 @@
 --
 -- 用途：建立玩家档案表。
 --
--- 范围说明（依据 docs/07-open-decisions.md）：
+-- 范围说明（依据 docs/07-open-decisions.md 与 docs/adr/0003-scope-reduction.md）：
 --   * 本表**不含密码列**。D-002 决定第一版账号密码保留在代码中作为测试数据，
 --     不写入数据库，也不实现注册系统。
---   * 表的所有者是 Player/State 服务（正式归属）。Phase 1 期间由 Gateway 只读，
---     依据 docs/adr/0002-gateway-temporary-player-ownership.md 这一带退出条件的
---     临时安排。
+--   * 表的所有者是 **Gateway**。原定的 Player/State 服务已列为非目标、不实现，
+--     因此 docs/adr/0002 中"临时例外"的退出条件已由 docs/adr/0003 取消，
+--     该归属自 2026-10-02 起为正式安排。Gateway 对本表只读。
 --
 -- 约定：
 --   * 幂等：重复执行不报错、不产生重复行，便于在已有数据卷上安全重跑。

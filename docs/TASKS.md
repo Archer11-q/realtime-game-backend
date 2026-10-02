@@ -1,7 +1,14 @@
 # 当前任务
 
-> 状态：Phase 1 进行中。TASK-000 至 TASK-006 已完成，TASK-007 任务单待确认。
+> 状态：Phase 1 进行中。TASK-000 至 TASK-007 已完成并合并。
+> **TASK-012（范围裁剪）已完成文档改动，待项目所有者审阅与合并。**
 > 阶段推进依据见 docs/02-roadmap.md 与 docs/devlog.md。
+>
+> **范围裁剪自 2026-10-02 起生效**：Kafka、etcd、多实例、Kubernetes、独立
+> Player/State 服务、独立 Settlement 服务、排行榜、匹配分差放宽**均为非目标，
+> 不实现**。完整理由见 [ADR-0003](adr/0003-scope-reduction.md)。
+> 本文档中 TASK-002/003/004/006/007 的"非范围"条目是**当时的历史记录**，
+> 其含义已由 ADR-0003 强化为"永久不做"。
 
 ## 当前里程碑
 
@@ -327,6 +334,11 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
 | 4 | TASK-009 | Gateway WebSocket 路由与房间消息 | TASK-008 |
 | 5 | TASK-010 | Vue 演示页面：登录、大厅、对战、结算 | TASK-009 |
 | 6 | TASK-011 | 集成验收：一条命令启动并双客户端完成对局 | TASK-010 |
+| — | TASK-012 | 范围裁剪（已先于上面第 3~6 项完成） | TASK-007 |
+
+**范围裁剪对本表的实际影响**：第 3 项 Room/Battle 的职责新增「对局结束时同步幂等
+写入 `match_results`」；原定的 Player/State 与 Settlement 服务、排行榜和异步结算
+**不在计划内**，见 [ADR-0003](adr/0003-scope-reduction.md)。
 
 拆分原则：每个任务都要有**可独立运行的验收命令**，且不引入下一个任务的组件。
 这也是 TASK-007 中「房间只分配 ID、不产生房间状态」的原因——房间真实状态属于 TASK-008。
@@ -477,6 +489,54 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
 - 提交边界：允许改动 `api/proto/`、`src/match/`、`src/gateway/`、`tests/unit/`、
   `scripts/`、顶层 `CMakeLists.txt`、`deploy/compose/.env.example`、`docs/`；
   禁止改动 `src/room/`、`web/`、`migrations/`、`deploy/compose/docker-compose.yml`。
+
+## TASK-012：范围裁剪——把非目标写进文档
+
+> **编号说明**：本任务在编号上排在 Phase 1 计划之后，但**实际执行时间早于
+> TASK-008 起的所有待办任务**。原因是它不实现任何功能，只是把已经确认的范围
+> 裁剪写进文档；若强行插入编号，会导致 `api/proto/` 与 `src/` 中大量指向
+> TASK-008/009 的注释被无意义地改写，扩大文档提交的 Diff。
+
+- 状态：文档改动已完成（2026-10-02），待项目所有者审阅与合并
+- 依赖：TASK-007（已完成并合并，`d6695a9`）
+- 背景问题：原路线图的 Phase 4（etcd/多实例）与 Phase 5（Kafka/Settlement Worker），
+  以及 Player/State 独立服务，已被项目所有者确认为非目标。但**文档里仍把它们写成
+  "后续阶段"**。后续 AI 读到这些描述仍会按计划实现，因此必须把"不做"写进文档，
+  而不是只存在于对话里。
+- 本次目标：
+  - 新增 ADR-0003，记录裁剪范围、理由、备选方案和连带影响。
+  - 把全部文档中的相关描述改为"非目标 / 不实现"。
+  - 处理连带影响：`players` 与 `match_results` 两张表的所有权。
+- 范围（本任务**只改文档与注释，不改任何行为代码**）：
+  - 新增 `docs/adr/0003-scope-reduction.md`。
+  - `CLAUDE.md`：规则 5、技术方向、服务边界、数据所有权、迭代准入条件、
+    当前阶段，并新增"范围裁剪"硬性约束一节。
+  - `README.md`：项目定位、目标架构图、技术基线表、非目标、仓库结构、完成标准。
+  - `docs/00-charter.md`：问题表、功能目标、成功标准、非目标、风险。
+  - `docs/01-architecture.md`：上下文图、服务职责、数据流、状态归属、失败模型、
+    部署演进、接口、变更规则。
+  - `docs/02-roadmap.md`：阶段总览重排，新增"已取消的阶段"一节。
+  - `docs/04-quality-and-observability.md`：移除消息队列相关测试与指标。
+  - `docs/05-api-and-data.md`：服务列表、表清单与所有权、Kafka 章节、幂等与一致性。
+  - `docs/06-operations.md`：故障环境、Runbook、配置清单、备份与发布。
+  - `docs/07-open-decisions.md`：D-004 与 D-005 改为已关闭结论。
+  - `docs/adr/0001`、`docs/adr/0002`：标注部分替代关系。
+  - `deploy/compose/.env.example`：移除 `KAFKA_BROKERS` 与 `ETCD_ENDPOINTS`。
+  - `migrations/002`、`003` 与若干源文件注释中的过期所有权/阶段引用。
+- 非范围：
+  - 不实现任何功能，不修改服务行为、接口契约或数据表结构。
+  - 不删除 `migrations/002`、`003`（迁移只追加，不回溯删除）。
+  - 不改动既有测试与验收脚本的行为。
+- 相关 ADR：新增 ADR-0003；部分替代 ADR-0001 与 ADR-0002。
+- 验收标准：
+  - 全仓库检索 `Kafka`、`etcd`、`Settlement`、`Player/State`、`多实例`，
+    剩余出现处均为"非目标"说明或历史记录，**不存在实现指引**。
+  - `CLAUDE.md`、README、charter、architecture、roadmap 的口径一致。
+  - 服务列表只有 Gateway、Match、Room/Battle 三个。
+  - `deploy/compose/.env.example` 不再包含 Kafka 与 etcd 变量。
+- 回退方式：`git revert` 本任务提交。全部为文档改动，不影响构建与运行。
+- 提交边界：允许改动 `CLAUDE.md`、`README.md`、`docs/`、`deploy/compose/.env.example`、
+  `migrations/*.sql` 的注释、`CMakeLists.txt` 与 `src/` 的注释；禁止改动任何可执行逻辑。
 
 ## Backlog：后续待办
 

@@ -26,7 +26,7 @@
 | GET | `/api/v1/matches/current` | 查询当前匹配状态 | 已实现（TASK-007） |
 | POST | `/api/v1/matches/current/cancel` | 取消匹配 | 已实现（TASK-007） |
 | GET | `/api/v1/rooms/{room_id}` | 查询房间状态 | 待 TASK-008 |
-| GET | `/api/v1/results/{match_id}` | 查询对局结果 | 待 Phase 5 |
+| GET | `/api/v1/results/{match_id}` | 查询对局结果 | 待 TASK-008 |
 | GET | `/health` | 健康检查 | 已实现（brpc 内置服务） |
 
 接口名称在实现前可以调整，但必须更新本文档。
@@ -92,13 +92,13 @@ HTTP 方法分派**，同一路径无法同时承载 GET 与 DELETE，因此改�
 
 ## 3. 服务间 Protobuf
 
-建议服务：
+服务集合固定为三个，见 [ADR-0003](adr/0003-scope-reduction.md)：
 
 - `GatewayService`
 - `MatchService`（已实现，TASK-007，契约见 `api/proto/match.proto`）
 - `RoomService`
-- `PlayerService`
-- `SettlementService`
+
+**不实现** `PlayerService` 与 `SettlementService`；不要为它们创建 `.proto`。
 
 每个 RPC 必须包含：
 
@@ -135,7 +135,6 @@ HTTP 方法分派**，同一路径无法同时承载 GET 与 DELETE，因此改�
 - 登录 Session 和连接映射。
 - 匹配队列临时状态。
 - 房间短期路由信息。
-- 排行榜视图。
 - 限流和短期幂等标记。
 
 当前落地情况（TASK-007 记录）：**匹配队列没有放进 Redis**。队列所有者是 Match，
@@ -151,14 +150,15 @@ Gateway 直接读 Redis 中的队列状态，必须先写 ADR。
 
 ### MySQL
 
-建议表：
+表清单（只保留有明确所有者的表）：
 
-- `players`
-- `player_stats`
-- `match_results`
-- `room_records`
-- `processed_events`
-- `schema_migrations`
+- `players`（所有者：Gateway）
+- `match_results`（所有者：Room/Battle）
+- `schema_migrations`（迁移记录）
+
+**不建** `player_stats`、`room_records`、`processed_events`：前两者在当前范围内没有
+写入者；`processed_events` 属于事件消费链路，已列为非目标。见
+[ADR-0003](adr/0003-scope-reduction.md)。
 
 约束：
 
@@ -180,9 +180,10 @@ Gateway 直接读 Redis 中的队列状态，必须先写 ADR。
 | `created_at` | `TIMESTAMP` | 创建时间 |
 | `updated_at` | `TIMESTAMP` | 更新时间，自动刷新 |
 
-- 所有者：Player/State（正式归属）。
-- 访问方式：Phase 1 期间由 Gateway **只读**，依据
-  [ADR-0002](adr/0002-gateway-temporary-player-ownership.md)；其余服务不得直接读写。
+- 所有者：**Gateway**，依据
+  [ADR-0002](adr/0002-gateway-temporary-player-ownership.md) 与
+  [ADR-0003](adr/0003-scope-reduction.md)。原定的 Player/State 所有者已取消。
+- 访问方式：Gateway **只读**，经 `PlayerReader` 接口读取；其余服务不得直接读写。
 - **不含密码列**：第一版账号密码保留在代码中作为测试数据，见
   `docs/07-open-decisions.md` 的 D-002。
 
@@ -197,31 +198,23 @@ Gateway 直接读 Redis 中的队列状态，必须先写 ADR。
 | `started_at` | `TIMESTAMP` | 开局时间，可空 |
 | `finished_at` | `TIMESTAMP` | 结束时间，默认当前时间 |
 
-- 所有者：Settlement（正式归属）。
-- 访问方式：Phase 1 不写入，仅建表；Settlement Worker 在 Phase 5 落地后写入。
+- 所有者：**Room/Battle**，依据 [ADR-0003](adr/0003-scope-reduction.md)。
+  原定的 Settlement 所有者已取消。
+- 访问方式：对局结束时由 Room/Battle **同步幂等**写入，以 `match_id` 为幂等业务键；
+  **不经过任何消息队列**。重复写入同一 `match_id` 返回已有结果，不产生第二行。
 
 迁移文件位于 `migrations/`，按 `NNN_描述.sql` 命名且必须幂等。
 注意：`/docker-entrypoint-initdb.d` 只在数据目录为空时执行一次，
 因此新增迁移需显式应用（`scripts/verify-login.sh` 会做这件事）。
 `004_seed_test_players.sql` 含测试数据，**仅用于开发环境**，文件头已标注。
 
-### Kafka
+### 消息队列：不使用
 
-建议事件：
+**不使用 Kafka 或任何消息队列**，见 [ADR-0003](adr/0003-scope-reduction.md)。
 
-- `match.created`
-- `match.cancelled`
-- `room.created`
-- `room.finished`
-- `player.disconnected`
-- `player.reconnected`
-
-事件要求：
-
-- 使用 `event_id`、`event_type`、`occurred_at` 和 `schema_version`。
-- 使用业务键分区，例如 `room_id` 或 `match_id`。
-- 消费方必须假设消息可能重复和乱序。
-- 消费成功后记录处理结果，支持安全重试。
+因此本项目**没有**领域事件、事件回放、异步结算 Worker、消费位点、死信队列和
+消费积压监控。跨服务协作只走 brpc 同步调用，对局结果由 Room/Battle 同步幂等写入
+MySQL。
 
 ## 5. 幂等规则
 
@@ -230,23 +223,22 @@ Gateway 直接读 Redis 中的队列状态，必须先写 ADR。
 - 登录会话创建。
 - 进入和取消匹配。
 - 创建和加入房间。
-- 对局结算。
-- 排行榜更新。
+- 对局结果写入。
 
 推荐：
 
 - 客户端请求使用 `request_id`。
-- 业务结算使用 `match_id` 作为唯一业务键。
+- 对局结果使用 `match_id` 作为唯一业务键。
 - Redis 只做短期快速判断，MySQL 唯一约束作为最终保护。
 - 幂等冲突返回已有结果，而不是创建新副作用。
 
 ## 6. 数据一致性
 
-- 房间实时状态由 Room Service 负责，其他服务不得直接修改。
-- 结算采用最终一致，客户端查询需要区分“处理中”和“已完成”。
+- 房间实时状态由 Room/Battle Service 负责，其他服务不得直接修改。
+- 对局结果写入采用**同步幂等**：一次写入成功即对客户端可见，不存在"处理中"中间态。
 - 缓存更新失败不能导致数据库出现错误成功记录。
 - Redis 和 MySQL 同时更新时，明确先后顺序、失败补偿和重建策略。
-- 跨服务操作不伪装成原子事务；使用状态机、事件和补偿。
+- 跨服务操作不伪装成原子事务；使用状态机和补偿。
 
 ## 7. Schema 演进
 

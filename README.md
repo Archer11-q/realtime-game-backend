@@ -1,13 +1,14 @@
 # Realtime Game Backend
 
-> 面向小型实时对战产品的分布式游戏服务端参考实现
+> 面向小型实时对战产品的游戏服务端参考实现
 >
-> C++20 / brpc / Protobuf / WebSocket / Redis / MySQL / Kafka / etcd / Vue 3
+> C++20 / brpc / Protobuf / WebSocket / Redis / MySQL / Docker Compose / Vue 3
 
 ## 项目定位
 
-本项目是一套面向小型实时对战产品的分布式游戏服务端参考实现，重点验证主流后端
-技术栈、分布式服务设计、数据一致性、故障恢复、可观测性和工程交付能力。
+本项目是一套面向小型实时对战产品的游戏服务端参考实现，重点验证主流后端技术栈、
+服务边界与数据所有权设计、有状态服务的持久化与恢复、故障处理、可观测性和工程
+交付能力。
 
 它不是通用 RPC 框架，也不是完整商业游戏，而是一套可运行、可部署、可压测、
 可故障注入和可现场演示的实时对战服务端。
@@ -16,15 +17,21 @@
 
 实时对战业务通常会遇到以下问题：
 
-- 单机服务无法承载持续增长的连接和房间。
 - 玩家断线后，会话、房间和战斗状态容易丢失。
-- 匹配、房间、结算、排行榜之间的数据边界不清晰。
-- 请求重试可能造成重复结算或重复入队。
-- 服务节点故障后缺少发现、恢复和迁移能力。
+- 匹配、房间和对局结果之间的数据边界不清晰。
+- 请求重试可能造成重复入队或重复写入对局结果。
+- 进程崩溃后房间状态缺少明确可验证的恢复边界。
+- 依赖（Redis/MySQL）不可用时容易写出"假成功"。
 - 只有日志，没有指标、链路和可复现的性能基线。
 
-本项目通过明确服务边界、持久化关键状态、引入幂等和可观测性来逐步解决这些问题。
-只有真实问题出现后，才引入对应的分布式组件，避免为了展示技术而堆叠组件。
+本项目通过明确服务边界、持久化关键状态、引入幂等、故障注入和可观测性来逐个解决
+这些问题，**每个结论都必须有可重复执行的验证脚本和实测数据**。
+
+### 明确不做的事
+
+本项目**不接入消息队列、服务发现、多实例或容器编排**。这不是"还没做"，
+而是经过评估的取舍：当前架构里没有它们的真实消费者，引入只会增加故障面和调试
+成本。完整理由与替代方案见 [ADR-0003](docs/adr/0003-scope-reduction.md)。
 
 ## 核心用户流程
 
@@ -36,34 +43,37 @@
   -> WebSocket 进入对战
   -> 发生断线并重连
   -> 对局结束
-  -> 结算、排行榜和回放事件
+  -> Room/Battle 同步幂等写入对局结果
+  -> 查询对局结果
 ```
 
 ## 目标架构
+
+**服务集合固定为三个**（见 [ADR-0003](docs/adr/0003-scope-reduction.md)）：
 
 ```text
 浏览器演示页 / 机器人客户端
              |
        HTTP + WebSocket
              |
-       Gateway Service
+       Gateway Service          ← 会话、鉴权、路由、限流
              |
       brpc + Protobuf
              |
-   +---------+----------+-----------+
-   |                    |           |
-Match Service     Room/Battle    Player/State
-                   Service         Service
-   |                    |           |
-   +---------+----------+-----------+
+   +---------+----------+
+   |                    |
+Match Service     Room/Battle Service   ← 房间状态、快照、对局结果
+   |                    |
+   +---------+----------+
              |
-    Settlement Worker
+        Redis / MySQL
 
-Redis：会话、缓存、排行榜
-MySQL：玩家、房间、战绩
-Kafka：领域事件、异步结算、回放
-etcd：服务注册、发现、租约
+Redis：会话、缓存、短期状态
+MySQL：players（Gateway 拥有）、match_results（Room/Battle 拥有）
 ```
+
+**不实现**：Kafka、etcd、Player/State 服务、Settlement 服务、多实例、Kubernetes。
+跨服务协作只走 brpc 同步调用；对局结果由 Room/Battle 同步幂等写入，不走异步链路。
 
 详细边界见 [架构设计](docs/01-architecture.md)，迭代依据见
 [迭代路线图](docs/02-roadmap.md)。
@@ -76,25 +86,37 @@ etcd：服务注册、发现、租约
 | 语言与构建 | C++20、GCC 15.2、CMake 4.2.3、Ninja 1.13.2、vcpkg | 主流 C++ 工程构建 |
 | 服务通信 | brpc + Protobuf | 内部服务调用和协议契约 |
 | 客户端通信 | HTTP + WebSocket | 浏览器登录、状态推送和实时消息 |
-| 数据存储 | Redis + MySQL | 会话、缓存、持久化和战绩 |
-| 事件系统 | Kafka | 领域事件、异步结算和回放 |
-| 协调服务 | etcd | 注册、发现、租约和节点信息 |
+| 数据存储 | Redis + MySQL | 会话、缓存、玩家档案和对局结果 |
 | 前端演示 | Vue 3 + TypeScript + Vite + Canvas | 可视化和端到端演示 |
 | 可观测性 | Prometheus + Grafana + OpenTelemetry | 指标、日志、链路和面板 |
 | 工程质量 | GoogleTest、ASan、TSan、UBSan | 测试、内存和并发检查 |
 | 部署 | Docker Compose、GitHub Actions | 本地集成环境和持续集成 |
 
 技术选型的决策记录见
-[ADR-0001](docs/adr/0001-initial-platform-and-stack.md)。
+[ADR-0001](docs/adr/0001-initial-platform-and-stack.md)；
+范围裁剪见 [ADR-0003](docs/adr/0003-scope-reduction.md)。
 
 ## 明确的非目标
 
 - 不做通用 RPC 框架，不重复实现基础通信能力。
 - 不追求商业级游戏功能，不做复杂渲染、美术、账号平台和支付系统。
-- 不一开始就拆成大量微服务，不默认采用 Kubernetes。
 - 不以代码量或版本号作为迭代成果。
 - 不在没有容量证据时做性能优化，不编造压测数字。
 - 不让多个 AI 同时修改同一分支。
+
+### 已确认的非目标（不做，且不是"延后"）
+
+依据 [ADR-0003](docs/adr/0003-scope-reduction.md)，以下内容**不实现**：
+
+- Kafka 及任何消息队列、领域事件、事件回放、异步结算 Worker
+- etcd 及任何服务注册、发现、租约机制
+- 多实例部署与水平扩展
+- Kubernetes / k3s / 容器编排
+- 独立的 Player/State 服务与独立的 Settlement 服务
+- 排行榜
+- 匹配分差放宽 / MMR / 评分体系
+
+要恢复其中任何一项，必须先撤销或修改 ADR-0003。
 
 ## 当前状态
 
@@ -104,7 +126,8 @@ etcd：服务注册、发现、租约
 已完成的能力：
 
 - Gateway 提供登录、查询当前玩家、登出三个接口，会话存于 Redis。
-- 玩家档案存于 MySQL，登录时从 `players` 表读取（Phase 1 临时安排，见 ADR-0002）。
+- 玩家档案存于 MySQL，登录时从 `players` 表读取（Gateway 拥有该表，见
+  ADR-0002 与 ADR-0003）。
 - brpc + Protobuf 的构建与运行链路已验证（vcpkg 提供依赖）。
 - Redis 与 MySQL 通过 Docker Compose 启动，含健康检查与数据卷。
 - 两者的不可用路径均返回 503，且恢复后无需重启服务。
@@ -117,13 +140,11 @@ etcd：服务注册、发现、租约
 
 ```text
 realtime-game-backend/
-├── api/proto/                 # Protobuf 接口契约
+├── api/proto/                 # Protobuf 接口契约（gateway / match / room）
 ├── src/
 │   ├── gateway/               # HTTP/WebSocket 网关（含本服务内部头文件）
 │   ├── match/                 # 匹配服务
-│   ├── room/                  # 房间和战斗服务
-│   ├── player/                # 玩家和状态服务
-│   └── settlement/            # 异步结算 Worker
+│   └── room/                  # 房间和战斗服务
 ├── include/common/            # 跨服务公共基础设施
 ├── tests/
 │   ├── unit/                  # 单元测试，按服务分子目录（unit/<service>/）
@@ -133,12 +154,15 @@ realtime-game-backend/
 ├── chaos/                     # 故障注入工具
 ├── web/                       # Vue 演示页面
 ├── deploy/
-│   ├── compose/               # Docker Compose
+│   ├── compose/               # Docker Compose（仅 Redis + MySQL）
 │   └── monitoring/            # Prometheus/Grafana 配置
 ├── migrations/                # MySQL 版本化迁移
 ├── scripts/                   # 开发和运维脚本
 └── docs/                      # 设计、ADR、任务与运行文档
 ```
+
+> **不要创建 `src/player/` 与 `src/settlement/`**：这两个服务已由
+> [ADR-0003](docs/adr/0003-scope-reduction.md) 列为非目标。
 
 > **放置规则**：只有被两个及以上服务使用的代码才放 `include/common/`；
 > 服务内部头文件与实现一起放在 `src/<service>/`，单元测试放
@@ -163,7 +187,8 @@ realtime-game-backend/
 3. [项目章程](docs/00-charter.md)
 4. [架构设计](docs/01-architecture.md)
 5. [迭代路线图](docs/02-roadmap.md)
-6. [当前任务](docs/TASKS.md)
+6. [范围裁剪 ADR-0003](docs/adr/0003-scope-reduction.md)（**必读：定义了不做什么**）
+7. [当前任务](docs/TASKS.md)
 
 ## 开发与验收方式
 
@@ -183,10 +208,12 @@ realtime-game-backend/
 
 - 两个浏览器完成登录、匹配、进入房间和一场最小对战。
 - 客户端断线后在宽限期内恢复会话和房间位置。
-- 业务进程重启后恢复关键状态，重复结算不会产生重复战绩。
-- 服务节点故障时完成发现、降级或迁移。
-- Grafana 展示连接数、QPS、延迟、错误率、房间数和消息积压。
+- 业务进程 `kill -9` 后恢复关键状态，重复写入不产生重复对局结果。
+- Redis/MySQL 不可用时返回明确错误（不写假成功），恢复后无需重启。
+- 优雅退出：收到 SIGTERM 后停止接收新房间、等待活跃对局结束。
+- Grafana 展示连接数、QPS、延迟、错误率、房间数和重连次数。
 - 形成可复现压测基线、故障注入结果、架构文档和 Runbook。
+- 能解释每个技术选择的替代方案，**包括为什么不做 Kafka、etcd 和多实例**。
 
 具体阶段性验收见 [验收标准](docs/04-quality-and-observability.md) 和
 [路线图](docs/02-roadmap.md)。
