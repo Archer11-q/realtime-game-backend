@@ -1,8 +1,12 @@
 # 当前任务
 
-> 状态：Phase 1 进行中。TASK-000 至 TASK-007 已完成并合并，TASK-012 已完成。
-> **TASK-008（Room/Battle Service）已实现，待项目所有者审阅与验收。**
-> 阶段推进依据见 docs/02-roadmap.md 与 docs/devlog.md。
+> 状态：**Phase 1 已完成，Phase 2 进行中。**
+> `main` 上已合并：TASK-000 ~ TASK-010，以及 TASK-012（范围裁剪文档）。
+> 尚未合并（在 `feat/phase-2` 分支上）：TASK-011（一条命令启动集成环境）、
+> TASK-013（房间快照落库）。
+> **TASK-014（房间重启恢复与恢复边界）已实现，待项目所有者审阅与验收**，
+> 位于分支 `feat/task-014-room-recovery`（基于 `wip/task-014-partial`，
+> 也就是 TASK-013 之上）。阶段推进依据见 docs/02-roadmap.md 与 docs/devlog.md。
 >
 > **范围裁剪自 2026-10-02 起生效**：Kafka、etcd、多实例、Kubernetes、独立
 > Player/State 服务、独立 Settlement 服务、排行榜、匹配分差放宽**均为非目标，
@@ -805,7 +809,8 @@ Phase 2 要还的历史欠账（此前各任务明确标注为 "Phase 2" 的）�
 
 ### TASK-014：房间重启恢复与恢复边界
 
-- 状态：待确认
+- 状态：**已实现，待项目所有者审阅与验收**（2026-10-02）。
+  分支 `feat/task-014-room-recovery`，基于 `wip/task-014-partial`（TASK-013 之上）。
 - 背景问题：TASK-013 把快照写进了 MySQL，但没有人读它。
   `01-architecture.md` 第 5 节写的「从最近快照恢复」仍未兑现。
 - 本次目标：Room 启动时从 `rooms` 表恢复未结束的房间，并**明确定义恢复边界**。
@@ -821,6 +826,44 @@ Phase 2 要还的历史欠账（此前各任务明确标注为 "Phase 2" 的）�
 - 测试要求：单元测试覆盖各类损坏快照的处理；端到端覆盖「对局进行中 `kill -9`
   Room，重启后房间仍在且能打完」，并记录**实测的进度丢失量**。
 - 回退方式：`git revert`。恢复是启动路径上的旁路，去掉后退回"重启即丢失"。
+- 涉及目录：`src/room/`、`src/gateway/`、`include/common/`、`tests/unit/`、
+  `scripts/`、`docs/`。
+- **实施结果（2026-10-02）**——完整经过见 `docs/devlog.md` 的「TASK-014 实施记录」：
+  - 接手的 `wip/task-014-partial`（`a35b3ef`）自带一个「存在崩溃待查」，
+    本任务把它查清并修完。崩溃根因**不在恢复逻辑里**，而是三个问题：
+    1. `MysqlConnection` 只创建一条连接却被 ticker 线程与启动线程并发使用
+       （`room_main.cpp` 第 110/137/145 行），协议流被打乱后 `mysql_close()`
+       拆 TLS 触发 `OpenSSL internal error: refcount error` → abort。
+       **A/B 实测：修复前 7/10 崩溃 → 修复后 10/10 存活。**
+       修复方式是给该连接加内部互斥；这同时修掉了 Gateway（brpc worker 共用一条
+       连接）的同类隐患。
+    2. 新增的 7e 并发检查又暴露出**同类缺陷的第二个实例**：`RedisSessionStore`
+       共用一条 hiredis 连接且无锁，并发登录时 `SET … NX` 的 `+OK` 被另一个
+       线程的 `GET` 当成 Token 读走（响应体里真的出现过 `"token":"OK"`）。
+       同样加锁修复。
+    3. `verify-all.sh` 里 `all_scripts` 写了两行，第二行把 `verify-persistence`
+       覆盖掉，导致 TASK-013 的验收脚本从未被这条命令跑到（**已修正**）。
+  - 同时修掉 WIP 中三处**不可能通过**的验收断言：7a 在错误的时刻度量恢复位置
+    （房间恢复后立刻继续推进）、7b 的前提自相矛盾（要求"在没有 MySQL 的情况下
+    从 MySQL 恢复"）、第 6 节的 2 秒观察窗太窄（快照写入阻塞 ticker 线程时
+    推进是突发式的）。
+  - 验收结果（WSL，16 核 / 11 GiB）：
+    `--clean-first` 全量重建 **0 error / 0 warning**；`ctest` **185/185 通过**；
+    `check-format.sh` 通过（69 个文件）；`verify-all.sh` **7/7 通过（228 秒）**；
+    `verify-persistence.sh` **连跑 3 次全部退出码 0**，恢复点精确等于最后一次快照
+    （30 / 30 / 29 帧），实测进度丢失 **0 / 0 / 1 帧**（上界 10 帧），
+    12 个并发登录 3 次均 12/12 成功。
+  - **ASan 已运行且干净**：Room 启动恢复路径 5 次运行存活 5/5、
+    **0 条 ASan/UBSan 报告**；Gateway 12 个并发登录 12/12 成功、0 条报告。
+    为此补上了两个基础设施缺口：三个**服务可执行文件**此前没有调用
+    `rgbt_apply_sanitizer`（ASan 版服务根本无法链接，等于 ASan 从未覆盖过服务进程），
+    以及新增 `brpc-asan` 预设（原来的 `asan` 预设不接 vcpkg，覆盖不到
+    `MysqlConnection` / `RedisSessionStore` / `room_manager`）。
+  - **未运行 TSan**：没有 TSan 预设，brpc + TSan 组合未验证过。并发缺陷的证据来自
+    A/B 复现、ASan 与直接现象（响应体里出现 `"token":"OK"`），**不是**来自 TSan。
+  - 新增的已知限制（已写入 `docs/01-architecture.md`）：快照写入在 ticker 线程上，
+    MySQL 不可用时该线程会阻塞在连接超时上，因此对局推进变成突发式而非严格 10 Hz。
+    要把依赖延迟完全从推进线程摘掉需要独立写入线程，属 Phase 3（无容量证据）。
 
 ### TASK-015：匹配队列的 Redis 快照与重启恢复
 
@@ -918,6 +961,20 @@ Phase 2 要还的历史欠账（此前各任务明确标注为 "Phase 2" 的）�
 
 ## Backlog：后续待办
 
+- **新增 TSan 预设**（TASK-014 期间发现）。`MysqlConnection` 与 `RedisSessionStore`
+  都因"同一连接被多线程共用"而修出真实缺陷，而这类问题正是 TSan 的强项；
+  当前仓库没有 TSan 预设，`brpc + TSan` 的组合也从未验证过（TSan 与 brpc 的
+  兼容性未知，可能需要单独评估）。在补上之前，并发缺陷只能靠 A/B 复现与 ASan
+  这类间接证据。参见 `docs/devlog.md` 的「TASK-014 实施记录」。
+- **把快照写入从 ticker 线程移出去**（TASK-014 期间记录为已知限制）。当前
+  `RoomManager::Tick` 在推进线程上直接写快照，因此 MySQL 不可用时推进会被连接
+  超时阻塞、变成突发式。需要独立写入线程或异步队列，但**先要有容量证据**
+  （Phase 3 的压测），否则属于提前引入复杂度。
+- **跨 Windows / WSL 的同步工具**（TASK-014 期间踩了两次）。临时用的 rsync 脚本
+  同时踩到 mtime（Ninja 不重建 → 新旧目标文件混链 → 假崩溃）与权限位
+  （DrvFs 全 755 → 154 个文件权限被改）两个坑。当前靠脚本里的 `touch` +
+  按 git 恢复权限来兜底，但它是会话临时工具、不在仓库里。若后续继续双环境协作，
+  应该把它固化成一个受版本控制的脚本并写进 `docs/06-operations.md`。
 - **应用服务的容器化**（TASK-011 期间决定延后）。给三个 C++ 服务与前端写
   Dockerfile，并加进 `deploy/compose/docker-compose.yml`。它是「现场演示可复现」
   与「故障注入」的前置条件，属于 Phase 4/5。

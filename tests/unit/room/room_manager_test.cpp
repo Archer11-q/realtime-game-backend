@@ -108,6 +108,22 @@ void AdvanceTo(RoomManager* manager, std::int64_t from_ms, std::int64_t target_m
     }
 }
 
+/// 摆出「双方已到齐、对局进行中」的局面。
+///
+/// 前提：调用方必须让 manager 使用返回 "r-fixed" 的 room_id_factory。
+///
+/// 为什么断言每一步而不是忽略返回值：
+///   * 这是本文件中大多数对局类用例的**前置条件**。若 Create 或 Join 悄悄失败，
+///     后面的断言会在完全不相干的地方报错（例如"帧号不对"），把"局面没摆出来"
+///     误报成产品逻辑坏了。
+///   * 这三个接口都带 `[[nodiscard]]`，忽略返回值本身就会产生编译告警。
+void OpenPlayingRoom(RoomManager* manager) {
+    ASSERT_EQ(manager->Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr),
+              CreateOutcome::kOk);
+    ASSERT_EQ(manager->Join("r-fixed", "p-0001", kT0, nullptr), JoinOutcome::kOk);
+    ASSERT_EQ(manager->Join("r-fixed", "p-0002", kT0, nullptr), JoinOutcome::kOk);
+}
+
 // ---------------------------------------------------------------------------
 // 创建
 // ---------------------------------------------------------------------------
@@ -187,7 +203,8 @@ TEST(RoomManagerTest, JoinAndSubmitReachTheRoom) {
     RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
 
     RoomSnapshot snapshot;
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
+    ASSERT_EQ(manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr),
+              CreateOutcome::kOk);
 
     EXPECT_EQ(manager.Join("r-fixed", "p-0001", kT0, &snapshot), JoinOutcome::kOk);
     EXPECT_EQ(snapshot.phase, RoomPhase::kWaiting);
@@ -209,7 +226,8 @@ TEST(RoomManagerTest, JoinAndSubmitReachTheRoom) {
 TEST(RoomManagerTest, ResultIsNotFoundWhileGameIsRunning) {
     FakeResultWriter writer;
     RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
+    ASSERT_EQ(manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr),
+              CreateOutcome::kOk);
 
     MatchResultRecord record;
     EXPECT_EQ(manager.GetResult("m-1", kT0, &record, nullptr), ResultOutcome::kNotFound);
@@ -218,9 +236,7 @@ TEST(RoomManagerTest, ResultIsNotFoundWhileGameIsRunning) {
 TEST(RoomManagerTest, FinishedResultIsPersistedAndReadable) {
     FakeResultWriter writer;
     RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
-    manager.Join("r-fixed", "p-0001", kT0, nullptr);
-    manager.Join("r-fixed", "p-0002", kT0, nullptr);
+    OpenPlayingRoom(&manager);
 
     // 打满到超时：双方都没攻击，因此是平局（winner_id 为空）。
     //
@@ -244,9 +260,7 @@ TEST(RoomManagerTest, ResultIsPendingWhenStoreIsUnavailable) {
     FakeResultWriter writer;
     writer.next_write = WriteStatus::kUnavailable;
     RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
-    manager.Join("r-fixed", "p-0001", kT0, nullptr);
-    manager.Join("r-fixed", "p-0002", kT0, nullptr);
+    OpenPlayingRoom(&manager);
 
     AdvanceTo(&manager, kT0, kTimeoutAtMs);
     manager.Tick(kTimeoutAtMs + kFrameIntervalMs);
@@ -266,9 +280,7 @@ TEST(RoomManagerTest, ResultIsPersistedAfterStoreRecovers) {
     FakeResultWriter writer;
     writer.next_write = WriteStatus::kUnavailable;
     RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
-    manager.Join("r-fixed", "p-0001", kT0, nullptr);
-    manager.Join("r-fixed", "p-0002", kT0, nullptr);
+    OpenPlayingRoom(&manager);
 
     AdvanceTo(&manager, kT0, kTimeoutAtMs);
     manager.Tick(kTimeoutAtMs + kFrameIntervalMs);
@@ -287,9 +299,7 @@ TEST(RoomManagerTest, ResultIsPersistedAfterStoreRecovers) {
 TEST(RoomManagerTest, RepeatedFinishDoesNotWriteTwice) {
     FakeResultWriter writer;
     RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
-    manager.Join("r-fixed", "p-0001", kT0, nullptr);
-    manager.Join("r-fixed", "p-0002", kT0, nullptr);
+    OpenPlayingRoom(&manager);
 
     AdvanceTo(&manager, kT0, kTimeoutAtMs);
     manager.Tick(kTimeoutAtMs + kFrameIntervalMs);
@@ -327,7 +337,9 @@ TEST(RoomManagerTest, UnknownMatchIdIsNotFoundWhenStoreSaysSo) {
 TEST(RoomManagerTest, AbortedRoomIsReapedAfterRetention) {
     FakeResultWriter writer;
     RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
+    // 摆出房间但**不加入任何玩家**：等待超时后它会被判为 ABORTED。
+    ASSERT_EQ(manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr),
+              CreateOutcome::kOk);
 
     // 没人加入 -> 等待超时 -> ABORTED。
     const std::int64_t abort_at = kT0 + kWaitingTimeoutMs;
@@ -345,9 +357,7 @@ TEST(RoomManagerTest, AbortedRoomIsReapedAfterRetention) {
 TEST(RoomManagerTest, FinishedRoomIsReapedAndResultStillReadableFromStore) {
     FakeResultWriter writer;
     RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
-    manager.Join("r-fixed", "p-0001", kT0, nullptr);
-    manager.Join("r-fixed", "p-0002", kT0, nullptr);
+    OpenPlayingRoom(&manager);
 
     AdvanceTo(&manager, kT0, kTimeoutAtMs);
     manager.Tick(kTimeoutAtMs + kFrameIntervalMs);
@@ -365,11 +375,12 @@ TEST(RoomManagerTest, FinishedRoomIsReapedAndResultStillReadableFromStore) {
 TEST(RoomManagerTest, PlayingCountTracksActiveRooms) {
     FakeResultWriter writer;
     RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
+    ASSERT_EQ(manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr),
+              CreateOutcome::kOk);
     EXPECT_EQ(manager.PlayingCount(), 0U);
 
-    manager.Join("r-fixed", "p-0001", kT0, nullptr);
-    manager.Join("r-fixed", "p-0002", kT0, nullptr);
+    EXPECT_EQ(manager.Join("r-fixed", "p-0001", kT0, nullptr), JoinOutcome::kOk);
+    EXPECT_EQ(manager.Join("r-fixed", "p-0002", kT0, nullptr), JoinOutcome::kOk);
     EXPECT_EQ(manager.PlayingCount(), 1U);
 }
 
@@ -409,7 +420,8 @@ TEST(RoomManagerTest, SnapshotIsWrittenImmediatelyOnCreate) {
     FakeSnapshotWriter snapshots;
     RoomManager manager(&writer, &snapshots, nullptr, []() { return std::string("r-fixed"); });
 
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
+    ASSERT_EQ(manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr),
+              CreateOutcome::kOk);
     manager.Tick(kT0);
 
     ASSERT_EQ(snapshots.rows.count("m-1"), 1U);
@@ -427,7 +439,8 @@ TEST(RoomManagerTest, SnapshotIsWrittenAtIntervalNotEveryTick) {
     FakeResultWriter writer;
     FakeSnapshotWriter snapshots;
     RoomManager manager(&writer, &snapshots, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
+    ASSERT_EQ(manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr),
+              CreateOutcome::kOk);
     manager.Tick(kT0);
     const int after_first = snapshots.write_calls;
     ASSERT_EQ(after_first, 1);
@@ -453,9 +466,7 @@ TEST(RoomManagerTest, SnapshotWriteFailureDoesNotBlockTheGame) {
     snapshots.next_write = SnapshotWriteStatus::kUnavailable;
     RoomManager manager(&writer, &snapshots, nullptr, []() { return std::string("r-fixed"); });
 
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
-    manager.Join("r-fixed", "p-0001", kT0, nullptr);
-    manager.Join("r-fixed", "p-0002", kT0, nullptr);
+    OpenPlayingRoom(&manager);
 
     // 推进 20 帧，期间每一次快照尝试都失败。
     manager.Tick(kT0);
@@ -480,9 +491,7 @@ TEST(RoomManagerTest, TerminalSnapshotIsWrittenOnFinish) {
     FakeResultWriter writer;
     FakeSnapshotWriter snapshots;
     RoomManager manager(&writer, &snapshots, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
-    manager.Join("r-fixed", "p-0001", kT0, nullptr);
-    manager.Join("r-fixed", "p-0002", kT0, nullptr);
+    OpenPlayingRoom(&manager);
     manager.Tick(kT0);
 
     // 打满到超时结束（双方都不攻击，因此是平局）。
@@ -504,9 +513,7 @@ TEST(RoomManagerTest, NoSnapshotWriterMeansNoWrites) {
     // 不注入快照写入器时必须安全：既不能崩，也不能偷偷写什么。
     FakeResultWriter writer;
     RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
-    manager.Join("r-fixed", "p-0001", kT0, nullptr);
-    manager.Join("r-fixed", "p-0002", kT0, nullptr);
+    OpenPlayingRoom(&manager);
     AdvanceTo(&manager, kT0, kT0 + 50 * kFrameIntervalMs);
 
     EXPECT_EQ(manager.SnapshotWriteCount(), 0U);
@@ -517,10 +524,9 @@ TEST(RoomManagerTest, SnapshotContentTracksHpAndJoinState) {
     FakeResultWriter writer;
     FakeSnapshotWriter snapshots;
     RoomManager manager(&writer, &snapshots, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
-    manager.Join("r-fixed", "p-0001", kT0, nullptr);
-    manager.Join("r-fixed", "p-0002", kT0, nullptr);
-    manager.SubmitInput("r-fixed", "p-0001", rgbt::room::InputKind::kAttack, nullptr);
+    OpenPlayingRoom(&manager);
+    EXPECT_EQ(manager.SubmitInput("r-fixed", "p-0001", rgbt::room::InputKind::kAttack, nullptr),
+              SubmitOutcome::kAccepted);
 
     // 推进两帧让攻击结算，再到快照间隔落一次。
     AdvanceTo(&manager, kT0, kT0 + kSnapshotIntervalMs);
@@ -540,9 +546,7 @@ TEST(RoomManagerTest, ReapedRoomClearsSnapshotState) {
     FakeResultWriter writer;
     FakeSnapshotWriter snapshots;
     RoomManager manager(&writer, &snapshots, nullptr, []() { return std::string("r-fixed"); });
-    manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr);
-    manager.Join("r-fixed", "p-0001", kT0, nullptr);
-    manager.Join("r-fixed", "p-0002", kT0, nullptr);
+    OpenPlayingRoom(&manager);
     AdvanceTo(&manager, kT0, kTimeoutAtMs);
     ASSERT_EQ(manager.RoomCount(), 1U);
 
@@ -552,7 +556,8 @@ TEST(RoomManagerTest, ReapedRoomClearsSnapshotState) {
 
     // 重建同一 match_id：应当被当作全新房间，因此**立刻**再写一次快照。
     const int before = snapshots.write_calls;
-    manager.Create("m-1", {"p-0003", "p-0004"}, kT0, nullptr, nullptr);
+    ASSERT_EQ(manager.Create("m-1", {"p-0003", "p-0004"}, kT0, nullptr, nullptr),
+              CreateOutcome::kOk);
     manager.Tick(kT0 + 1);
     EXPECT_GT(snapshots.write_calls, before);
     EXPECT_EQ(snapshots.rows.at("m-1").players[0].player_id, "p-0003");

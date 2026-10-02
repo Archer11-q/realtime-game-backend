@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdio>
+#include <mutex>
 #include <utility>
 
 namespace rgbt::common {
@@ -64,12 +65,21 @@ bool IsConnectionLostError(unsigned int error_code) {
 MysqlConnection::MysqlConnection(std::string service_prefix, MysqlOptions options)
     : service_prefix_(std::move(service_prefix)), options_(std::move(options)) {
     // 说明：不使用自动重连选项。它会掩盖连接状态，且不同客户端行为不一致；
-    // 本实现改为每次查询前探测，并在连接失效时显式重试一次（见 Query）。
+    // 本实现改为**不做预检**，只在语句真的失败且错误码表示"连接已失效"时
+    // 显式换一条新连接重试一次（见 QueryLocked）。
     (void)service_prefix_;
 }
 
 MysqlConnection::~MysqlConnection() {
+    // 加锁只为让"析构时的关闭"与其他线程的查询互斥。按契约，对象析构时不应
+    // 还有别的线程在用同一个对象；但那属于调用方的责任，本类不该假设它一定成立。
+    const std::lock_guard<std::mutex> lock(mutex_);
     Disconnect();
+}
+
+std::string MysqlConnection::last_error() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return last_error_;
 }
 
 void MysqlConnection::Disconnect() {
@@ -151,10 +161,13 @@ bool MysqlConnection::Ping() {
     //   2. 更要紧的是 `mysql_ping` 在本环境下会崩（原因见 EnsureConnected 的注释）。
     //      与其在调用顺序上绕开它，不如根本不碰它。
     //
-    // `Query` 内部已经包含"连接失效则换新连接重试一次"的逻辑，因此这里不需要
-    // 任何额外处理。
+    // `QueryLocked` 内部已经包含"连接失效则换新连接重试一次"的逻辑，因此这里
+    // 不需要任何额外处理。
+    //
+    // 注意这里**不能**调用 public 的 `Query`：它也要加同一把锁，会自锁死。
+    const std::lock_guard<std::mutex> lock(mutex_);
     std::vector<SqlRow> rows;
-    return Query("SELECT 1", {}, &rows);
+    return QueryLocked("SELECT 1", {}, &rows);
 }
 
 bool MysqlConnection::QueryOnce(const std::string& sql, const std::vector<std::string>& params,
@@ -291,6 +304,14 @@ bool MysqlConnection::QueryOnce(const std::string& sql, const std::vector<std::s
 
 bool MysqlConnection::Query(const std::string& sql, const std::vector<std::string>& params,
                             std::vector<SqlRow>* out_rows) {
+    // 整个查询（含可能的重连重试）在一把锁内完成。理由与代价见头文件里
+    // mutex_ 的说明：一条连接是有状态的字节流，并发使用会打乱协议。
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return QueryLocked(sql, params, out_rows);
+}
+
+bool MysqlConnection::QueryLocked(const std::string& sql, const std::vector<std::string>& params,
+                                  std::vector<SqlRow>* out_rows) {
     if (out_rows == nullptr) {
         last_error_ = "null output";
         return false;

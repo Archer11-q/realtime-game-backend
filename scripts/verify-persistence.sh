@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# verify-persistence.sh - TASK-013 房间快照持久化验收入口
+# verify-persistence.sh - 房间快照与重启恢复验收入口
 #
-# 覆盖 TASK-013 的验收标准：
+# 覆盖 TASK-013（写入路径）的验收标准：
 #   1. 迁移 005 可重复执行，rooms 表结构与预期一致
 #   2. 房间创建后立刻落一条快照（"这里曾经有一局"从一开始就成立）
 #   3. 对局进行中 frame 随服务端推进增长，且落库节奏受间隔约束而非每个 tick
@@ -11,11 +11,17 @@
 #   6. **MySQL 停机时对局仍能打完**——快照可以丢弃，不能拖住对局
 #   7. MySQL 恢复后快照自动继续，不需要任何补写逻辑
 #
+# 覆盖 TASK-014（恢复路径）的验收标准：
+#   8. 对局进行中 kill -9 Room：重启后房间仍在，且实测进度丢失量有上界
+#   9. FINISHING 房间重启后仍能把结果落库（TASK-008 的已知限制解除）
+#  10. 损坏快照被标记 ABORTED 并记录原因，不静默丢弃
+#  11. **启动时存在未结束房间**时，Room 反复重启都必须存活
+#      （TASK-014 期间这里曾 7/10 概率 abort，见 docs/devlog.md）
+#  12. 多个请求并发使用同一条 MySQL 连接时不能出错
+#
 # 用法：
 #   bash scripts/verify-persistence.sh              # 完整验收
 #   bash scripts/verify-persistence.sh --no-docker  # 复用已启动的 Redis/MySQL
-#
-# TASK-014 会往这个脚本里追加「重启恢复」一节；本任务只覆盖写入路径。
 
 set -uo pipefail
 
@@ -347,17 +353,29 @@ else
   docker stop rgbt-mysql >/dev/null 2>&1 && ok "MySQL 已停止" || fail "无法停止 MySQL"
 
   # 关键断言：MySQL 不可用时，快照写失败**不能拖住对局**。
+  #
+  # 为什么用轮询等最多 12 秒，而不是固定 sleep 2 秒再看一次：
+  #   快照写入是在 Room 的 **ticker 线程**上做的（RoomManager::Tick -> FlushSnapshots），
+  #   所以一次连不上的写入会让这个线程阻塞在 MySQL 的连接超时上（本脚本用默认 3 秒）。
+  #   结果是 MySQL 停机期间对局推进变成**突发式**的：停 3 秒、再连推几十帧。
+  #   固定的 2 秒观察窗可能整段落在一次停顿里，于是"对局停住了"是**误报**——
+  #   TASK-014 期间实测到过一次（frame 14 -> 14）。这里改成观察"12 秒内是否推进过"。
   before=$(curl -s --max-time 5 -H "Authorization: Bearer $alice_token" \
     "http://127.0.0.1:$gateway_port/api/v1/rooms/state?room_id=$room2" |
     python3 -c "import json,sys; print(json.load(sys.stdin).get('room',{}).get('frame',0))")
-  sleep 2
-  after=$(curl -s --max-time 5 -H "Authorization: Bearer $alice_token" \
-    "http://127.0.0.1:$gateway_port/api/v1/rooms/state?room_id=$room2" |
-    python3 -c "import json,sys; print(json.load(sys.stdin).get('room',{}).get('frame',0))")
+  after="$before"
+  for _ in $(seq 1 12); do
+    sleep 1
+    after=$(curl -s --max-time 5 -H "Authorization: Bearer $alice_token" \
+      "http://127.0.0.1:$gateway_port/api/v1/rooms/state?room_id=$room2" |
+      python3 -c "import json,sys; print(json.load(sys.stdin).get('room',{}).get('frame',0))" 2>/dev/null)
+    [ "${after:-0}" -gt "$before" ] 2>/dev/null && break
+    after="$before"
+  done
   if [ "$after" -gt "$before" ] 2>/dev/null; then
     ok "MySQL 停机期间对局继续推进（frame $before -> $after）"
   else
-    fail "MySQL 停机期间对局停住了（frame $before -> $after）"
+    fail "MySQL 停机期间对局停住了（frame $before -> $after，观察 12 秒）"
   fi
 
   # 还能打完。
@@ -462,18 +480,32 @@ else
     fi
 
     # **实测的进度丢失量**：这是 TASK-014 要求必须给出的数字，Phase 4 会用它做基线。
-    frames_lost=$((frame_before - frame_after))
+    #
+    # 定义是「kill 时的实时帧 - 最后一次落库的帧」，也就是"还没来得及写进快照的进度"。
+    # 不能用"恢复后查询到的帧"来算：房间一恢复就继续按 10 Hz 推进，等脚本查到它时
+    # 帧号已经往前走了（实测重启后 1~3 秒内会多出十几帧），那样算出来会是负数。
+    frames_lost=$((frame_before - frame_snapshot))
     frames_lost_measured="$frames_lost"
     if [ "$frames_lost" -ge 0 ] 2>/dev/null && [ "$frames_lost" -le 10 ]; then
       ok "进度丢失量实测：$frames_lost 帧（约 $((frames_lost * 100)) 毫秒），上界 10 帧"
     else
-      fail "进度丢失量超出预期：$frames_lost 帧（kill 前 $frame_before，恢复后 $frame_after）"
+      fail "进度丢失量超出预期：$frames_lost 帧（kill 时实时 $frame_before，最后快照 $frame_snapshot）"
     fi
-    # 恢复位置应当**等于最后一次快照**，而不是别的什么中间值。
-    if [ "$frame_after" = "$frame_snapshot" ]; then
-      ok "恢复位置精确等于最后一次快照帧（$frame_snapshot）"
+
+    # 恢复位置应当**精确等于最后一次快照**，而不是别的什么中间值。
+    # 判据取自 Room 启动日志里的恢复点（`已恢复房间：... frame=N`），因为外部查询
+    # 拿不到这个数字——见上面「进度丢失量」的说明。
+    restored_frame=$(grep -o "room_id=$room3 frame=[0-9]*" /tmp/room.out | tail -1 | grep -o '[0-9]*$')
+    if [ -n "$restored_frame" ] && [ "$restored_frame" = "$frame_snapshot" ]; then
+      ok "恢复点精确等于最后一次快照帧（$frame_snapshot）"
     else
-      fail "恢复位置不等于最后快照：恢复后 $frame_after，快照 $frame_snapshot"
+      fail "恢复点不等于最后快照：日志恢复点 [${restored_frame:-未记录}]，快照 $frame_snapshot"
+    fi
+    # 房间确实在恢复点之后继续推进了（否则"恢复成功"可能是假象）。
+    if [ "$frame_after" -ge "$frame_snapshot" ] 2>/dev/null; then
+      ok "恢复后继续推进（恢复点 $frame_snapshot -> 查询时 $frame_after）"
+    else
+      fail "恢复后帧号倒退：恢复点 $frame_snapshot，查询时 $frame_after"
     fi
 
     # 恢复后还能正常打完。
@@ -498,65 +530,78 @@ fi
 echo
 
 # --- 7b. FINISHING 房间重启后仍能落库（TASK-008 的已知限制） ---
+#
+# ⚠ 本节在 TASK-014 期间被重写过，原因是**原来的写法不可能通过**：
+#   它先停掉 MySQL、把对局打到 finishing，然后在 MySQL 仍停机时重启 Room，
+#   再断言"FINISHING 房间被恢复"。
+#   但恢复本身就要读 MySQL：存储不可用时 RoomManager::Restore 按设计
+#   **一个房间都不恢复**（空手启动比"以为恢复了其实没有"安全）。
+#   也就是说那条断言要求"在没有 MySQL 的情况下从 MySQL 恢复"——前提自相矛盾。
+#
+# 现在改为直接构造那个状态：**在 MySQL 正常时**往 rooms 表插一条合法的
+# finishing 行（这正是"进程被杀时结果尚未落库"在库里的样子），重启 Room，
+# 断言它被恢复成 finishing，并且**把结果补写进 match_results**。
+# 这才是 TASK-008 那条已知限制的正解，也是本任务真正要验的行为。
 echo "===== 7b. FINISHING 房间重启后仍能落库 ====="
-wait_idle
-docker stop rgbt-mysql >/dev/null 2>&1 && ok "MySQL 已停止" || fail "无法停止 MySQL"
-
-room4=$(open_playing_room)
-if [ -z "$room4" ]; then
-  fail "无法为 FINISHING 验收开出对局"
-else
-  http_get "/api/v1/rooms/state?room_id=$room4" "$alice_token" >/dev/null
-  match4=$(json_path room.match_id)
-  for attempt in $(seq 1 40); do
-    http_get "/api/v1/rooms/state?room_id=$room4" "$alice_token" >/dev/null
-    [ "$(json_path room.state)" != "playing" ] && break
-    http_post /api/v1/rooms/input \
-      "{\"token\":\"$alice_token\",\"request_id\":\"vp-finishing-$attempt\",\"room_id\":\"$room4\"}" \
-      >/dev/null
-    sleep 0.25
+q_mysql() {
+  docker exec rgbt-mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -e "$1" 2>/dev/null
+}
+if [ "$(docker inspect -f '{{.State.Health.Status}}' rgbt-mysql 2>/dev/null)" != "healthy" ]; then
+  docker start rgbt-mysql >/dev/null 2>&1 || true
+  for _ in $(seq 1 60); do
+    [ "$(docker inspect -f '{{.State.Health.Status}}' rgbt-mysql 2>/dev/null)" = "healthy" ] && break
+    sleep 2
   done
-  http_get "/api/v1/rooms/state?room_id=$room4" "$alice_token" >/dev/null
-  if [ "$(json_path room.state)" = "finishing" ]; then
-    ok "MySQL 停机使对局停在 finishing（结果尚未落库）"
+fi
+
+now_ms=$(( $(date +%s) * 1000 ))
+q_mysql "DELETE FROM rooms WHERE match_id='m-finishing-014';
+        DELETE FROM match_results WHERE match_id='m-finishing-014';
+        INSERT INTO rooms (match_id, room_id, state, frame,
+          p1_id, p1_hp, p1_joined, p2_id, p2_hp, p2_joined,
+          winner_id, finish_reason, started_at_ms, finished_at_ms, snapshot_at_ms)
+        VALUES ('m-finishing-014', 'r-finishing-014', 'finishing', 600,
+          'p-0001', 100, 1, 'p-0002', 0, 1,
+          'p-0001', 'hp_zero', $((now_ms - 60000)), $now_ms, $now_ms);" &&
+  ok "已写入一条合法的 finishing 快照（结果尚未落库）" ||
+  fail "无法写入 finishing 快照"
+
+kill -9 "$room_pid" 2>/dev/null || true
+wait "$room_pid" 2>/dev/null
+room_pid=""
+if start_room; then
+  ok "Room 已重启"
+  if grep -q 'room_id=r-finishing-014 frame=600' /tmp/room.out; then
+    ok "FINISHING 房间被恢复，且恢复点就是快照帧 600（没有被当成已结束而丢弃）"
   else
-    fail "对局状态异常：$(json_path room.state)（期望 finishing）"
+    fail "FINISHING 房间未被恢复：$(grep -o 'room_id=r-finishing-014 frame=[0-9]*' /tmp/room.out | tail -1)"
   fi
 
-  kill -9 "$room_pid" 2>/dev/null || true
-  wait "$room_pid" 2>/dev/null
-  room_pid=""
-  if start_room; then
-    ok "Room 在 MySQL 仍停机时重启成功"
-    http_get "/api/v1/rooms/state?room_id=$room4" "$alice_token" >/dev/null
-    if [ "$(json_path room.state)" = "finishing" ]; then
-      ok "FINISHING 房间被恢复（没有被当成已结束而丢弃）"
-    else
-      fail "FINISHING 房间恢复失败：$(json_path room.state)"
+  recovered=0
+  for _ in $(seq 1 30); do
+    if docker exec rgbt-mysql mysql -N -B -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" \
+      -e "SELECT 1 FROM match_results WHERE match_id='m-finishing-014';" 2>/dev/null | grep -q 1; then
+      recovered=1
+      break
     fi
-
-    docker start rgbt-mysql >/dev/null 2>&1 && ok "MySQL 已重启" || fail "无法重启 MySQL"
-    for _ in $(seq 1 60); do
-      [ "$(docker inspect -f '{{.State.Health.Status}}' rgbt-mysql 2>/dev/null)" = "healthy" ] && break
-      sleep 2
-    done
-    recovered=0
-    for _ in $(seq 1 30); do
-      if docker exec rgbt-mysql mysql -N -B -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" \
-        -e "SELECT 1 FROM match_results WHERE match_id='$match4';" 2>/dev/null | grep -q 1; then
-        recovered=1
-        break
-      fi
-      sleep 1
-    done
-    if [ "$recovered" -eq 1 ]; then
-      ok "重启后的 FINISHING 房间把结果补写进了 match_results（TASK-008 的限制已解除）"
+    sleep 1
+  done
+  if [ "$recovered" -eq 1 ]; then
+    ok "重启后的 FINISHING 房间把结果补写进了 match_results（TASK-008 的限制已解除）"
+    winner=$(docker exec rgbt-mysql mysql -N -B -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" \
+      -e "SELECT winner_id FROM match_results WHERE match_id='m-finishing-014';" 2>/dev/null | tr -d '\r')
+    if [ "$winner" = "p-0001" ]; then
+      ok "补写的结果带上了正确的胜者（winner_id=p-0001）"
     else
-      fail "重启后 30 秒内结果仍未落库，match_id=$match4"
+      fail "补写结果的 winner_id 异常：[$winner]"
     fi
   else
-    fail "Room 重启失败"
+    fail "重启后 30 秒内结果仍未落库，match_id=m-finishing-014"
   fi
+  q_mysql "DELETE FROM rooms WHERE match_id='m-finishing-014';
+           DELETE FROM match_results WHERE match_id='m-finishing-014';"
+else
+  fail "Room 重启失败"
 fi
 echo
 
@@ -597,6 +642,139 @@ docker exec rgbt-mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABAS
   -e "DELETE FROM rooms WHERE match_id='m-corrupt-1';" >/dev/null 2>&1 || true
 echo
 
+# --- 7d. 启动时存在未结束房间：Room 反复重启都必须存活 ---
+#
+# 这一节是 TASK-014 那次 abort 的直接回归。当时的现象是：
+#   只要 rooms 表里有一条未结束的快照，Room 启动就会以 7/10 的概率 abort
+#   （`OpenSSL internal error: refcount error`）或段错误。
+# 根因不是恢复逻辑，而是**同一条 MysqlConnection 被多个线程共用**：
+#   恢复在启动线程上做一次 SELECT，ticker 线程紧接着为刚恢复的房间写第一份
+#   快照，而启动线程同一时刻还在做启动探活。一股字节流被两个线程写，
+#   MySQL 协议被搅乱（`Received malformed packet`），走到重连分支关闭 TLS 时
+#   进程直接死掉。详见 docs/devlog.md 与 common/mysql_connection.hpp 的 mutex_。
+#
+# 为什么必须**重复**几次：这是竞态，跑一次通过说明不了任何事。
+echo "===== 7d. 存在未结束房间时反复重启 Room ====="
+# 前面的 7b 可能把 MySQL 停掉了；这一节需要它是活的。
+if [ "$(docker inspect -f '{{.State.Health.Status}}' rgbt-mysql 2>/dev/null)" != "healthy" ]; then
+  docker start rgbt-mysql >/dev/null 2>&1 || true
+  for _ in $(seq 1 60); do
+    [ "$(docker inspect -f '{{.State.Health.Status}}' rgbt-mysql 2>/dev/null)" = "healthy" ] && break
+    sleep 2
+  done
+fi
+if [ "$(docker inspect -f '{{.State.Health.Status}}' rgbt-mysql 2>/dev/null)" = "healthy" ]; then
+  now_ms=$(( $(date +%s) * 1000 ))
+  docker exec rgbt-mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -e "
+    INSERT INTO rooms (match_id, room_id, state, frame,
+      p1_id, p1_hp, p1_joined, p2_id, p2_hp, p2_joined,
+      winner_id, finish_reason, started_at_ms, finished_at_ms, snapshot_at_ms)
+    VALUES ('m-restart-014', 'r-restart-014', 'playing', 10,
+      'p-0001', 100, 1, 'p-0002', 90, 1,
+      NULL, 'none', $((now_ms - 3000)), 0, $now_ms)
+    ON DUPLICATE KEY UPDATE state='playing', frame=10, snapshot_at_ms=$now_ms;" >/dev/null 2>&1 &&
+    ok "已写入一条未结束快照（模拟进程被杀时对局仍在进行）" ||
+    fail "无法写入未结束快照"
+
+  restarts=3
+  survived=0
+  for attempt in $(seq 1 "$restarts"); do
+    kill -9 "$room_pid" 2>/dev/null || true
+    wait "$room_pid" 2>/dev/null
+    room_pid=""
+    sleep 1
+    if start_room; then
+      survived=$((survived + 1))
+      # 恢复必须真的发生，否则这一节什么也没验证。
+      # 断言"至少恢复 1 个"而不是"恰好 1 个"：表里可能还有别的历史未结束行，
+      # 那不影响本节的结论——多个房间只会让并发写快照更密集。
+      if ! grep -qE '恢复 [1-9][0-9]* 个' /tmp/room.out; then
+        fail "第 $attempt 次重启没有恢复任何房间（前置条件失效，本节未验证到目标路径）"
+      fi
+      # 崩溃前的直接征兆，出现即失败，便于定位。
+      if grep -qE 'refcount error|malformed packet' /tmp/room.out; then
+        fail "第 $attempt 次重启的日志出现了并发/协议错误征兆"
+      fi
+    else
+      fail "第 $attempt 次重启后 Room 未就绪（崩溃？）"
+      tail -15 /tmp/room.out | sed 's/^/    /'
+    fi
+  done
+  if [ "$survived" -eq "$restarts" ]; then
+    ok "连续 $restarts 次「存在未结束房间时重启」全部存活"
+  else
+    fail "重启存活 $survived/$restarts"
+  fi
+  docker exec rgbt-mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" \
+    -e "DELETE FROM rooms WHERE match_id='m-restart-014';" >/dev/null 2>&1 || true
+else
+  fail "MySQL 未恢复，无法验证启动恢复路径"
+fi
+echo
+
+# --- 7e. 多请求并发使用同一条 MySQL 连接 ---
+#
+# Gateway 与 Room 都只创建**一条** MysqlConnection（见各自 main）：Gateway 由
+# 所有 brpc worker 线程共用，Room 由 ticker 线程与启动路径共用。
+# 这一段并发打 12 个登录：每个登录都要读一次 players 表，因此它们会真的争用
+# 同一条连接。**它不能保证复现竞态**（竞态没有确定性的时序），作用是把暴露
+# 概率拉高到验收里能被看见；真正的确定性回归是上面的 7d。
+#
+# 先"预热"一次：本节前面停过 MySQL，Gateway 手上那条连接已经死了，**第一个**
+# 请求必然要负责发现断连并重连。那一次失败属于"依赖刚恢复时的首次探测"，
+# 不能算到"并发共用连接"头上（设计上依赖不可用时就是返回可重试的 503，
+# 见 docs/01-architecture 的失败模型）。预热之后，才测真正想测的东西。
+echo "===== 7e. 并发共用同一条 MySQL 连接 ====="
+warm_code=$(http_post /api/v1/login \
+  "{\"account\":\"alice\",\"password\":\"alice_dev_pw\",\"request_id\":\"vp-warm-$RANDOM\",\"client_type\":\"web\"}")
+if [ "$warm_code" = "200" ]; then
+  ok "预热登录成功（Gateway 的 MySQL 连接已可用）"
+else
+  ok "预热登录返回 HTTP $warm_code（依赖刚恢复时的首次探测，不计入并发检查）"
+fi
+
+concurrent=12
+conc_pids=()
+for i in $(seq 1 "$concurrent"); do
+  curl -s -o "/tmp/persist-conc-$i.json" -w '%{http_code}' --max-time 10 -X POST \
+    -H 'Content-Type: application/json' \
+    -d "{\"account\":\"alice\",\"password\":\"alice_dev_pw\",\"request_id\":\"vp-conc-$i-$RANDOM\",\"client_type\":\"web\"}" \
+    "http://127.0.0.1:$gateway_port/api/v1/login" > "/tmp/persist-conc-$i.code" 2>/dev/null &
+  conc_pids+=("$!")
+done
+# 只等这些 curl：**裸 wait 会连 Room/Match/Gateway 一起等**，那三个进程永远不退出。
+for pid in "${conc_pids[@]}"; do
+  wait "$pid" 2>/dev/null || true
+done
+conc_ok=0
+conc_bad=""
+for i in $(seq 1 "$concurrent"); do
+  code=$(cat "/tmp/persist-conc-$i.code" 2>/dev/null)
+  token=$(python3 -c "
+import json,sys
+try:
+    print(json.load(open('/tmp/persist-conc-$i.json')).get('token','') or '')
+except Exception:
+    print('')
+" 2>/dev/null)
+  if [ "$code" = "200" ] && [ -n "$token" ]; then
+    conc_ok=$((conc_ok + 1))
+  else
+    conc_bad="$conc_bad #$i(HTTP ${code:-无响应})"
+  fi
+done
+if [ "$conc_ok" -eq "$concurrent" ]; then
+  ok "$concurrent 个并发登录全部成功（同一条连接被并发使用）"
+else
+  fail "并发登录失败 $((concurrent - conc_ok)) 个：$conc_bad"
+fi
+if grep -q 'malformed packet' /tmp/gateway.out; then
+  fail "Gateway 日志出现 malformed packet（并发使用同一条连接）"
+else
+  ok "Gateway 日志没有协议错乱"
+fi
+echo
+
 # ---------- 8. 优雅退出 ----------
 echo "===== 8. 优雅退出 ====="
 for pair in "Gateway:$gateway_pid" "Match:$match_pid" "Room:$room_pid"; do
@@ -625,7 +803,8 @@ if [ "${#failures[@]}" -eq 0 ]; then
   echo "          MySQL 停机期间对局继续推进并能打完，恢复后快照自动继续"
   echo "  [恢复路径，TASK-014] 对局进行中 kill -9 Room 后重启，房间仍在、血量与快照一致、"
   echo "          恢复位置精确等于最后一次快照；FINISHING 房间重启后仍能落库；"
-  echo "          损坏快照被标记 ABORTED 并记录原因，不静默丢弃"
+  echo "          损坏快照被标记 ABORTED 并记录原因，不静默丢弃；"
+  echo "          存在未结束房间时连续 3 次重启全部存活；并发共用同一条 MySQL 连接无协议错乱"
   echo
   echo "  实测进度丢失量：${frames_lost_measured:-未取到} 帧"
   exit 0

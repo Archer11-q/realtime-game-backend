@@ -72,7 +72,8 @@ std::string ValidateRoomSnapshot(const RoomSnapshotRecord& record) {
 
     // 对局真的打过，就不可能双方都没加入。这条约束不适用于 CREATED / WAITING：
     // 那时 0 人是正常状态，不是损坏。
-    const bool played = (record.phase == RoomPhase::kPlaying || record.phase == RoomPhase::kFinishing);
+    const bool played =
+        (record.phase == RoomPhase::kPlaying || record.phase == RoomPhase::kFinishing);
     if (played && !record.players[0].joined && !record.players[1].joined) {
         return "对局状态为已开打，但双方都不在房间内";
     }
@@ -83,7 +84,8 @@ std::string ValidateRoomSnapshot(const RoomSnapshotRecord& record) {
     }
 
     // 已结束却带 kNone 的结束原因，说明两列不是同一次写入的结果。
-    const bool finished = (record.phase == RoomPhase::kFinished || record.phase == RoomPhase::kAborted);
+    const bool finished =
+        (record.phase == RoomPhase::kFinished || record.phase == RoomPhase::kAborted);
     if (finished && record.finish_reason == FinishReason::kNone) {
         return "已处于终态但 finish_reason 为 none";
     }

@@ -75,6 +75,10 @@ rgbt_set_project_warnings(rgbt_gateway_lib)
 add_executable(rgbt_gateway gateway_main.cpp)
 target_link_libraries(rgbt_gateway PRIVATE rgbt_gateway_lib unofficial::brpc::brpc)
 
+# 服务可执行文件也要过 sanitizer，理由见 src/room/CMakeLists.txt 里的说明：
+# 只给 *_lib 加 sanitizer 会让服务二进制链接失败，ASan 实际覆盖不到服务进程。
+rgbt_apply_sanitizer(rgbt_gateway)
+
 set_target_properties(
   rgbt_gateway
   PROPERTIES

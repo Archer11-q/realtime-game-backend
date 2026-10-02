@@ -48,6 +48,9 @@ RestoreReport RoomManager::Restore(std::int64_t now_ms) {
     report.scanned = rows.size();
 
     std::vector<std::pair<RoomSnapshotRecord, std::string>> rejected;
+    // 成功重建的房间也要留一份记录，好在锁外打日志。**不能在持锁循环里打**：
+    // 持锁做 I/O 是本项目明确避免的（见 room_manager.hpp 的并发说明）。
+    std::vector<RoomSnapshotRecord> restored_records;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         for (const RoomSnapshotRow& row : rows) {
@@ -70,10 +73,23 @@ RestoreReport RoomManager::Restore(std::int64_t now_ms) {
             }
             rooms_.emplace(room_id, std::make_unique<BattleRoom>(std::move(*room)));
             match_index_.emplace(match_id, room_id);
+            restored_records.push_back(row.record);
             ++report.restored;
         }
     }
     report.rejected = rejected.size();
+
+    // 每个恢复出来的房间各打一行，带上**恢复点帧号**。
+    //
+    // 为什么必须有这条日志：房间一恢复就继续按 10 Hz 推进，因此重启后从 Gateway
+    // 查询到的帧号**已经往前走了**，"恢复点究竟是哪一帧"在外部观测不到。
+    // 验收脚本（scripts/verify-persistence.sh 第 7 节）靠这一行断言
+    // "恢复位置精确等于最后一次快照"，否则那条断言只能退化成"大致对得上"。
+    for (const RoomSnapshotRecord& record : restored_records) {
+        std::fprintf(stderr, "[room] 已恢复房间：match_id=%s room_id=%s frame=%lld phase=%s\n",
+                     record.match_id.c_str(), record.room_id.c_str(),
+                     static_cast<long long>(record.frame), ToString(record.phase));
+    }
 
     // 日志与写回都在锁外：持锁做 I/O 是本项目明确避免的。
     RejectSnapshots(rejected, now_ms);

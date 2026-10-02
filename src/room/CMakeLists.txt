@@ -53,6 +53,12 @@ rgbt_set_project_warnings(rgbt_room_lib)
 add_executable(rgbt_room room_main.cpp)
 target_link_libraries(rgbt_room PRIVATE rgbt_room_lib unofficial::brpc::brpc)
 
+# 服务可执行文件也要过 sanitizer。**这一行是必需的**：TASK-014 之前
+# rgbt_apply_sanitizer 只作用于 *_lib 与测试目标，服务二进制没有链接 ASan 运行时，
+# 于是 "用 ASan 构建的服务" 直接链接失败（undefined reference to `__asan_*`），
+# 也就是说 ASan 从来没有真正覆盖过三个服务的进程（而崩溃恰恰发生在它们里面）。
+rgbt_apply_sanitizer(rgbt_room)
+
 set_target_properties(
   rgbt_room
   PROPERTIES
