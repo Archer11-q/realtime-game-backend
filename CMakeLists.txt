@@ -31,7 +31,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(RGBT_WARNINGS_AS_ERRORS "把编译警告视为错误" ON)
 option(RGBT_ENABLE_SANITIZER "启用 AddressSanitizer" OFF)
+option(RGBT_ENABLE_TSAN "启用 ThreadSanitizer" OFF)
 option(RGBT_BUILD_TESTS "构建单元测试" ON)
+
+# ASan 与 TSan 不能同时启用：两者都要接管内存访问路径，同时打开会在链接期
+# 或运行期产生难以解释的失败。这里直接报错，而不是让使用者自己猜。
+if(RGBT_ENABLE_SANITIZER AND RGBT_ENABLE_TSAN)
+  message(FATAL_ERROR "RGBT_ENABLE_SANITIZER 与 RGBT_ENABLE_TSAN 不能同时开启（ASan 与 TSan 互斥）")
+endif()
 
 # GoogleTest 获取方式开关：
 #   OFF（默认）使用 FetchContent 下载并构建，不需要额外系统配置；
@@ -104,15 +111,29 @@ function(rgbt_set_test_warnings target)
 endfunction()
 
 function(rgbt_apply_sanitizer target)
-  if(NOT RGBT_ENABLE_SANITIZER)
+  set(flags "")
+  if(RGBT_ENABLE_SANITIZER)
+    list(APPEND flags -fsanitize=address)
+  endif()
+  if(RGBT_ENABLE_TSAN)
+    list(APPEND flags -fsanitize=thread)
+    # 关掉 -Wtsan：它会为"TSan 无法正确插桩 atomic_thread_fence"报一条告警，
+    # 而该构造出现在 brpc/protobuf 与 libstdc++ 的头文件里，不在本项目代码中
+    # （`grep atomic_thread_fence` 在本仓库为空）。开着 -Werror 会因此直接编译失败。
+    # 这条告警说明的是"该处 TSan 覆盖不到"，不是代码缺陷，因此在 TSan 构建里屏蔽，
+    # 其余告警仍然照常按 -Werror 处理。
+    list(APPEND flags -Wno-tsan)
+  endif()
+  if(NOT flags)
     return()
   endif()
   if(MSVC)
     message(WARNING "MSVC 暂不支持本项目的 Sanitizer 预设，已跳过 ${target}")
     return()
   endif()
-  target_compile_options(${target} PRIVATE -fsanitize=address -fno-omit-frame-pointer -g)
-  target_link_options(${target} PRIVATE -fsanitize=address)
+  # TSan 要求带帧指针以便给出可读的栈，ASan 同理，因此两者都加。
+  target_compile_options(${target} PRIVATE ${flags} -fno-omit-frame-pointer -g)
+  target_link_options(${target} PRIVATE ${flags})
 endfunction()
 
 # 公共 CMake 函数：为 api/proto 下的契约生成 C++ 代码。

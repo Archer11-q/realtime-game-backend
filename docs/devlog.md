@@ -1808,10 +1808,18 @@ devlog 里"已加入 `verify-all.sh`"实际没有生效，它自己的验收脚�
 - `src/gateway/mysql_player_reader.cpp`：失败时打印 MySQL 的真实错误。
   （调用方只能看到一个 503，具体是断连、权限还是语句被拒只有这一层知道——
   排查那一例并发 503 时正卡在这里。）
-- `CMakePresets.json`：新增 `brpc-asan` 预设（vcpkg + ASan，configure/build/test）。
+- `CMakePresets.json`：新增 `brpc-asan` 与 `brpc-tsan` 预设
+  （vcpkg + ASan / TSan，configure/build/test 三处）。
+- `CMakeLists.txt`：`rgbt_apply_sanitizer` 改为按开关选择 ASan 或 TSan，
+  两者互斥（同时打开直接 FATAL_ERROR），并在 TSan 构建里加 `-Wno-tsan`
+  （该告警由第三方头文件里的 `atomic_thread_fence` 触发，不是本项目代码）。
 - `src/gateway/CMakeLists.txt`、`src/match/CMakeLists.txt`、`src/room/CMakeLists.txt`：
   给三个**服务可执行文件**补上 `rgbt_apply_sanitizer`——此前只有 `*_lib` 与测试
-  目标加了它，服务的 ASan 构建根本无法链接，等于 ASan 从未覆盖过服务进程。
+  目标加了它，服务的 sanitizer 构建根本无法链接，等于 sanitizer 从未覆盖过服务进程。
+- `docs/TASKS.md` + `docs/02-roadmap.md`：清理过期状态标注（TASK-001/002/003/007
+  的「进行中」与 TASK-008 ~ TASK-013 的「待验收」全部更正为已完成并附合并点；
+  roadmap 的「Phase 1 进行中」更正为已完成）。这些标注此前与 git 状态不符，
+  会让人误以为还有一堆任务挂着。
 - `scripts/verify-persistence.sh`：修正 7a 的度量方式、重写 7b 的前提、放宽第 6 节
   的观察窗、新增 7d（存在未结束房间时连续 3 次重启）与 7e（并发共用一条连接）。
 - `scripts/verify-all.sh`：删掉覆盖 `all_scripts` 的重复行。
@@ -1869,31 +1877,34 @@ devlog 里"已加入 `verify-all.sh`"实际没有生效，它自己的验收脚�
 
 进度丢失量的上界由快照间隔决定（10 帧 = 1 秒），实测 0~1 帧。
 
-**ASan 已运行，结果干净**——但为此先补上了一个**基础设施缺口**：
+**TSan 也已运行，但当前配置下不具指向性**——这也是一个需要记录的事实，不是"跑过了"就完事：
 
-- `rgbt_apply_sanitizer` 原本只作用于 `*_lib` 与测试目标，**从未作用于三个服务的
-  可执行文件**。后果是"用 ASan 构建的服务"直接链接失败
-  （`undefined reference to __asan_option_detect_stack_use_after_return` 等）——
-  也就是说，在 TASK-014 之前，**ASan 从来没有真正覆盖过三个服务的进程**，
-  而崩溃恰恰发生在它们里面。已在 `src/{gateway,match,room}/CMakeLists.txt` 里
-  为三个可执行文件补上该调用。
-- 预设也只有 `debug` / `release` / `asan` / `brpc-debug`，其中 `asan` 不接 vcpkg，
-  因此覆盖不到 `MysqlConnection`、`RedisSessionStore`、`room_manager` 这些只在
-  vcpkg 构建里存在的目标。上一次会话是用命令行临时配置（`cmake --preset brpc-debug
-  -B build/brpc-asan -DRGBT_ENABLE_SANITIZER=ON`）绕过去的，那个目录链接失败且没有
-  任何记录。现在新增正式的 **`brpc-asan` 预设**（configure / build / test 三处）。
+- 为了跑 TSan 补了两处：新增 `brpc-tsan` 预设，以及修掉两个**既有**阻塞点：
+  1. `rgbt_apply_sanitizer` 只作用于 `*_lib` 与测试目标，**三个服务可执行文件从未
+     应用 sanitizer**（ASan 版服务直接链接失败，等于 sanitizer 从未覆盖过服务进程）；
+  2. GCC 的 `-Wtsan`（"TSan 无法插桩 `atomic_thread_fence`"）在 `-Werror` 下直接
+     编译失败，而该构造只出现在 brpc / libstdc++ 头文件里（`grep atomic_thread_fence`
+     在本仓库为空），因此在 TSan 构建里用 `-Wno-tsan` 屏蔽这一条。
+- 实测结果：Room 启动恢复 3 次全部存活、Gateway 12 个并发登录 12/12 成功，
+  但产生 **21 条 TSan 报告**（Room 每次 5 条，Gateway 6 条）。
+- **这 21 条全部指向 brpc 内部**：按栈帧统计，186 帧来自 brpc 源码，
+  `butil::Mutex::lock`、`butil::cpuwide_time_ns`、`butil::IOPortal::pappend_from_file_descriptor`
+  等；来自本项目源码的只有 2 帧，且都是**对象构造点**
+  （`BrpcMatchClient::BrpcMatchClient`、`main`），不是竞争访问。
+- 原因是 vcpkg 提供的 brpc **没有用 TSan 插桩**：brpc 自己的锁与每 CPU 时间缓存
+  在 TSan 看来就是"无同步的裸访问"。要让它成为可用的门禁，必须先用 TSan 重建
+  brpc 及其依赖链（brpc 本体普通编译就要 17 分钟，插桩后更久）。
+  **结论：TSan 预设保留（它是那一步的前置条件），但当前不能当作本项目的并发门禁；
+  并发缺陷的证据仍然来自 A/B 复现（7/10 → 0/10）、ASan 与"废弃 Token `OK`"这类直接现象。**
+  这件事记入 `docs/TASKS.md` 的 Backlog。
 
-ASan 实测（`build/brpc-asan`，`detect_leaks=0`：brpc 自身的静态对象会被报成泄漏，
+**ASan 的运行结果**（`build/brpc-asan`，`detect_leaks=0`：brpc 自身的静态对象会被报成泄漏，
 开着它只会把真正的内存错误淹掉）：
 
 | 场景 | 结果 |
 |---|---|
 | Room 启动恢复 + 立刻写第一份快照，5 次 | 存活 5/5，**ASan/UBSan 报告 0/5** |
 | Gateway 12 个并发登录 | **12/12 成功**，无 ASan/UBSan 报告，进程存活 |
-
-**仍未运行 TSan**：没有 TSan 预设，brpc + TSan 的组合未验证过。并发缺陷的证据来自
-A/B 复现（7/10 → 0/10）、ASan 与"废弃 Token `OK`"这类直接现象，**不是**来自 TSan。
-新增 TSan 预设需要单独评估，记入 `docs/TASKS.md` 的 Backlog。
 
 ### 问题与风险
 
