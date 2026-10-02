@@ -472,6 +472,14 @@ std::int32_t GatewayServiceImpl::HandleRoomFailure(RoomCallStatus status,
         case RoomCallStatus::kInvalidArgument:
             return FillError(error, ErrorCode::INVALID_ARGUMENT, "room_invalid_argument",
                              "房间请求参数不合法", request_id);
+        case RoomCallStatus::kNotAMember:
+            // 与 room_invalid_argument 分开：房间确实存在，只是这个玩家不在名单里。
+            // 合并成一个 reason 会让排障时无法区分「请求写错了」和「走错房间了」。
+            return FillError(error, ErrorCode::INVALID_ARGUMENT, "not_a_member",
+                             "该玩家不是这一局的成员", request_id);
+        case RoomCallStatus::kNotPlaying:
+            return FillError(error, ErrorCode::INVALID_ARGUMENT, "room_not_playing",
+                             "对局尚未开始，此时不能提交输入", request_id);
         case RoomCallStatus::kInternal:
             return FillError(error, ErrorCode::INTERNAL, "room_internal", "房间服务返回未分类错误",
                              request_id);

@@ -85,6 +85,14 @@ enum class RoomCallStatus {
     kUnavailable,
     /// 对端判定参数不合法，对外返回 400。
     kInvalidArgument,
+    /// 该玩家不是这一局的成员，对外返回 400 not_a_member。
+    ///
+    /// 与 kInvalidArgument 分开的理由：Room 用**独立错误码**表达这件事
+    /// （见 api/proto/room.proto 的 RoomErrorCode）。若在这里合并成一个值，
+    /// 「不是本局成员」就会在跨进程后退化成「参数不合法」——调用方只映射错误码。
+    kNotAMember,
+    /// 对局尚未开始，此时不接受输入，对外返回 400 room_not_playing。
+    kNotPlaying,
     /// 房间或结果不存在，对外返回 404。
     kNotFound,
     /// 对局已结束，不再接受该操作，对外返回 409。

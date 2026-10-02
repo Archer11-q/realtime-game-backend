@@ -209,17 +209,23 @@ if [ "$manage_docker" -eq 1 ]; then
     fi
   done
 
-  # 种子数据断言：3 个测试玩家，且与代码内测试身份一致。
+  # 种子数据断言：4 个测试玩家（3 个启用 + 1 个禁用），且与代码内测试身份一致。
   seed_count=$(mysql_query "SELECT COUNT(*) FROM players;")
-  if [ "$seed_count" = "3" ]; then
-    ok "players 有 3 行种子数据"
+  if [ "$seed_count" = "4" ]; then
+    ok "players 有 4 行种子数据"
   else
-    fail "players 行数为 $seed_count（期望 3）"
+    fail "players 行数为 $seed_count（期望 4）"
   fi
   if [ "$(mysql_query "SELECT status FROM players WHERE account='carol';")" = "disabled" ]; then
     ok "禁用账号 carol 的状态正确"
   else
     fail "carol 的状态不符合预期"
+  fi
+  # dave 是第三个启用身份，用于端到端覆盖「第三个玩家」与「非本局成员」两条不变量。
+  if [ "$(mysql_query "SELECT status FROM players WHERE account='dave';")" = "active" ]; then
+    ok "第三个启用身份 dave 的状态正确"
+  else
+    fail "dave 的状态不符合预期（应为 active）"
   fi
   if mysql_query "SHOW COLUMNS FROM players LIKE '%password%';" | grep -q .; then
     fail "players 表出现密码列，与 D-002 不符"

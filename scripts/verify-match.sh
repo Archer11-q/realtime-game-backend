@@ -17,8 +17,13 @@
 #
 # 前置：Docker Desktop 已启动；deploy/compose/.env 存在（缺失时由本脚本生成）。
 #
-# 为什么需要 MySQL：登录仍然要读 players 表（ADR-0002）。匹配切片本身不碰 MySQL，
-# 但入队必须先登录拿到 Token，因此这里一并把 Redis 与 MySQL 起起来。
+# 为什么需要 MySQL：登录要读 players 表（ADR-0002），且要看种子身份是否就位。
+# 为什么需要 Room（TASK-008 起）：匹配成功后 Match 会调用 RoomService.CreateRoom
+# 拿 room_id。TASK-007 时房间分配是进程内的占位实现，只需要 Match 和 Gateway；
+# 现在少起 Room 会让**配对全部失败**，表现为玩家一直 queued。
+#
+# 注意：使用 --no-docker 时本脚本**不会重新应用迁移**，因此若种子数据缺少
+# dave/p-0004（第三个启用身份），dave 的登录会失败。要覆盖那一条请不加 --no-docker。
 #
 # 为了让超时路径可以在几秒内验证，本脚本给 Match 传了很短的超时与结果保留时长
 # （-match_timeout_seconds 2 -match_result_ttl_seconds 5）。这是**测试配置**，
@@ -35,14 +40,17 @@ env_example="deploy/compose/.env.example"
 preset="brpc-debug"
 gateway_binary="build/$preset/bin/rgbt_gateway"
 match_binary="build/$preset/bin/rgbt_match"
+room_binary="build/$preset/bin/rgbt_room"
 
 # 端口。候选列表都以文档中的约定值为首选；被占用时依次尝试其它端口。
 # 必须显式预检：端口冲突时进程启动失败，而请求会打到占用端口的那个服务上，
 # 表现为难以定位的 404，而不是「端口冲突」这种可定位的错误。
 gateway_port=""
 match_port=""
+room_port=""
 gateway_candidates=(8080 18080 18081 18090)
 match_candidates=(8082 18092 18093 18094)
+room_candidates=(8083 18103 18104 18105)
 
 match_timeout_seconds=2
 match_result_ttl_seconds=5
@@ -68,8 +76,9 @@ compose() { docker compose -f "$compose_file" "$@"; }
 
 gateway_pid=""
 match_pid=""
+room_pid=""
 cleanup() {
-  for pid in "$gateway_pid" "$match_pid"; do
+  for pid in "$gateway_pid" "$match_pid" "$room_pid"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       if [ "$keep_running" -eq 1 ]; then
         echo "已保留进程 $pid（--keep）"
@@ -132,6 +141,19 @@ match_port="$(pick_port "${match_pool[@]}")" || {
   exit 1
 }
 ok "Match 选用空闲端口 $match_port"
+
+# Room 端口必须与前面两个都不同。
+room_pool=()
+for candidate in "${room_candidates[@]}"; do
+  [ "$candidate" = "$gateway_port" ] && continue
+  [ "$candidate" = "$match_port" ] && continue
+  room_pool+=("$candidate")
+done
+room_port="$(pick_port "${room_pool[@]}")" || {
+  echo "Room 候选端口均被占用：${room_pool[*]}" >&2
+  exit 1
+}
+ok "Room 选用空闲端口 $room_port"
 echo
 
 # ---------- 1. 依赖 ----------
@@ -230,11 +252,40 @@ else
 fi
 echo
 
-# ---------- 4. 启动 Match 与 Gateway ----------
-echo "===== 4. 启动 Match 与 Gateway ====="
+# ---------- 4. 启动 Room、Match 与 Gateway ----------
+#
+# 为什么这个脚本也要起 Room（TASK-008 起）：匹配成功后 Match 会调用
+# RoomService.CreateRoom 拿 room_id。TASK-007 时房间分配是进程内的占位实现，
+# 所以当时只需要 Match 和 Gateway。现在不起 Room，**配对会全部失败**，
+# 玩家退回队列并表现为「一直 queued」——那是脚本少了依赖，不是系统坏了。
+echo "===== 4. 启动 Room、Match 与 Gateway ====="
+"$room_binary" -port "$room_port" -env_prefix dev \
+  -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
+  -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
+  -mysql_database "$MYSQL_DATABASE" >/tmp/room.out 2>&1 &
+room_pid=$!
+echo "Room 进程号: $room_pid"
+
+room_ready=0
+for _ in $(seq 1 30); do
+  if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$room_port/health" 2>/dev/null; then
+    room_ready=1
+    break
+  fi
+  sleep 0.5
+done
+if [ "$room_ready" -eq 1 ]; then
+  ok "Room 已就绪（brpc 内置 /health）"
+else
+  fail "Room 未就绪"
+  cat /tmp/room.out
+  exit 1
+fi
+
 "$match_binary" -match_port "$match_port" \
   -match_timeout_seconds "$match_timeout_seconds" \
-  -match_result_ttl_seconds "$match_result_ttl_seconds" >/tmp/match.out 2>&1 &
+  -match_result_ttl_seconds "$match_result_ttl_seconds" \
+  -room_host 127.0.0.1 -room_port "$room_port" >/tmp/match.out 2>&1 &
 match_pid=$!
 echo "Match 进程号: $match_pid"
 
@@ -258,7 +309,8 @@ fi
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
   -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
   -mysql_database "$MYSQL_DATABASE" \
-  -match_host 127.0.0.1 -match_port "$match_port" >/tmp/gateway.out 2>&1 &
+  -match_host 127.0.0.1 -match_port "$match_port" \
+  -room_host 127.0.0.1 -room_port "$room_port" >/tmp/gateway.out 2>&1 &
 gateway_pid=$!
 echo "Gateway 进程号: $gateway_pid"
 
@@ -299,14 +351,12 @@ login() {
 }
 
 echo "===== 5. 登录测试账号 ====="
-# 只使用 alice 与 bob。carol 在种子数据里是 disabled，专门用于覆盖「禁用账号被拒绝」
-# 这条失败路径，不能用于任何需要成功登录的流程。
+# alice 与 bob 用于正常的匹配流程；carol 在种子数据里是 disabled，专门用于覆盖
+# 「禁用账号被拒绝」这条失败路径，不能用于任何需要成功登录的流程。
 #
-# 因此「第三个玩家不会被并入已配满的局」这一条**无法在端到端层面覆盖**——它需要
-# 三个可用身份。该不变量由单元测试覆盖：
-#   MatchQueueTest.CompletedMatchDoesNotAbsorbLaterPlayers
-#   MatchQueueTest.FifoOrderDecidesWhoIsPairedFirst
-# 端到端改为验证强度接近的「两次匹配互相独立」：已完成的局不会被后续请求复用。
+# dave 是第三个**启用**身份，在第 7b 节使用：验证「第三个玩家不会被并入已配满的局」。
+# 这条不变量需要三个可用身份，此前只有两个，只能靠单元测试覆盖
+# （MatchQueueTest.CompletedMatchDoesNotAbsorbLaterPlayers / FifoOrderDecidesWhoIsPairedFirst）。
 alice_token=$(login alice alice_dev_pw "verify-match-alice")
 bob_token=$(login bob bob_dev_pw "verify-match-bob")
 for pair in "alice:$alice_token" "bob:$bob_token"; do
@@ -403,6 +453,33 @@ if [ "$code" = "200" ] && [ "$again_state" = "matched" ] && [ "$again_match_id" 
 else
   fail "重复入队异常：HTTP $code state=${again_state:-<空>} match_id=[$again_match_id]"
 fi
+echo
+
+# ---------- 7b. 第三个玩家不会被并入已配满的局 ----------
+# 这一条此前**无法在端到端覆盖**：需要三个可用身份，而种子数据只提供两个
+# （carol 是 disabled）。docs/devlog.md 里把它记为「待项目所有者决定」。
+# 2026-10-02 补上了第三个启用身份 dave 与 p-0004，因此这里改为真正验证它。
+echo "===== 7b. 第三个玩家不会被并入已配满的局 ====="
+dave_token=$(login dave dave_dev_pw "verify-match-dave")
+if [ -n "$dave_token" ]; then
+  ok "dave 登录成功（第三个启用身份）"
+else
+  fail "dave 登录失败（种子数据应包含 dave/p-0004/active）"
+fi
+
+code=$(http_post /api/v1/matches "{\"token\":\"$dave_token\",\"request_id\":\"m-dave-1\"}")
+dave_state=$(json_field state)
+dave_match_id=$(json_field match_id)
+if [ "$code" = "200" ] && [ "$dave_state" = "queued" ] && [ -z "$dave_match_id" ]; then
+  ok "第三个玩家留在队列（state=queued），没有被并入已配满的局"
+else
+  fail "第三个玩家被错误配对：HTTP $code state=${dave_state:-<空>} match_id=[$dave_match_id]"
+  cat /tmp/resp.json; echo
+fi
+
+# 清理：把 dave 移出队列。否则下一步 alice/bob 重新匹配时，FIFO 会先取
+# (dave, alice) 配对，后面的小节就会测出与预期不同的组合。
+http_post /api/v1/matches/current/cancel "{\"token\":\"$dave_token\",\"request_id\":\"m-dave-cancel\"}" >/dev/null
 echo
 
 # ---------- 8. 两次匹配互相独立 ----------
@@ -552,7 +629,7 @@ echo
 
 # ---------- 12. 优雅退出 ----------
 echo "===== 12. 优雅退出 ====="
-for pair in "Gateway:$gateway_pid" "Match:$match_pid"; do
+for pair in "Gateway:$gateway_pid" "Match:$match_pid" "Room:$room_pid"; do
   name="${pair%%:*}"
   pid="${pair#*:}"
   [ -z "$pid" ] && continue
@@ -579,17 +656,20 @@ for pair in "Gateway:$gateway_pid" "Match:$match_pid"; do
 done
 gateway_pid=""
 match_pid=""
+room_pid=""
 echo
 
 # ---------- 结果 ----------
 echo "===== 验收结果 ====="
 if [ "${#failures[@]}" -eq 0 ]; then
   echo "验收通过：两人可配成同一局且 match_id/room_id 一致；重复入队幂等；"
-  echo "          已完成的局不会被复用；取消幂等；超时状态可区分；"
-  echo "          Match 不可用返回 503 且恢复后无需重启；两个进程均可优雅退出"
+  echo "          第三个玩家不会被并入已配满的局；已完成的局不会被复用；"
+  echo "          取消幂等；超时状态可区分；Match 不可用返回 503 且恢复后无需重启；"
+  echo "          Room、Match、Gateway 三个进程均可优雅退出"
   echo
-  echo "未在端到端覆盖：「第三个玩家不会被并入已配满的局」需要三个可用测试身份，"
-  echo "          种子数据只提供两个（carol 是 disabled）。该不变量由单元测试覆盖："
+  echo "覆盖说明：「第三个玩家不会被并入已配满的局」自 2026-10-02 起已在端到端覆盖"
+  echo "          （种子数据新增了第三个启用身份 dave/p-0004）。"
+  echo "          与之对应的单元测试仍保留："
   echo "          MatchQueueTest.CompletedMatchDoesNotAbsorbLaterPlayers"
   exit 0
 fi

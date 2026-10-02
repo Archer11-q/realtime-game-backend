@@ -175,10 +175,12 @@ void RoomServiceImpl::JoinRoom(google::protobuf::RpcController* /*controller*/,
             FillSnapshot(snapshot, response->mutable_room());
             return;
         case JoinOutcome::kNotAMember:
-            // 房间存在但不是给这个玩家的。用 INVALID_ARGUMENT 表达，
-            // 而不是 NOT_FOUND——房间确实存在，谎称不存在会误导排障。
-            SetError(response->mutable_error(), rgbt::room::v1::ROOM_INVALID_ARGUMENT,
-                     "not_a_member", "该玩家不是这一局的成员", request->request_id());
+            // 房间存在但不是给这个玩家的。用**独立错误码**而不是 INVALID_ARGUMENT：
+            // 调用方只映射错误码，复用同一个码会让「不是本局成员」在跨进程后
+            // 退化成「参数不合法」。也不用 NOT_FOUND——房间确实存在，谎称不存在
+            // 会误导排障。
+            SetError(response->mutable_error(), rgbt::room::v1::ROOM_NOT_A_MEMBER, "not_a_member",
+                     "该玩家不是这一局的成员", request->request_id());
             return;
         case JoinOutcome::kAlreadyFinished:
             SetError(response->mutable_error(), rgbt::room::v1::ROOM_ALREADY_FINISHED,
@@ -228,13 +230,13 @@ void RoomServiceImpl::SubmitInput(google::protobuf::RpcController* /*controller*
             return;
         case SubmitOutcome::kNotPlaying:
             response->set_accepted(false);
-            SetError(response->mutable_error(), rgbt::room::v1::ROOM_INVALID_ARGUMENT,
+            SetError(response->mutable_error(), rgbt::room::v1::ROOM_NOT_PLAYING,
                      "room_not_playing", "对局尚未开始", request->request_id());
             return;
         case SubmitOutcome::kNotInRoom:
             response->set_accepted(false);
-            SetError(response->mutable_error(), rgbt::room::v1::ROOM_INVALID_ARGUMENT,
-                     "not_a_member", "该玩家不是这一局的成员", request->request_id());
+            SetError(response->mutable_error(), rgbt::room::v1::ROOM_NOT_A_MEMBER, "not_a_member",
+                     "该玩家不是这一局的成员", request->request_id());
             return;
         case SubmitOutcome::kAlreadyFinished:
             response->set_accepted(false);

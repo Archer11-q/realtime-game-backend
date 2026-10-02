@@ -1129,6 +1129,72 @@ HP 初值 100；一方归零即结束；600 帧（60 秒）后按 HP 判定，�
 - 由项目所有者审阅 Diff 并运行 `bash scripts/verify-room.sh`；确认后开 PR。
 - 通过后进入 TASK-009（Gateway WebSocket 路由）。
 
+## 2026-10-02：补上第三个启用测试身份（dave / p-0004）
+
+### 背景
+
+TASK-007 的记录里留了一个待决问题（见本文档 2026-09-22 的「问题与风险」一节）：
+
+> **种子数据只有两个可用身份，而「第三个玩家不会被并入已配满的局」需要三个**……
+> 是否新增第四个启用身份待项目所有者决定。
+
+这个决定一直没有结论，因此 TASK-008 的端到端脚本里仍然把两条不变量打印成
+「未在端到端覆盖」：匹配的「第三个玩家不会被并入已配满的局」、
+房间的「非本局成员无法加入」。项目所有者指出该决定悬空，本轮补上。
+
+### 完成
+
+- `migrations/004_seed_test_players.sql`：新增 `dave / p-0004 / Dave / active`。
+- `src/gateway/test_credentials.cpp`：新增 `dave / dave_dev_pw`。
+- `scripts/verify-login.sh`：种子行数断言 3 -> 4；新增 dave 状态为 active 的断言。
+- `scripts/verify-match.sh`：新增第 7b 节，用 dave 真正验证
+  「第三个玩家不会被并入已配满的局」；头部注释与结尾的「未覆盖项」一并更新。
+- `scripts/verify-room.sh`：用 dave 真正验证「非本局成员无法加入」返回
+  `400 not_a_member`；结尾的「未覆盖项」一并更新。
+- `tests/unit/gateway/player_directory_test.cpp`：把「档案有、代码里没有凭据」
+  那个用例的账号从 `dave / p-0004` 改成 `erin / p-0005`。**不改就测不出原意**：
+  dave 从本轮起是真实存在的测试身份，用它构造不出「配置不一致」这个场景。
+- `api/proto/room.proto`：新增 `ROOM_NOT_A_MEMBER` 与 `ROOM_NOT_PLAYING` 两个错误码；
+  `room_service.cpp` 改用它们；`room_client.hpp` / `brpc_room_client.cpp` /
+  `gateway_service.cpp` 同步映射。
+
+### 问题与风险（本轮实际踩到并解决的）
+
+- **`verify-match.sh` 被 TASK-008 改坏了，而且不是立刻能看出来的那种坏**。
+  TASK-007 时房间分配是 Match 进程内的占位实现，所以那个脚本只启动 Match 与
+  Gateway；TASK-008 把分配换成真实的 brpc 调用后，**脚本没起 Room**，
+  于是所有配对都失败，表现为「玩家一直 queued」。重新跑它才发现，
+  这也说明**新增服务依赖时必须回头检查既有验收脚本**，不能只验新脚本。
+  修复：脚本增加 Room 的端口预检、启动、就绪等待与优雅退出检查。
+- **调用方只映射错误码，写在 `reason` 里的区别跨进程后必然丢失**。
+  端到端断言「非本局成员返回 400 not_a_member」失败，实际返回的是
+  `room_invalid_argument`：Room 侧确实把 `reason` 设成了 `not_a_member`，
+  但 `BrpcRoomClient` 按**错误码**映射，而这两个场景共用
+  `ROOM_INVALID_ARGUMENT`，区别只存在于自由文本里，于是被丢掉了。
+  修复：在契约里给它们**独立的错误码**（`ROOM_NOT_A_MEMBER` / `ROOM_NOT_PLAYING`），
+  而不是继续依赖 `reason`。教训：需要调用方区分的语义必须体现在**结构化字段**上；
+  放在自由文本里等于指望每一层都恰好把它透传下去。
+- **`--no-docker` 会跳过迁移应用，因此种子数据的新增行不会生效**。
+  第一次跑 `verify-match.sh --no-docker` 时 dave 登录失败，一度以为是凭据没配对，
+  实际是那一轮没有重新应用 `004_seed_test_players.sql`。已在脚本头部写明这个前提。
+
+### 决策
+
+- **扩展现有的 `004_seed_test_players.sql`，而不是新增 `005_…`**。理由：该文件是
+  **开发用种子数据**，不是 schema 迁移；它的头部注释本来就是「账号 ↔ player_id」
+  的唯一对照表，把测试身份集合拆到两个文件会让这张表在两边都不完整。脚本每次运行
+  都会重新应用 `migrations/*.sql`（幂等），因此已有数据卷也会拿到 dave 这一行。
+- **不把 carol 改成可用**。它承担「账号被禁用」这条失败路径的覆盖，改成 active
+  会丢掉一个已经有效的用例。
+
+### 验证
+
+- 命令：`ctest --test-dir build/brpc-debug --output-on-failure`
+- 结果：通过（`player_directory_test` 改用 erin 后仍覆盖原场景）。
+- 命令：`bash scripts/verify-login.sh`、`bash scripts/verify-match.sh`、
+  `bash scripts/verify-room.sh`
+- 结果：见各脚本输出的真实结论；匹配与房间的脚本不再打印「未覆盖项」。
+
 ## 日志模板
 
 ```markdown

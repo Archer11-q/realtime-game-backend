@@ -15,10 +15,16 @@ struct BuiltinAccount {
 };
 
 /// 刻意包含一个 disabled 账号（carol），用于覆盖「账号被禁用」这条失败路径。
+///
+/// dave 是第三个**启用**身份。它存在的理由不是「多一个测试账号」，而是有两条
+/// 不变量必须三个启用身份才能验证：匹配的「第三个玩家不会被并入已配满的局」、
+/// 房间的「非本局成员无法加入」。缺了它这两条只能在单元测试里覆盖，
+/// 端到端脚本会一直打印「未覆盖项」。
 constexpr BuiltinAccount kBuiltinAccounts[] = {
     {"alice", "alice_dev_pw"},
     {"bob", "bob_dev_pw"},
     {"carol", "carol_dev_pw"},
+    {"dave", "dave_dev_pw"},
 };
 
 }  // namespace

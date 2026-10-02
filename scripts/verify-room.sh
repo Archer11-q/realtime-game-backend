@@ -457,7 +457,8 @@ wait_until_idle() {
 
 # ---------- 5. 登录 ----------
 echo "===== 5. 登录测试账号 ====="
-# 只使用 alice 与 bob。carol 在种子数据里是 disabled，专门用于覆盖失败路径。
+# alice 与 bob 参与正常对局；carol 在种子数据里是 disabled，用于覆盖失败路径；
+# dave 是第三个启用身份，在第 7 节用于验证「非本局成员无法加入」。
 alice_token=$(login alice alice_dev_pw "verify-room-alice")
 bob_token=$(login bob bob_dev_pw "verify-room-bob")
 for pair in "alice:$alice_token" "bob:$bob_token"; do
@@ -533,9 +534,20 @@ else
   fail "重复加入异常：HTTP $code"
 fi
 
-# 「非本局成员不能加入」在端到端层面无法覆盖：需要三个可用身份，而种子数据只提供
-# 两个（carol 是 disabled，专门用于覆盖「禁用账号被拒绝」这条失败路径）。
-# 该不变量由单元测试覆盖，这里只验证「缺少 Token」这一类输入错误。
+# 第三个启用身份（dave）是**真人但不是这一局的人**：房间还有空位也进不去。
+# 这条不变量此前因为「种子数据只有两个可用身份」而无法在端到端覆盖，
+# 2026-10-02 补上 dave/p-0004 后改为真正验证。
+dave_token=$(login dave dave_dev_pw "verify-room-dave")
+code=$(http_post /api/v1/rooms/join \
+  "{\"token\":\"$dave_token\",\"request_id\":\"verify-room-join-dave\",\"room_id\":\"$alice_room\"}")
+if [ "$code" = "400" ] && grep -q 'not_a_member' /tmp/resp.json; then
+  ok "非本局成员无法加入（dave 是真人但不在这一局，400 not_a_member）"
+else
+  fail "非本局成员加入异常：HTTP $code（期望 400 not_a_member）"
+  cat /tmp/resp.json; echo
+fi
+
+# 缺少 Token 这一类输入错误。
 code=$(http_post /api/v1/rooms/join "{\"request_id\":\"verify-room-join-notoken\",\"room_id\":\"$alice_room\"}")
 if [ "$code" = "400" ] && grep -q 'token_required' /tmp/resp.json; then
   ok "缺少 Token 时拒绝加入（400 token_required）"
@@ -850,12 +862,14 @@ if [ "${#failures[@]}" -eq 0 ]; then
   echo "验收通过：匹配后可创建真实房间；双方进房驱动 waiting->playing；"
   echo "          攻击按 10 Hz 帧结算且不跨帧累积；一方 HP 归零后产生胜负；"
   echo "          对局结果同步幂等落库（match_results 仅 1 行）；"
-  echo "          结束后提交输入返回 409；Room 停机返回 503 且不产生半成品配对；"
+  echo "          非本局成员无法加入（400）；结束后提交输入返回 409；"
+  echo "          Room 停机返回 503 且不产生半成品配对；"
   echo "          MySQL 停机时结果返回 503 result_pending 且不返回假胜负，"
   echo "          恢复后无需重启 Room 即自动落库；三个进程均可优雅退出"
   echo
-  echo "未在端到端覆盖：「非本局成员无法加入」需要三个可用测试身份，"
-  echo "          种子数据只提供两个（carol 是 disabled）。该不变量由单元测试覆盖："
+  echo "覆盖说明：「非本局成员无法加入」自 2026-10-02 起已在端到端覆盖"
+  echo "          （种子数据新增了第三个启用身份 dave/p-0004）。"
+  echo "          与之对应的单元测试仍保留："
   echo "          BattleRoomTest.StrangerCannotJoin"
   echo "          BattleRoomTest.StrangerCannotSubmitInput"
   echo "          GatewayServiceTest.JoinRoomUsesPlayerIdFromSession（player_id 取自会话）"

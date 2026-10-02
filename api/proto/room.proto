@@ -72,7 +72,14 @@ enum FinishReason {
 //   ALREADY_FINISHED       对局已结束，不再接受输入
 //   RESULT_PENDING         已分出胜负但结果尚未落库，可稍后重试
 //   STORE_UNAVAILABLE      对端存储（MySQL）暂时不可用，可有限重试
+//   NOT_A_MEMBER           该玩家不是这一局的成员
+//   NOT_PLAYING            对局尚未开始，此时不接受输入
 //   INTERNAL               未分类内部错误
+//
+// 为什么 NOT_A_MEMBER 与 NOT_PLAYING 要有独立错误码，而不是复用 INVALID_ARGUMENT
+// 再靠 reason 区分：**调用方只映射错误码**（见 src/gateway/brpc_room_client.cpp）。
+// 把区别放在自由文本的 reason 里，跨进程后必然丢失——Gateway 会把「不是本局成员」
+// 报成「参数不合法」。契约要能承载调用方真正需要的区分。
 enum RoomErrorCode {
   ROOM_ERROR_CODE_UNSPECIFIED = 0;
   ROOM_INVALID_ARGUMENT = 1;
@@ -81,6 +88,8 @@ enum RoomErrorCode {
   ROOM_RESULT_PENDING = 4;
   ROOM_STORE_UNAVAILABLE = 5;
   ROOM_INTERNAL = 6;
+  ROOM_NOT_A_MEMBER = 7;
+  ROOM_NOT_PLAYING = 8;
 }
 
 // 统一错误体。

@@ -81,6 +81,10 @@ RoomCallStatus ToCallStatus(rgbt::room::v1::RoomErrorCode code) {
             return RoomCallStatus::kOk;
         case rgbt::room::v1::ROOM_INVALID_ARGUMENT:
             return RoomCallStatus::kInvalidArgument;
+        case rgbt::room::v1::ROOM_NOT_A_MEMBER:
+            return RoomCallStatus::kNotAMember;
+        case rgbt::room::v1::ROOM_NOT_PLAYING:
+            return RoomCallStatus::kNotPlaying;
         case rgbt::room::v1::ROOM_NOT_FOUND:
             return RoomCallStatus::kNotFound;
         case rgbt::room::v1::ROOM_ALREADY_FINISHED:
