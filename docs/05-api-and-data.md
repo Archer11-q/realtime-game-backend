@@ -93,7 +93,30 @@ HTTP 方法分派**，同一路径无法同时承载 GET 与 DELETE，因此改�
 **安全约束**：所有房间接口的 `player_id` **只能来自会话**，请求体里即使带上
 该字段也会被忽略。否则任何登录用户都能替他人加入房间或代打。
 
-### WebSocket 消息信封
+### 服务端推送（SSE）与消息信封
+
+浏览器推送**不使用 WebSocket**：brpc 1.16.0 不支持它，改用其官方支持的
+Server-Sent Events。完整论证见 [ADR-0004](adr/0004-sse-instead-of-websocket.md)。
+
+传输形态：
+
+```text
+浏览器 -> Gateway：现有 HTTP 接口（登录、匹配、加入房间、提交输入）
+Gateway -> 浏览器：GET /api/v1/stream?room_id=...   text/event-stream 长连接
+```
+
+事件的线上格式（`data` 是**单行** JSON，即下面的信封）：
+
+```text
+event: room.state
+data: {"version":1,"type":"room.state","sequence":12,"timestamp_ms":0,"payload":{}}
+
+```
+
+心跳以 SSE 注释行发送（`: ping`），客户端会忽略它，但它让长连接不被中间层回收。
+**心跳不能做成事件**，否则会污染事件流、让客户端的类型分发多一种无意义的分支。
+
+信封字段：
 
 ```json
 {
@@ -109,20 +132,31 @@ HTTP 方法分派**，同一路径无法同时承载 GET 与 DELETE，因此改�
 要求：
 
 - `version` 用于协议演进。
-- `type` 使用小写点分命名。
-- `request_id` 只用于需要响应的客户端请求。
-- `sequence` 用于房间内消息排序和发现缺口。
+- `type` 使用小写点分命名，与 SSE 的 `event:` 字段一致。
+- `request_id` 只用于需要响应的客户端请求；**服务端主动推送不带该字段**。
+- `sequence` 用于房间内消息排序和发现缺口。`room.state` / `room.finished`
+  直接用房间帧号，天然单调递增。
 - 服务端必须校验消息大小、字段类型和当前连接状态。
 
-首批消息类型：
+推送事件类型（TASK-009 已实现的部分）：
 
-- `session.ready`
-- `match.updated`
-- `room.joined`
-- `room.state`
-- `room.frame`
-- `room.finished`
-- `error`
+- `session.ready` —— 订阅建立后的第一个事件，带上订阅者与房间
+- `room.state` —— 房间权威状态快照，**仅在该房间帧号变化时推送**
+- `room.finished` —— 对局结束（含平局与 `aborted`），推送后服务端关闭连接
+
+计划中但**当前未实现**的事件类型（不要在没有对应实现时把它们写进文档之外的地方）：
+
+- `match.updated` —— 匹配状态变化。当前由客户端轮询 `GET /api/v1/matches/current`
+  获得。改为推送需要 Gateway 为**每个在线连接**轮询 Match，而匹配状态变化频率低，
+  收益不足以换这份负载；若将来前端体验确实需要，再评估。
+- `room.joined` / `room.frame` —— 已被 `room.state` 覆盖，不单独定义。
+
+**订阅的访问控制**：`room_id` 由客户端提供，因此服务端必须校验调用者确实是该房间
+成员（用一次 `GetRoomState` 即可判定），否则任何登录用户都能长期订阅别人的房间、
+看到对方的血量。非成员返回 `400 not_a_member`。
+
+**轮询兜底仍然保留**：`GET /api/v1/rooms/state` 与 `GET /api/v1/results` 不因为
+推送上线而删除。断线、代理不支持 SSE、或客户端尚未接入推送时，它们仍是可用路径。
 
 ## 3. 服务间 Protobuf
 

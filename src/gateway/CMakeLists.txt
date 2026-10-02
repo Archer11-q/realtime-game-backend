@@ -1,4 +1,5 @@
-# gateway 服务：TASK-005 登录切片 + TASK-006 玩家档案走数据库 + TASK-007 匹配 + TASK-008 房间与对局结果。
+# gateway 服务：TASK-005 登录切片 + TASK-006 玩家档案走数据库 + TASK-007 匹配
+# + TASK-008 房间与对局结果 + TASK-009 SSE 推送。
 #
 # 依赖 vcpkg 提供的 brpc、hiredis 与 libmariadb（后者经 rgbt_common_mysql 传递），
 # 因此本目录只在启用 vcpkg 工具链时加入（见 src/CMakeLists.txt），
@@ -41,6 +42,7 @@ add_library(
   mysql_player_reader.cpp
   password_hash.cpp
   redis_session_store.cpp
+  stream_hub.cpp
   test_credentials.cpp
 )
 

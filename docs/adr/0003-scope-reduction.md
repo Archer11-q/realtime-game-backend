@@ -49,7 +49,7 @@ proto、服务、Compose 服务或迁移脚本：
 
 | 服务 | 职责 | 数据所有权 |
 |---|---|---|
-| Gateway | HTTP/WebSocket、鉴权、路由、心跳、限流、会话 | `players`（只读） |
+| Gateway | HTTP/SSE、鉴权、路由、心跳、限流、会话 | `players`（只读） |
 | Match | 匹配队列、FIFO 两人配对、取消、房间分配 | 匹配队列（进程内存） |
 | Room/Battle | 房间生命周期、权威状态、快照、对局同步 | 房间状态、`match_results` |
 

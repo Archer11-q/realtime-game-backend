@@ -3,12 +3,15 @@
 #include <brpc/closure_guard.h>
 #include <brpc/controller.h>
 #include <brpc/http_status_code.h>
+#include <brpc/progressive_attachment.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "common/token.hpp"
 #include "error.hpp"
@@ -17,6 +20,31 @@ namespace rgbt::gateway {
 namespace {
 
 using rgbt::gateway::v1::ErrorCode;
+
+/// 把 SSE 事件写进 brpc 的持续响应体。
+///
+/// 这是 EventSink 的唯一生产实现。它必须持有 ProgressiveAttachment 的
+/// intrusive_ptr——`brpc::Controller` 在请求返回后就不再可用，而文档明确要求
+/// 「发送完毕后确保所有 intrusive_ptr 都析构以释放资源」。
+/// 因此释放最后一个引用（Close）就是结束这条响应。
+class ProgressiveAttachmentSink final : public EventSink {
+public:
+    explicit ProgressiveAttachmentSink(butil::intrusive_ptr<brpc::ProgressiveAttachment> attachment)
+        : attachment_(std::move(attachment)) {}
+
+    [[nodiscard]] bool Write(const std::string& data) override {
+        if (attachment_ == nullptr) {
+            return false;
+        }
+        // 返回 0 表示写成功；非 0 表示连接已断或响应已关闭，此时调用方清理订阅。
+        return attachment_->Write(data.data(), data.size()) == 0;
+    }
+
+    void Close() override { attachment_.reset(); }
+
+private:
+    butil::intrusive_ptr<brpc::ProgressiveAttachment> attachment_;
+};
 
 /// 把业务状态码同步到 HTTP 响应上。
 ///
@@ -164,12 +192,13 @@ std::string MatchStateName(MatchState state) {
 }  // namespace
 
 GatewayServiceImpl::GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* players,
-                                       MatchClient* match, RoomClient* room,
+                                       MatchClient* match, RoomClient* room, StreamHub* stream,
                                        std::int32_t session_ttl_seconds)
     : sessions_(sessions),
       players_(players),
       match_(match),
       room_(room),
+      stream_(stream),
       session_ttl_seconds_(session_ttl_seconds > 0 ? session_ttl_seconds
                                                    : kDefaultSessionTtlSeconds) {}
 
@@ -818,6 +847,129 @@ void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* contr
         result->set_started_at_ms(view.result.started_at_ms);
         result->set_finished_at_ms(view.result.finished_at_ms);
     }
+}
+
+void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* controller,
+                                      const rgbt::gateway::v1::StreamEventsRequest* request,
+                                      rgbt::gateway::v1::StreamEventsResponse* response,
+                                      ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    const std::string token = ExtractToken(controller, request->token());
+    const std::string request_id = request->request_id();
+    const std::string room_id = ExtractQueryParam(controller, "room_id", request->room_id());
+
+    std::string player_id;
+    rgbt::gateway::v1::Error error;
+    const std::int32_t auth = ResolvePlayerId(token, request_id, &player_id, &error);
+    if (auth != 200) {
+        *response->mutable_error() = error;
+        response->set_status_code(auth);
+        ApplyHttpStatus(controller, auth);
+        return;
+    }
+
+    if (room_id.empty()) {
+        const std::int32_t status =
+            FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
+                      "缺少 room_id", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    if (room_ == nullptr) {
+        const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
+                                              "room_unavailable", "房间服务未配置", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    // 成员校验：房间快照里必须包含调用者。
+    //
+    // 没有这一步，任何登录用户只要猜到（或用别人给的）room_id，就能长期订阅到
+    // 别人房间的血量与胜负。room_id 由服务端随机生成，但「难猜」不是访问控制。
+    RoomSnapshot snapshot;
+    const RoomCallStatus lookup = room_->GetState(room_id, &snapshot);
+    if (lookup != RoomCallStatus::kOk) {
+        const std::int32_t status = HandleRoomFailure(lookup, request_id, &error);
+        *response->mutable_error() = error;
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+    bool is_member = false;
+    for (const RoomPlayerSnapshot& player : snapshot.players) {
+        if (player.player_id == player_id) {
+            is_member = true;
+            break;
+        }
+    }
+    if (!is_member) {
+        const std::int32_t status =
+            FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "not_a_member",
+                      "该玩家不是这一局的成员", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    if (stream_ == nullptr) {
+        const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
+                                              "stream_unavailable", "推送服务未配置", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    auto* cntl = static_cast<brpc::Controller*>(controller);
+    if (cntl == nullptr || !cntl->has_http_request()) {
+        // 无 HTTP 上下文（单元测试直接调用服务）时无法建立流式响应。
+        // 明确失败，而不是登记一条永远写不出去的订阅。
+        const std::int32_t status =
+            FillError(response->mutable_error(), ErrorCode::INTERNAL, "stream_requires_http",
+                      "推送接口只能通过 HTTP 访问", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    // 进入 SSE 模式：先定响应头，再取持续写入口。
+    // done 释放之后写出的数据会立刻以 chunked 形式发出
+    // （brpc 文档 http_service.md「持续发送」一节）。
+    cntl->http_response().set_content_type("text/event-stream");
+    cntl->http_response().set_status_code(200);
+    cntl->http_response().SetHeader("Connection", "keep-alive");
+    cntl->http_response().SetHeader("Cache-Control", "no-cache");
+    // 反向代理常会缓冲响应体，把 SSE 事件攒到最后一起发。这一行是通用的
+    // 关闭缓冲提示，对直连没有副作用。
+    cntl->http_response().SetHeader("X-Accel-Buffering", "no");
+
+    butil::intrusive_ptr<brpc::ProgressiveAttachment> attachment =
+        cntl->CreateProgressiveAttachment();
+    if (attachment == nullptr) {
+        const std::int32_t status = FillError(response->mutable_error(), ErrorCode::INTERNAL,
+                                              "stream_unavailable", "无法创建推送通道", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    const std::uint64_t subscription_id = stream_->Subscribe(
+        player_id, room_id, std::make_unique<ProgressiveAttachmentSink>(attachment));
+    if (subscription_id == 0) {
+        const std::int32_t status = FillError(response->mutable_error(), ErrorCode::INTERNAL,
+                                              "stream_unavailable", "订阅注册失败", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatus(controller, status);
+        return;
+    }
+
+    // 成功。不写 error、也不写响应体：后续内容全部由 StreamHub 持续写出，
+    // 直到对局结束或客户端断开。
+    response->set_status_code(200);
+    ApplyHttpStatus(controller, 200);
 }
 
 bool GatewayServiceImpl::DependenciesHealthy() {

@@ -123,7 +123,7 @@ Compose 服务或环境变量：
 - 正式源码目录固定为 `~/workspace/realtime-game-backend`，位于 WSL Linux
   文件系统，而不是 `/mnt/d`。
 - 服务间通信固定为 brpc + Protobuf。
-- 浏览器通信固定为 HTTP + WebSocket。
+- 浏览器通信固定为 HTTP + SSE（服务端推送）。**不使用 WebSocket**：brpc 不支持它，见 ADR-0004。
 - 业务实现采用 C++20，演示前端采用 Vue 3 + TypeScript。
 - 外部依赖版本需要固定并记录。
 - 每个阶段都必须可构建、可测试、可回退。

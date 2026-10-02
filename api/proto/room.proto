@@ -5,7 +5,7 @@
 //     （docs/01-architecture.md 第 3、5 节，docs/adr/0003-scope-reduction.md）。
 //   * 对局同步方式为**最小状态同步**（D-003）：服务端权威快照 + 广播。
 //     TASK-008 阶段客户端通过 Gateway 轮询 GetRoomState 获取快照；
-//     WebSocket 主动推送属 TASK-009。
+//     服务端主动推送（SSE）属 TASK-009，见 docs/adr/0004-sse-instead-of-websocket.md。
 //   * 字段只追加，不修改既有标签号；删除字段必须先标记 reserved。
 //   * 本文件是**第三个服务间契约**（前两个是 gateway.proto、match.proto），沿用
 //     同样的约定：每个请求带 request_id，每个响应带可判定的 error.reason。

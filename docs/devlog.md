@@ -1195,6 +1195,131 @@ TASK-007 的记录里留了一个待决问题（见本文档 2026-09-22 的「�
   `bash scripts/verify-room.sh`
 - 结果：见各脚本输出的真实结论；匹配与房间的脚本不再打印「未覆盖项」。
 
+## TASK-009 实施记录（2026-10-02）
+
+### 背景与范围变更
+
+原定范围是「Gateway WebSocket 路由与房间消息」。按项目纪律在编码前先核实框架能力，
+结论是这条路在当前技术栈下走不通：
+
+- **brpc 1.16.0 完全不支持 WebSocket**。在 `docs/`、`include/brpc/`、`src/` 三处
+  检索 `websocket` 全部为空；唯一的命中来自 Thrift（`TThriftWebSocketServer`），
+  那是 brpc 的传递依赖，与 brpc 无关。
+- **在 brpc 之上自实现 WebSocket 也不成立**。brpc 只提供
+  `Controller::CreateProgressiveAttachment()`，它能持续写响应体，但无法接管底层
+  socket。WebSocket 要求握手后把同一连接切成帧协议并**读取**客户端帧，而在 brpc 下
+  这些字节会被当作新的 HTTP 请求解析。
+- **没有现成的 WebSocket 库**。vcpkg 只装了 brpc 依赖所需的 boost 子集，没有 beast；
+  websocketpp / uwebsockets / libwebsockets 均未安装。
+
+同时确认 brpc **官方支持 SSE**：`docs/cn/http_service.md` 第 336–350 行明确写了
+「利用该特性可以轻松实现 Server-Sent Events(SSE) 服务」，且源码包内的官方示例
+`HttpSSEServiceImpl` 就是一个普通的 protobuf service 方法——与现有
+`GatewayServiceImpl` 形态完全一致。
+
+据此，项目所有者确认改用 SSE，新增 **ADR-0004** 记录这次方向变更与备选方案的取舍。
+
+### 完成
+
+- `docs/adr/0004-sse-instead-of-websocket.md`：方向变更的完整论证。
+- `api/proto/gateway.proto`：新增 `StreamEvents` RPC 与请求/响应消息。
+- `src/gateway/event_sink.hpp`：事件出口接口（为了能脱离 HTTP 上下文做单元测试）。
+- `src/gateway/stream_hub.hpp/.cpp`：订阅表与推送驱动。只对有订阅者的房间轮询、
+  帧号变化才推送、同房间多订阅者扇入成一次调用、写失败即清理订阅。
+- `src/gateway/gateway_service.cpp`：`StreamEvents` 处理函数 +
+  `ProgressiveAttachmentSink`（brpc 的实现方）。
+- `src/gateway/gateway_main.cpp`：接线订阅表与推进线程，新增
+  `-stream_poll_interval_ms`、`-stream_heartbeat_interval_ms`；
+  优雅退出顺序改为「停线程 → 关所有长连接 → 停服务器」。
+- `tests/unit/gateway/stream_hub_test.cpp`：13 个用例；`gateway_service_test.cpp`
+  新增 6 个 SSE 失败路径用例。
+- `scripts/verify-stream.sh`：端到端验收。
+- `deploy/compose/.env.example`：删除 `GATEWAY_WS_PORT`（从未被任何进程读取）。
+- 全仓库 47 处 WebSocket 表述同步为 SSE。
+
+### 决策
+
+- **只在帧号变化时推送**。每 100 ms 推一条完全相同的快照是纯粹的空转，且会让
+  客户端误以为有更新。但「进入结束态」是必须送达的事件，即使帧号没变。
+- **结束事件之后主动关闭流**。`finished` 与 `aborted` 都是终点，之后这条流没有
+  内容了；不关闭会让客户端一直等。
+- **Room 抖动时保持连接、也不推 error 事件**。房间查不到可能只是暂时不可用，
+  关掉连接会强迫客户端重连；而每次轮询都推一条 error 会刷屏。恢复后继续推。
+- **`session.ready` 在第一次 Tick 里发，而不是在 Subscribe 里发**。
+  Subscribe 运行在 brpc 的请求处理中，那时响应还没提交；brpc 文档说明只有
+  `done` 之后写入的数据才会立刻以 chunked 形式发出。
+- **订阅要校验成员身份**。`room_id` 由客户端提供，不校验的话任何登录用户只要
+  拿到（或猜到）room_id 就能长期订阅别人的房间、看到对方的血量。
+  随机生成的 ID「难猜」不是访问控制。
+- **`match.updated` 不做推送**。它需要 Gateway 为每个在线连接轮询 Match，
+  而匹配状态变化频率很低；客户端继续轮询 `/api/v1/matches/current`。
+  把这条件为「未实现」写进文档，而不是留一个含糊的"计划中"。
+- **保留全部轮询接口**。断线或代理不支持 SSE 时它们是唯一可用的路径。
+- **删除而不是保留 `GATEWAY_WS_PORT`**。它从未被任何进程读取；在改用 SSE 之后
+  更没有任何用途。留着只会让下一个人以为有个 WebSocket 端口可以用。
+
+### 验证（均在 WSL 的 `~/workspace/realtime-game-backend` 执行）
+
+- 命令：`cmake --preset brpc-debug && cmake --build --preset brpc-debug`
+- 结果：构建成功，无新增编译警告（`-Werror` 全程生效）。
+- 命令：`ctest --test-dir build/brpc-debug --output-on-failure`
+- 结果：**163/163 通过**（TASK-008 时为 144 个，本次新增 19 个）。
+- 命令：`cmake --preset brpc-debug -B build/brpc-asan -DRGBT_ENABLE_SANITIZER=ON`
+  然后运行 `rgbt_gateway_tests`
+- 结果：**91/91 通过，ASan 与泄漏检测均无报告**。
+  必须单独配这个目录：`asan` 预设不启用 vcpkg，因此根本不构建 Gateway 与它的测试。
+- 命令：`bash scripts/verify-stream.sh`
+- 结果：**全部通过，退出码 0**。实测覆盖：订阅后收到 `session.ready`（含
+  `player_id` 与 `room_id`）；帧推进产生 **13 次** `room.state` 推送且 `sequence`
+  为 `0..12` **严格单调递增**；攻击造成的血量变化在推送中可见（`p-0002` hp=90）；
+  空闲时收到心跳注释 `: ping` 且**未污染事件流**；结束后收到 `room.finished`
+  且服务端**主动关闭连接**（curl 自行退出）；非本局成员被拒绝
+  `400 not_a_member`；缺 Token / 缺 room_id 各 400；房间不存在 404；
+  轮询接口仍返回 200；**持有一条打开的 SSE 长连接时，Gateway 仍在 10 秒内以
+  退出码 0 退出**。
+- 命令：`bash scripts/verify-room.sh`、`bash scripts/verify-match.sh`
+- 结果：全部通过（回归：推送上线没有破坏轮询与匹配链路）。
+
+### 问题与风险（本轮实际踩到并解决的）
+
+- **测试自己抓到了 use-after-free**。写 `StreamHub` 的单元测试时，我把可观测状态
+  放在 `FakeSink` 内部，而对局结束与写失败这两条路径会**销毁 sink**。结果那两个
+  用例直接 SegFault。这类问题在普通构建下常常"看起来通过"（内存还没被复用），
+  只在 ASan 或恰好被覆盖时才暴露。修复：把可观测状态移到 sink 之外的共享对象里，
+  并在文件头写明为什么必须这样做。
+- **长连接会拖住优雅退出，且这一点必须被验证而不是假设**。
+  `brpc::Server::Stop()` 要等响应结束，而 SSE 响应不会自己结束。因此退出顺序
+  必须是「停推进线程 → 关闭所有订阅 → 停服务器」。验收脚本专门开一条保持打开的
+  长连接再发 SIGTERM，确认仍在 10 秒内退出——如果只测「没有连接时的退出」，
+  这个问题永远不会被发现。
+- **第一次写验收脚本时，我把 SIGTERM 测试建在了一个已经结束的房间上**。
+  订阅一个 `finished` 房间会立刻收到 `room.finished` 并被关闭，于是"长连接未能
+  保持打开"，那条断言什么都没验证。修复：先等双方回到 idle，再开一局新的。
+  **测试里"连接没保持住"可能是测试搭错了场景，而不是产品有问题**。
+- **`asan` 预设覆盖不到 Gateway**。它不使用 vcpkg，而 Gateway 只在 vcpkg 工具链下
+  构建（因为它依赖 brpc）。也就是说 **TASK-005 以来的 Gateway 代码从来没有跑过
+  ASan**。本轮用 `-DRGBT_ENABLE_SANITIZER=ON` 单独配了 `build/brpc-asan` 才跑上。
+  这是一个真实的覆盖缺口，应该固化成一条命令，而不是每次临时拼参数。
+- **测试目标的告警策略与产品代码不同，且这是有意为之**。`rgbt_set_test_warnings`
+  不加 `-Werror`，原因是 GTest 的 `TEST_F` 宏展开出的静态函数会被
+  `-Wunused-function` 误报（devlog 2026-09-18 已记录）。副作用是测试里忽略
+  `[[nodiscard]]` 返回值只会产生警告、不会失败——`room_manager_test.cpp` 里有
+  约 20 处 setup 调用就是这样。它们不影响断言的有效性，因此本轮**没有**顺手修改
+  另一个任务的测试文件（一个 PR 只解决一个问题），仅在此记录。
+
+### 未做 / 留给后续
+
+- 不实现 `match.updated` 推送（理由见决策）。
+- 不做帧级高频上行；上行仍是「一次动作一个 HTTP 请求」。
+- 不做断线重连补帧（Phase 2）。SSE 规范自带 `Last-Event-ID` 语义，Phase 2
+  实现「补缺失状态」时可以直接利用。
+- 推送只有进程内的订阅表，**Gateway 重启即丢失订阅**，客户端需重连（Phase 2）。
+
+### 下一步
+
+- 由项目所有者审阅 Diff 并运行 `bash scripts/verify-stream.sh`；确认后开 PR。
+- 通过后进入 TASK-010（Vue 演示页面：登录、大厅、对战、结算）。
+
 ## 日志模板
 
 ```markdown
