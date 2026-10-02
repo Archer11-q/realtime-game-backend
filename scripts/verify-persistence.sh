@@ -19,6 +19,11 @@
 #      （TASK-014 期间这里曾 7/10 概率 abort，见 docs/devlog.md）
 #  12. 多个请求并发使用同一条 MySQL 连接时不能出错
 #
+# 覆盖 TASK-015（匹配队列恢复）的验收标准：
+#  13. 入队后 Redis 里确实有队列快照
+#  14. kill -9 Match 后重启，玩家**仍在队列里**（排队状态不丢）
+#  15. Match 的快照存储不可用时**降级为纯内存、匹配照常**，且日志明确记录降级
+#
 # 用法：
 #   bash scripts/verify-persistence.sh              # 完整验收
 #   bash scripts/verify-persistence.sh --no-docker  # 复用已启动的 Redis/MySQL
@@ -163,12 +168,27 @@ else
   fail "Room 未就绪"; cat /tmp/room.out; exit 1
 fi
 
-"$match_bin" -match_port "$match_port" -match_timeout_seconds 30 -match_result_ttl_seconds 4 \
-  -room_host 127.0.0.1 -room_port "$room_port" >/tmp/match.out 2>&1 &
-match_pid=$!
-for _ in $(seq 1 30); do curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$match_port/health" && break; sleep 0.5; done
-curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$match_port/health" && ok "Match 就绪" ||
-  { fail "Match 未就绪"; exit 1; }
+# 启动（或重启）Match。抽成函数是因为 TASK-015 的队列恢复验收要
+# `kill -9` 之后再拉起它，验证排队状态能从 Redis 快照里回来。
+start_match() {
+  local redis_port="${1:-${REDIS_PORT:-6379}}"
+  "$match_bin" -match_port "$match_port" -match_timeout_seconds 30 -match_result_ttl_seconds 4 \
+    -env_prefix dev -redis_host "${REDIS_HOST:-127.0.0.1}" \
+    -redis_port "$redis_port" \
+    -room_host 127.0.0.1 -room_port "$room_port" >/tmp/match.out 2>&1 &
+  match_pid=$!
+  for _ in $(seq 1 30); do
+    curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$match_port/health" 2>/dev/null && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+if start_match; then
+  ok "Match 就绪"
+else
+  fail "Match 未就绪"; cat /tmp/match.out; exit 1
+fi
 
 "$gw_bin" -port "$gateway_port" -env_prefix dev \
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
@@ -775,6 +795,94 @@ else
 fi
 echo
 
+# --- 7f. 匹配队列的 Redis 快照与重启恢复（TASK-015） ---
+#
+# 背景：TASK-007 的已知限制是「Match 重启即丢失排队状态」，排队中的玩家会
+# 突然变成 idle 且没有任何解释。本节验证三件事：
+#   1. 入队后 Redis 里确实有快照；
+#   2. kill -9 Match 再拉起，玩家**仍在队列里**（状态与恢复人数都对得上）；
+#   3. Redis 不可用时**降级为纯内存、匹配照常**——这是项目所有者确认的策略，
+#      也是与房间快照一致的取舍：快照可以丢弃，不阻塞业务。
+echo "===== 7f. 匹配队列的重启恢复 ====="
+redis_key="dev:match:queue"
+redis_cli() { docker exec rgbt-redis redis-cli "$@" 2>/dev/null | tr -d '\r'; }
+
+wait_idle
+enqueue_match "$alice_token" "vq-a-$RANDOM"
+sleep 1
+qlen=$(redis_cli LLEN "$redis_key")
+if [ "${qlen:-0}" -ge 1 ] 2>/dev/null; then
+  ok "入队后 Redis 快照里有 $qlen 条（$redis_key）"
+else
+  fail "入队后快照为空：LLEN $redis_key = [$qlen]"
+fi
+
+# --- 重启 Match：排队状态必须回来 ---
+kill -9 "$match_pid" 2>/dev/null || true
+wait "$match_pid" 2>/dev/null
+match_pid=""
+ok "已 kill -9 Match（排队中）"
+if start_match; then
+  ok "Match 已重启"
+  http_get /api/v1/matches/current "$alice_token" >/dev/null
+  state_after_restart=$(json_path match.state)
+  if [ "$state_after_restart" = "queued" ]; then
+    ok "重启后玩家仍在队列里（state=queued）"
+  else
+    fail "重启后匹配状态异常：[$state_after_restart]（期望 queued）"
+  fi
+  if grep -qE '队列恢复：.*重建排队 [1-9]' /tmp/match.out; then
+    ok "启动日志报告了恢复到的排队人数"
+  else
+    fail "启动日志没有报告恢复结果：$(grep -o '队列恢复：.*' /tmp/match.out | tail -1)"
+  fi
+else
+  fail "Match 重启失败"
+fi
+
+# --- Match 自己的快照存储不可用：降级为纯内存，匹配照常 ---
+#
+# 为什么**不能**靠 `docker stop rgbt-redis` 来测这一段：Gateway 的会话也在同一个
+# Redis 上，停掉它之后所有 HTTP 请求会先因鉴权失败返回 503，根本走不到 Match，
+# 测到的就不是"Match 的快照存储不可用"。（第一版就是这么写的，结果失败项指向的是
+# Gateway 的会话存储，而不是本任务要验证的行为。）
+# 这里改成让 **Match 指向一个没有监听的端口**：只有 Match 的快照存储不可用，
+# 链路其余部分完好，降级行为才能被隔离验证。
+kill -9 "$match_pid" 2>/dev/null || true
+wait "$match_pid" 2>/dev/null
+match_pid=""
+dead_redis_port=6399
+if start_match "$dead_redis_port"; then
+  ok "Match 已重启并指向不可用的快照存储（端口 $dead_redis_port，故意不监听）"
+  if grep -q '队列快照读取失败' /tmp/match.out; then
+    ok "启动时如实报告快照读取失败（不假装恢复了一个空队列）"
+  else
+    fail "启动日志没有报告快照读取失败"
+  fi
+
+  enqueue_match "$alice_token" "vq-a2-$RANDOM"
+  enqueue_match "$bob_token" "vq-b2-$RANDOM"
+  matched_without_snapshot=0
+  for _ in $(seq 1 20); do
+    http_get /api/v1/matches/current "$alice_token" >/dev/null
+    [ "$(json_path match.state)" = "matched" ] && { matched_without_snapshot=1; break; }
+    sleep 0.3
+  done
+  if [ "$matched_without_snapshot" -eq 1 ]; then
+    ok "快照存储不可用时匹配照常成功（降级为纯内存，不阻塞业务）"
+  else
+    fail "快照存储不可用时匹配失败：state=[$(json_path match.state)]"
+  fi
+  if grep -q '队列快照写入失败' /tmp/match.out; then
+    ok "日志明确记录了降级（队列快照写入失败，可丢弃）"
+  else
+    fail "没有记录降级：快照写失败却静默无日志"
+  fi
+else
+  fail "Match 重启失败"
+fi
+echo
+
 # ---------- 8. 优雅退出 ----------
 echo "===== 8. 优雅退出 ====="
 for pair in "Gateway:$gateway_pid" "Match:$match_pid" "Room:$room_pid"; do
@@ -805,6 +913,8 @@ if [ "${#failures[@]}" -eq 0 ]; then
   echo "          恢复位置精确等于最后一次快照；FINISHING 房间重启后仍能落库；"
   echo "          损坏快照被标记 ABORTED 并记录原因，不静默丢弃；"
   echo "          存在未结束房间时连续 3 次重启全部存活；并发共用同一条 MySQL 连接无协议错乱"
+  echo "  [队列恢复，TASK-015] 入队后 Redis 有快照；kill -9 Match 后重启，玩家仍在队列里；"
+  echo "          Match 的快照存储不可用时降级为纯内存，匹配照常成功且日志明确记录降级"
   echo
   echo "  实测进度丢失量：${frames_lost_measured:-未取到} 帧"
   exit 0

@@ -176,10 +176,10 @@ if [ "$manage_docker" -eq 1 ]; then
   done
   [ "$applied" -gt 0 ] && ok "已应用 $applied 个迁移脚本（幂等）" || fail "迁移脚本未成功应用"
 
-  stale=$(docker exec rgbt-redis redis-cli --scan --pattern 'dev:gateway:*' 2>/dev/null | wc -l)
-  docker exec rgbt-redis redis-cli --scan --pattern 'dev:gateway:*' 2>/dev/null |
+  stale=$(docker exec rgbt-redis redis-cli --scan --pattern 'dev:*' 2>/dev/null | wc -l)
+  docker exec rgbt-redis redis-cli --scan --pattern 'dev:*' 2>/dev/null |
     while read -r key; do docker exec rgbt-redis redis-cli DEL "$key" >/dev/null 2>&1; done
-  ok "已清理上次运行残留的 $stale 个 dev:gateway:* Key"
+  ok "已清理上次运行残留的 $stale 个 dev:* Key（会话与队列快照）"
   echo
 else
   echo "===== 1. 跳过依赖启停（--no-docker） ====="
