@@ -13,7 +13,7 @@
 | 正式项目目录 | WSL 中的 `~/workspace/realtime-game-backend` |
 | Windows 目录用途 | 初始文档整理和迁移前备份，不作为正式开发目录 |
 | 服务通信 | brpc + Protobuf |
-| 浏览器通信 | HTTP + WebSocket |
+| 浏览器通信 | HTTP + SSE（服务端推送，见 ADR-0004） |
 | Web 演示 | 保留轻量 Vue 3 + TypeScript + Canvas 页面 |
 | 第一版部署 | Docker Compose；**不使用 Kubernetes 或多实例**（ADR-0003） |
 | 范围裁剪（ADR-0003） | 不实现 Kafka、etcd、多实例、Kubernetes、独立 Player/State 与 Settlement 服务、排行榜、匹配分差放宽（2026-10-02 确认） |

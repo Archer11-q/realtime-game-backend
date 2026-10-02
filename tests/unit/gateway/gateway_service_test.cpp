@@ -18,6 +18,7 @@
 #include "player_directory.hpp"
 #include "room_client.hpp"
 #include "session_store.hpp"
+#include "stream_hub.hpp"
 
 namespace {
 
@@ -37,6 +38,7 @@ using rgbt::gateway::RoomState;
 using rgbt::gateway::SessionRecord;
 using rgbt::gateway::SessionStore;
 using rgbt::gateway::StoreStatus;
+using rgbt::gateway::StreamHub;
 using rgbt::gateway::v1::CancelMatchRequest;
 using rgbt::gateway::v1::CancelMatchResponse;
 using rgbt::gateway::v1::EnqueueMatchRequest;
@@ -56,6 +58,8 @@ using rgbt::gateway::v1::LoginRequest;
 using rgbt::gateway::v1::LoginResponse;
 using rgbt::gateway::v1::LogoutRequest;
 using rgbt::gateway::v1::LogoutResponse;
+using rgbt::gateway::v1::StreamEventsRequest;
+using rgbt::gateway::v1::StreamEventsResponse;
 using rgbt::gateway::v1::SubmitInputRequest;
 using rgbt::gateway::v1::SubmitInputResponse;
 
@@ -1086,6 +1090,107 @@ TEST_F(GatewayServiceTest, RoomEndpointsReturn503WhenSessionStoreIsDown) {
     EXPECT_EQ(response.status_code(), 503);
     EXPECT_EQ(response.error().reason(), "session_store_unavailable");
     EXPECT_EQ(room_.state_calls, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 服务端推送（SSE，TASK-009）
+//
+// 成功路径（真的建立 text/event-stream 连接）无法在这里验证：它需要 brpc 的
+// HTTP 请求上下文才能拿到 ProgressiveAttachment，而单元测试直接调用服务方法。
+// 因此这里覆盖全部**失败路径**，成功路径由 scripts/verify-stream.sh 端到端覆盖。
+// ---------------------------------------------------------------------------
+
+TEST_F(GatewayServiceTest, StreamEventsRequiresToken) {
+    StreamEventsRequest request;
+    request.set_room_id("r-1");
+    StreamEventsResponse response;
+    service_->StreamEvents(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 400);
+    EXPECT_EQ(response.error().reason(), "token_required");
+    // 鉴权不过就不应触碰 Room。
+    EXPECT_EQ(room_.state_calls, 0);
+}
+
+TEST_F(GatewayServiceTest, StreamEventsRequiresRoomId) {
+    const std::string token = LoginAlice();
+    StreamEventsRequest request;
+    request.set_token(token);
+    StreamEventsResponse response;
+    service_->StreamEvents(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 400);
+    EXPECT_EQ(response.error().reason(), "room_id_required");
+    EXPECT_EQ(room_.state_calls, 0);
+}
+
+TEST_F(GatewayServiceTest, StreamEventsWithoutHubReturns503) {
+    // 夹具默认不注入 StreamHub（见 SetUp），因此推送接口应明确报不可用，
+    // 而不是静默建立一条永远收不到事件的流。
+    const std::string token = LoginAlice();
+    room_.snapshot.players.push_back(RoomPlayerSnapshot{"p-0001", 100, true});
+
+    StreamEventsRequest request;
+    request.set_token(token);
+    request.set_room_id("r-1");
+    StreamEventsResponse response;
+    service_->StreamEvents(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 503);
+    EXPECT_EQ(response.error().reason(), "stream_unavailable");
+}
+
+TEST_F(GatewayServiceTest, StreamEventsRejectsNonMember) {
+    // 核心访问控制：房间存在，但调用者不在名单里。
+    // 没有这条校验，任何登录用户只要拿到 room_id 就能长期订阅别人的血量。
+    const std::string token = LoginAlice();
+    room_.snapshot.players.push_back(RoomPlayerSnapshot{"p-0002", 100, true});
+
+    StreamEventsRequest request;
+    request.set_token(token);
+    request.set_room_id("r-1");
+    StreamEventsResponse response;
+    service_->StreamEvents(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 400);
+    EXPECT_EQ(response.error().reason(), "not_a_member");
+    // 必须真的查过房间才可能知道谁是成员。
+    EXPECT_EQ(room_.state_calls, 1);
+}
+
+TEST_F(GatewayServiceTest, StreamEventsPropagatesRoomNotFound) {
+    const std::string token = LoginAlice();
+    room_.next_status = RoomCallStatus::kNotFound;
+
+    StreamEventsRequest request;
+    request.set_token(token);
+    request.set_room_id("r-missing");
+    StreamEventsResponse response;
+    service_->StreamEvents(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 404);
+    EXPECT_EQ(response.error().reason(), "room_not_found");
+}
+
+TEST_F(GatewayServiceTest, StreamEventsWithoutHttpContextReturns500) {
+    // 注入了 StreamHub 且成员校验通过，但没有 HTTP 上下文——
+    // 此时不能"假装成功"：必须明确失败，否则会登记一条永远写不出去的订阅。
+    const std::string token = LoginAlice();
+    room_.snapshot.players.push_back(RoomPlayerSnapshot{"p-0001", 100, true});
+    StreamHub hub(&room_);
+    GatewayServiceImpl service(&sessions_, players_.get(), &match_, &room_, &hub);
+
+    StreamEventsRequest request;
+    request.set_token(token);
+    request.set_room_id("r-1");
+    StreamEventsResponse response;
+    service.StreamEvents(nullptr, &request, &response, nullptr);
+
+    EXPECT_EQ(response.status_code(), 500);
+    EXPECT_EQ(response.error().reason(), "stream_requires_http");
+    // 关键：没有登记任何订阅。登记了就会给同一个房间凭空增加轮询。
+    EXPECT_EQ(hub.ConnectionCount(), 0U);
+    EXPECT_EQ(hub.RoomPollCount(), 0U);
 }
 
 }  // namespace

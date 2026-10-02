@@ -33,6 +33,7 @@
 #include "player_directory.hpp"
 #include "room_client.hpp"
 #include "session_store.hpp"
+#include "stream_hub.hpp"
 
 namespace rgbt::gateway {
 
@@ -50,8 +51,11 @@ class GatewayServiceImpl : public rgbt::gateway::v1::GatewayService {
 public:
     /// @param room 房间客户端。可以为 nullptr（此时房间接口一律返回 503），
     ///        用于只关心登录与匹配的单元测试。
+    /// @param stream SSE 订阅表。可以为 nullptr（此时推送接口一律返回 503）；
+    ///        成功建立流式响应还需要真实的 HTTP 上下文，因此正向路径只能在
+    ///        端到端脚本里验证（见 scripts/verify-stream.sh）。
     GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* players, MatchClient* match,
-                       RoomClient* room,
+                       RoomClient* room, StreamHub* stream = nullptr,
                        std::int32_t session_ttl_seconds = kDefaultSessionTtlSeconds);
 
     void Login(::google::protobuf::RpcController* controller,
@@ -104,6 +108,11 @@ public:
                         rgbt::gateway::v1::GetMatchResultResponse* response,
                         ::google::protobuf::Closure* done) override;
 
+    void StreamEvents(::google::protobuf::RpcController* controller,
+                      const rgbt::gateway::v1::StreamEventsRequest* request,
+                      rgbt::gateway::v1::StreamEventsResponse* response,
+                      ::google::protobuf::Closure* done) override;
+
     /// @brief 当前是否所有依赖都可用。供健康检查使用。
     [[nodiscard]] bool DependenciesHealthy();
 
@@ -149,6 +158,7 @@ private:
     PlayerDirectory* players_;
     MatchClient* match_;
     RoomClient* room_;
+    StreamHub* stream_;
     std::int32_t session_ttl_seconds_;
 };
 

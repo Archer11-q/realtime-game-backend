@@ -4,7 +4,7 @@
 /// 服务边界（docs/01-architecture.md 第 3 节）：
 ///   Match 维护匹配队列、处理进入/取消/超时、选择玩家并请求创建房间。
 ///   它不保存战斗状态，也不直接向客户端推送消息——客户端通过 Gateway 轮询结果
-///   （TASK-007 决策 4 选 A），WebSocket 推送属 TASK-009。
+///   （TASK-007 决策 4 选 A），服务端推送（SSE）属 TASK-009。
 ///
 /// 本进程只通过 brpc 对外提供服务，没有 restful 映射：它不面向浏览器。
 /// brpc 的内置运维服务（`/health`、`/status`）由 `has_builtin_services` 提供，

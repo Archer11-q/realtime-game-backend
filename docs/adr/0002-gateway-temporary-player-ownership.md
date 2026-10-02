@@ -21,7 +21,7 @@
 
 TASK-006 需要建立 `players` 表并让玩家档案具备真实读写，以验证数据模型是否合理
 （只建空表无法验证这一点）。但 Phase 1 的范围清单（`docs/02-roadmap.md` 第 4 节）
-包含 Match、Room/Battle、WebSocket 与 Vue 演示，**不包含 Player/State 服务**。
+包含 Match、Room/Battle、SSE 推送与 Vue 演示，**不包含 Player/State 服务**。
 
 因此出现一个现实矛盾：表需要被读，而它的所有者服务在 Phase 1 不存在。
 

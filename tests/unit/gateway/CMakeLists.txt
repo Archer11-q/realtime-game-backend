@@ -10,6 +10,7 @@ add_executable(
   rgbt_gateway_tests
   gateway_service_test.cpp
   player_directory_test.cpp
+  stream_hub_test.cpp
 )
 
 target_link_libraries(rgbt_gateway_tests PRIVATE rgbt_gateway_lib GTest::gtest_main)

@@ -75,7 +75,7 @@
   - `tests/unit/` 接入 GoogleTest（CMake `FetchContent`，暂不引入 vcpkg）。
   - `.github/workflows/ci.yml`：配置、构建、测试。
 - 非范围：
-  - 不实现 Gateway 业务、Proto、brpc、Redis、MySQL、WebSocket。
+  - 不实现 Gateway 业务、Proto、brpc、Redis、MySQL、服务端推送。
   - 不引入 vcpkg manifest、Docker Compose、Kafka、etcd。
   - 不新建服务目录和业务头文件。
 - 相关 ADR：ADR-0001（技术栈与平台）。本轮不新增 ADR。
@@ -190,7 +190,7 @@
 - 背景问题：需要验证 brpc/Protobuf 工程集成和服务启动方式。
 - 本次目标：
   - 公共 Proto、错误码、Gateway 健康检查和优雅退出。
-- 非范围：不实现匹配、房间和 WebSocket 业务。
+- 非范围：不实现匹配、房间和服务端推送业务。
 - 验收标准：
   - Gateway 可启动。
   - 健康检查成功。
@@ -282,7 +282,7 @@
 - 非范围：
   - 不实现注册系统，不把账号密码写入 MySQL。
   - 不实现 Token 刷新（只做短期会话）。
-  - 不实现匹配、房间、WebSocket。
+  - 不实现匹配、房间、服务端推送。
 - 相关 ADR：本轮不新增 ADR，但落地了 `docs/07-open-decisions.md` 的 D-002 决策。
 - 涉及目录：`api/proto/`、`include/common/`、`src/common/`、`src/gateway/`、
   `scripts/`、`tests/`、根 `CMakeLists.txt`、`CMakePresets.json`。
@@ -331,7 +331,7 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
 | 1 | TASK-006 | 数据模型与 MySQL 迁移 | TASK-003 |
 | 2 | TASK-007 | Match Service：匹配队列与配对 | TASK-006 |
 | 3 | TASK-008 | Room/Battle Service：房间生命周期与权威状态 | TASK-007 |
-| 4 | TASK-009 | Gateway WebSocket 路由与房间消息 | TASK-008 |
+| 4 | TASK-009 | Gateway SSE 推送路由与房间消息 | TASK-008 |
 | 5 | TASK-010 | Vue 演示页面：登录、大厅、对战、结算 | TASK-009 |
 | 6 | TASK-011 | 集成验收：一条命令启动并双客户端完成对局 | TASK-010 |
 | — | TASK-012 | 范围裁剪（已先于上面第 3~6 项完成） | TASK-007 |
@@ -366,7 +366,7 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
 - 非范围：
   - 不引入真实密码体系（不做注册、不做 bcrypt/Argon2）。
   - 不建 `player_stats`、`room_records`、`processed_events`。
-  - 不实现 Match / Room / WebSocket / 前端。
+  - 不实现 Match / Room / 服务端推送 / 前端。
   - 不实现 Player/State 服务（ADR-0002 记录其为正式归属）。
 - 相关 ADR：ADR-0002。
 - 涉及目录：`migrations/`、`src/gateway/`、`tests/unit/gateway/`、`scripts/`、`docs/`。
@@ -433,7 +433,7 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
   - `scripts/verify-match.sh`：端到端验收入口。
 - 非范围：
   - 不实现 Room/Battle Service（TASK-008）；房间只分配 ID，不产生房间状态。
-  - 不实现 WebSocket（TASK-009）；匹配结果由客户端轮询获得。
+  - 不实现服务端推送（TASK-009）；匹配结果由客户端轮询获得。
   - 不实现分差/MMR、不实现多实例分片、不引入 etcd。
   - 不实现队列的 Redis 快照与进程重启恢复（Phase 2）。
   - 不做前端页面（TASK-010）。
@@ -446,7 +446,7 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
   3. 房间分配：**A) 抽象 `RoomAllocator` 接口**，Phase 1 用「生成 room_id 并登记」的
      占位实现，TASK-008 替换为真实调用。Room 的契约由拥有它的 TASK-008 定型。
   4. 客户端获取匹配结果：**A) 轮询 `GET /api/v1/matches/current`**。
-     WebSocket 属 TASK-009 范围；轮询接口在 WebSocket 落地后仍作为兜底保留。
+     服务端推送属 TASK-009 范围；轮询接口在推送落地后仍作为兜底保留。
   5. 监听端口与配置变量：**`MATCH_HTTP_PORT=8082`**，同步写入
      `deploy/compose/.env.example` 与 `docs/06-operations.md` 的配置清单。
 - 相关 ADR：本任务**不修改服务边界或数据所有权**（决策 1、3 均选 A），因此不需要新 ADR。
@@ -521,7 +521,7 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
   - `tests/unit/room/`、`tests/unit/match/`、`tests/unit/gateway/` 的新用例。
   - `scripts/verify-room.sh`：端到端验收入口。
 - 非范围：
-  - 不实现 WebSocket 推送（TASK-009）；客户端通过轮询获取状态。
+  - 不实现服务端推送（TASK-009）；客户端通过轮询获取状态。
   - 不实现断线重连与宽限期（Phase 2）；`connected` 字段表达「是否在房间内」，
     不是「网络是否连通」。
   - 不实现房间快照的持久化（Phase 2）；快照环形缓冲只存在内存里。
@@ -551,6 +551,72 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
 - 提交边界：允许改动 `api/proto/`、`src/`、`include/`、`tests/`、`cmake/`、`scripts/`、
   顶层 `CMakeLists.txt`、`deploy/compose/.env.example`、`docs/`；
   禁止改动 `web/`、`migrations/`（表结构不需要变更）。
+
+## TASK-009：Gateway SSE 推送路由与房间消息
+
+- 状态：待验收
+- 背景问题：TASK-008 之后房间状态只能靠客户端轮询 `/api/v1/rooms/state` 获得。
+  轮询能跑通，但它是「客户端按固定间隔问」，对局页的血量刷新最多滞后一个轮询间隔，
+  且 N 个客户端会产生 N 份等价的查询。Phase 1 的目标是「双浏览器完成一场对战」，
+  这需要服务端能把状态变化推出去。
+- **范围变更（项目所有者 2026-10-02 确认）**：原定用 WebSocket 实现。动手前核实框架
+  能力时发现 **brpc 1.16.0 完全不支持 WebSocket**（文档/头文件/源码三处检索为空），
+  且 `CreateProgressiveAttachment` 只能持续写响应体、无法接管 socket 读取客户端帧，
+  因此「在 brpc 上自实现 WebSocket」也不成立。改用 brpc 官方支持的 SSE。
+  完整论证见 [ADR-0004](adr/0004-sse-instead-of-websocket.md)。
+- 本次目标：把房间状态的传递方式从「客户端轮询」改为「服务端推送」，保留轮询兜底。
+- 范围：
+  - `GatewayService.StreamEvents`：`GET /api/v1/stream?room_id=...`，成功时返回
+    `text/event-stream` 长连接。
+  - `StreamHub`：订阅表 + 推送驱动。**只对有订阅者的房间**按 100 ms 轮询
+    `RoomService.GetRoomState`；帧号变化才推送；同房间多订阅者扇入成一次轮询。
+  - 事件：`session.ready`、`room.state`、`room.finished`（含 `aborted`）。
+  - 心跳：以 SSE 注释行 `: ping` 发送，不作为事件。
+  - 订阅的访问控制：用一次 `GetRoomState` 校验调用者是该房间成员，
+    非成员返回 `400 not_a_member`。
+  - 优雅退出：`CloseAll()` + `Stop()`，否则长连接会拖住 `brpc::Server::Stop()`。
+  - 删除从未被读过的 `GATEWAY_WS_PORT`（SSE 复用 HTTP 端口）。
+  - 全仓库 47 处 WebSocket 表述同步为 SSE。
+- 非范围：
+  - **不实现 `match.updated` 推送**。匹配状态变化频率低，改为推送需要 Gateway 为
+    每个在线连接轮询 Match，收益不值这份负载；客户端继续轮询
+    `/api/v1/matches/current`。理由写在 `docs/05-api-and-data.md` 第 2 节。
+  - 不做帧级高频上行。客户端上行仍是「一次动作一个 HTTP 请求」。
+  - 不删轮询接口（`/api/v1/rooms/state`、`/api/v1/results` 保留为兜底）。
+  - 不改 Room 契约（不引入 brpc streaming RPC 订阅）。
+  - 不做断线重连补帧（Phase 2）。
+  - 不引入任何 WebSocket 库（Boost.Beast 未安装，会新增 vcpkg 依赖）。
+- 相关 ADR：**ADR-0004（新增）**；部分替代 ADR-0001/0002/0003 中的 WebSocket 表述。
+- 涉及目录：`api/proto/`、`src/gateway/`、`tests/unit/gateway/`、`scripts/`、
+  `deploy/compose/`、`docs/`。
+- 接口变化：新增 `StreamEvents` RPC 与 `GET /api/v1/stream`；删除 `GATEWAY_WS_PORT`。
+- 数据变化：无（不涉及表结构与迁移）。
+- 失败场景：
+  - 缺 Token → 400 `token_required`；缺 room_id → 400 `room_id_required`。
+  - 房间不存在 → 404 `room_not_found`。
+  - 非本局成员 → 400 `not_a_member`（**安全关键**，否则能偷看别人血量）。
+  - 无 HTTP 上下文（单元测试直接调用）→ 500 `stream_requires_http`，
+    且**不登记订阅**。
+  - 客户端断开 → 下一次写失败时清理订阅，不需客户端发任何东西。
+  - Room 抖动 → 保持连接不关闭（恢复后继续推送），也不刷 error 事件。
+- 已知限制：
+  - 上行是「一次动作一个 HTTP 请求」。当前输入是低频点击（10 Hz 帧、每帧最多结算
+    一次攻击），够用；**帧级高频输入会成为瓶颈**，那时要重新评估 ADR-0004。
+  - 房间结束但结果未落库（`finishing`）期间仍会推送状态；只有 `finished` /
+    `aborted` 才关流。
+- 验收命令：
+  ```bash
+  cmake --preset brpc-debug && cmake --build --preset brpc-debug
+  ctest --test-dir build/brpc-debug --output-on-failure
+  bash scripts/verify-stream.sh     # SSE 推送全链路
+  bash scripts/verify-room.sh       # 回归：轮询与房间链路未被破坏
+  bash scripts/verify-match.sh      # 回归：匹配链路未被破坏
+  ```
+- 测试要求：新增 13 个 `StreamHubTest` 用例与 6 个 Gateway 侧 SSE 用例；
+  并发代码必须跑 ASan（见下）。
+- 回退方式：`git revert` 本任务提交。若只想关掉推送，不传 `StreamHub` 给
+  `GatewayServiceImpl` 即可——推送接口会返回 503 `stream_unavailable`，
+  房间与匹配的轮询链路完全不受影响。
 
 ## TASK-012：范围裁剪——把非目标写进文档
 
@@ -624,4 +690,8 @@ Phase 1 已在讨论中确认为「拆成 6 个任务」，但此前只存在于
 - 用户审阅关键 Diff。
 - 所有验收命令实际运行。
 - 没有未解释的警告、遗留密钥和构建产物。
+- **改变了某个服务的依赖或启动方式时，必须重跑受影响的既有验收脚本，并在
+  devlog 里记录重跑结果。** 这条是 2026-10-02 补上的：TASK-008 把 Match 的房间
+  分配换成真实 brpc 调用后，`scripts/verify-match.sh` 因为不启动 Room 而**全部配对
+  失败**，直到十天后有人重跑它才发现。只验新脚本、不重跑旧脚本，等于让缺口静默积累。
 - 不属于当前任务的后续问题记录到 Backlog，不直接扩大当前提交。

@@ -21,7 +21,7 @@ C++ 后端和游戏服务端常用技术栈。项目优先验证主流服务端�
 - Git 2.53.0。
 - clang-tidy 21.1.8 + pkg-config 2.5.1。
 - brpc + Protobuf 3.21.12 作为服务间通信。
-- HTTP + WebSocket 作为浏览器通信。
+- HTTP + WebSocket 作为浏览器通信。（2026-10-02 由 ADR-0004 部分替代：下行改为 SSE。）
 - Redis + MySQL 作为第一版数据组件。
 - ~~Kafka 用于后续异步和回放阶段~~ → **已由 [ADR-0003](0003-scope-reduction.md)
   取代为「不实现」**。

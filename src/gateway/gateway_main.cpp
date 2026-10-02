@@ -41,6 +41,7 @@
 #include "player_directory.hpp"
 #include "redis_session_store.hpp"
 #include "room_client.hpp"
+#include "stream_hub.hpp"
 
 // 默认端口与 .env.example 的 GATEWAY_HTTP_PORT 保持一致（8080）。
 // 本地 8080 可能被其它开发服务占用，端口冲突时网关会启动失败，而请求会被打到
@@ -53,6 +54,10 @@ DEFINE_int32(redis_port, 6379, "Redis 端口");
 DEFINE_int32(redis_timeout_ms, 500, "Redis 连接与命令超时（毫秒）");
 DEFINE_int32(session_ttl_seconds, 604800, "会话有效期（秒），默认 7 天");
 DEFINE_string(env_prefix, "dev", "Key 前缀的环境标识，取值示例 dev / test / prod");
+// SSE 推送参数。轮询间隔取 100 ms，与 Room 的帧长对齐：更密不会产生新帧，
+// 更疏则推送比帧率还慢。心跳用于房间长时间没有帧变化时保持连接。
+DEFINE_int32(stream_poll_interval_ms, 100, "SSE 推送时轮询房间状态的间隔（毫秒）");
+DEFINE_int32(stream_heartbeat_interval_ms, 15000, "SSE 心跳间隔（毫秒）");
 DEFINE_string(mysql_host, "127.0.0.1", "MySQL 主机");
 DEFINE_int32(mysql_port, 3306, "MySQL 端口");
 DEFINE_string(mysql_user, "realtime_game", "MySQL 账号");
@@ -128,8 +133,17 @@ int main(int argc, char* argv[]) {
     room_options.timeout_ms = FLAGS_room_timeout_ms;
     auto room = std::make_unique<rgbt::gateway::BrpcRoomClient>(room_options);
 
+    // --- 服务端推送（SSE，TASK-009）---
+    //
+    // 推送线程与订阅表在这里创建，生命周期覆盖整个进程：订阅表由 GatewayServiceImpl
+    // 使用，推进线程按固定间隔轮询 Room 并把变化推给订阅者。
+    rgbt::gateway::StreamHubOptions stream_options;
+    stream_options.poll_interval_ms = FLAGS_stream_poll_interval_ms;
+    stream_options.heartbeat_interval_ms = FLAGS_stream_heartbeat_interval_ms;
+    rgbt::gateway::StreamHub stream_hub(room.get(), stream_options);
+
     rgbt::gateway::GatewayServiceImpl service(sessions.get(), players.get(), match.get(),
-                                              room.get(), FLAGS_session_ttl_seconds);
+                                              room.get(), &stream_hub, FLAGS_session_ttl_seconds);
 
     brpc::Server server;
     brpc::ServerOptions options;
@@ -158,7 +172,11 @@ int main(int argc, char* argv[]) {
         "/api/v1/rooms/join => JoinRoom,"
         "/api/v1/rooms/input => SubmitInput,"
         "/api/v1/rooms/state => GetRoomState,"
-        "/api/v1/results => GetMatchResult";
+        "/api/v1/results => GetMatchResult,"
+        // SSE 订阅。它是唯一一个响应体长度不确定的接口：成功时返回
+        // text/event-stream 长连接，由服务端持续写事件。
+        // room_id 同样走查询参数（brpc 不支持 {name} 路径参数）。
+        "/api/v1/stream => StreamEvents";
 
     brpc::ServiceOptions service_options;
     service_options.restful_mappings = mappings;
@@ -181,6 +199,7 @@ int main(int argc, char* argv[]) {
     std::printf("  监听: http://127.0.0.1:%d\n", FLAGS_port);
     std::printf("  登录: POST http://127.0.0.1:%d/api/v1/login\n", FLAGS_port);
     std::printf("  当前玩家: GET http://127.0.0.1:%d/api/v1/players/me\n", FLAGS_port);
+    std::printf("  推送(SSE): GET http://127.0.0.1:%d/api/v1/stream?room_id=...\n", FLAGS_port);
     std::printf("  Redis(会话): %s:%d (%s)\n", FLAGS_redis_host.c_str(), FLAGS_redis_port,
                 redis_ok ? "可用" : "当前不可用，请求将返回 503");
     std::printf("  MySQL(玩家档案): %s:%d/%s (%s)\n", FLAGS_mysql_host.c_str(), FLAGS_mysql_port,
@@ -196,12 +215,21 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
 
+    // 推送线程在服务注册完成之后启动，避免它先于订阅表可用而空转。
+    stream_hub.Start();
+
     while (!g_stopping.load()) {
         ::usleep(100 * 1000);
     }
 
     std::printf("收到停止信号，开始优雅退出\n");
     std::fflush(stdout);
+    // 顺序很重要：先停推送线程，再关闭所有 SSE 长连接，最后停服务器。
+    //   * 不先停线程，它会继续往正在被关闭的连接里写。
+    //   * 不关闭长连接，server.Stop() 要等这些响应结束，进程会挂住不退出——
+    //     SSE 是长连接，不会自己结束。
+    stream_hub.Stop();
+    stream_hub.CloseAll();
     server.Stop(0);
     server.Join();
     std::printf("已优雅退出\n");

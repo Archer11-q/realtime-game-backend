@@ -322,6 +322,43 @@ message GetMatchResultResponse {
 }
 
 // ---------------------------------------------------------------------------
+// 服务端推送（TASK-009，SSE）
+// ---------------------------------------------------------------------------
+//
+// 浏览器推送**不使用 WebSocket**：brpc 不支持它（详见
+// docs/adr/0004-sse-instead-of-websocket.md）。改用 brpc 官方支持的
+// Server-Sent Events：一个 text/event-stream 长连接，服务端持续写事件。
+//
+// 因此本 RPC 与其它接口不同——它没有一次性响应体：
+//   * 成功时先设置 SSE 响应头，再用 Controller::CreateProgressiveAttachment()
+//     持续写出 `event: <type>\ndata: <json>\n\n`，连接保持到对局结束或客户端断开。
+//   * 失败时（鉴权、参数、依赖不可用）**不进入流式模式**，照常返回 HTTP 错误码
+//     与 Error，客户端据此决定是否重试。
+// 响应消息里的字段只在失败路径上有意义。
+//
+// 事件类型（承载在 SSE 的 event 字段上）：
+//   session.ready   订阅建立后的第一个事件
+//   room.state      房间权威状态快照，仅在该房间帧号变化时推送
+//   room.finished   对局结束，推送后连接被关闭
+// 载荷是 docs/05-api-and-data.md 第 2 节的版本化 JSON 信封
+// （version / type / sequence / timestamp_ms / payload）。
+
+message StreamEventsRequest {
+  string token = 1;
+  string request_id = 2;
+
+  // 订阅哪个房间的权威状态。**服务端会校验调用者确实是该房间成员**，
+  // 否则任何登录用户都能订阅别人的房间、看到对方的血量。
+  string room_id = 3;
+}
+
+message StreamEventsResponse {
+  // 仅失败时有效。成功时响应体由持续写出的 SSE 事件占据。
+  int32 status_code = 1;
+  Error error = 2;
+}
+
+// ---------------------------------------------------------------------------
 // 服务定义
 // ---------------------------------------------------------------------------
 
@@ -359,7 +396,7 @@ service GatewayService {
 
   // 提交一次攻击输入。
   // HTTP: POST /api/v1/rooms/input
-  // 说明：TASK-009 落地 WebSocket 后，本接口与房间状态轮询一起作为兜底保留
+  // 说明：TASK-009 落地 SSE 推送后，本接口与房间状态轮询一起作为兜底保留
   // （与匹配的轮询接口同一考虑）。
   rpc SubmitInput(SubmitInputRequest) returns (SubmitInputResponse);
 
@@ -370,4 +407,10 @@ service GatewayService {
   // 查询对局结果。结果尚未落库时返回 503 result_pending，而不是空结果。
   // HTTP: GET /api/v1/results?match_id=...
   rpc GetMatchResult(GetMatchResultRequest) returns (GetMatchResultResponse);
+
+  // 订阅服务端推送（SSE）。成功时返回 text/event-stream 长连接。
+  // HTTP: GET /api/v1/stream?room_id=...
+  // 注意：这是本项目唯一一个**响应体长度不确定**的接口，brpc 的 restful 映射
+  // 与 HTTP 语义都依赖它不设 Content-Length。
+  rpc StreamEvents(StreamEventsRequest) returns (StreamEventsResponse);
 }

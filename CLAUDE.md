@@ -33,7 +33,7 @@
 - 开发环境：WSL2 Ubuntu 26.04 LTS + CLion Remote Toolchain
 - 语言与构建：C++20、GCC 15.2、CMake 4.2.3、Ninja 1.13.2、vcpkg
 - 服务通信：brpc + Protobuf
-- 浏览器通信：HTTP + WebSocket
+- 浏览器通信：HTTP + SSE（服务端推送）。**不使用 WebSocket**：brpc 1.16.0 不支持它，见 [ADR-0004](docs/adr/0004-sse-instead-of-websocket.md)
 - 数据组件：Redis、MySQL（**Kafka、etcd 已列入非目标**，见 ADR-0003）
 - Web 演示：Vue 3、TypeScript、Vite、Canvas
 - 可观测性：Prometheus、Grafana、OpenTelemetry
@@ -48,7 +48,7 @@
 
 | 服务 | 职责 | 不应承担 |
 |---|---|---|
-| Gateway | HTTP/WebSocket、鉴权、路由、心跳、限流、会话 | 匹配策略、房间状态权威计算 |
+| Gateway | HTTP/SSE、鉴权、路由、心跳、限流、会话 | 匹配策略、房间状态权威计算 |
 | Match | 匹配队列、FIFO 两人配对、取消、房间分配 | 保存战斗状态、直接推送客户端 |
 | Room/Battle | 房间生命周期、权威状态、快照、对局同步、对局结果写入 | 玩家长期档案 |
 
@@ -186,7 +186,7 @@ Phase 1 的目标与范围：
 
 - 目标：打通「匹配 -> 房间 -> 对战」的最小用户价值链路。
 - 范围：数据模型与迁移、Match Service、Room/Battle Service、Gateway 的
-  WebSocket 路由、Vue 演示页面。
+  SSE 推送、Vue 演示页面。
 - 对局同步方式已定为**最小状态同步**（服务端权威快照 + 广播），
   见 `docs/07-open-decisions.md`。
 

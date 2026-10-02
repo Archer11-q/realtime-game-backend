@@ -21,7 +21,7 @@
 玩家浏览器 / 机器人客户端
              |
              | HTTP：登录、查询、操作入口
-             | WebSocket：连接状态、房间消息、对战事件
+             | SSE：房间状态、对战事件（服务端单向推送）
              v
        Gateway Service
              |
@@ -49,7 +49,7 @@ Match Service      Room/Battle Service
 
 职责：
 
-- 接收 HTTP 和 WebSocket 连接。
+- 接收 HTTP 请求并维护 SSE 推送长连接。
 - 校验登录凭证并建立逻辑会话。
 - 管理心跳、连接状态、限流和优雅关闭。
 - 将客户端请求转换为内部 brpc 调用。
@@ -151,7 +151,7 @@ CREATED ──► WAITING ──► PLAYING ──► FINISHING ──► FINISH
   -> 配对成立后，Match 在**锁外**调用 RoomService.CreateRoom
   -> Room 以 match_id 为幂等键创建房间，返回 room_id
   -> Gateway 返回当前状态；客户端轮询 /api/v1/matches/current 领取结果
-  -> 玩家通过 HTTP 加入房间（WebSocket 属 TASK-009）
+  -> 玩家通过 HTTP 加入房间
 ```
 
 落地情况（TASK-008 更新，避免把计划当成已实现）：
@@ -161,34 +161,43 @@ CREATED ──► WAITING ──► PLAYING ──► FINISHING ──► FINISH
 - **分配在队列锁之外**：配对拆成「锁内取人并标记分配中 → 锁外 brpc 调用 →
   锁内提交」三步。持锁调用远程会让一次对端超时卡住整个队列。
   分配失败时玩家退回队首，而不是被标记为超时——Room 不可用不是玩家的错。
-- 「通知玩家」仍用**轮询**实现，WebSocket 推送属 TASK-009。轮询接口在
-  WebSocket 落地后仍作为兜底保留。
+- **匹配结果的通知仍用轮询**（TASK-009 的推送只覆盖房间状态，理由见 4.3）。
 - 配对规则只有 FIFO 两人一局，**没有分差放宽**：当前没有任何分数体系，
   先实现等于把未验证的评分模型固化进契约。
 
 ### 4.3 对战
 
-目标形态（WebSocket 落地后）：
+TASK-009 之后的实际形态（推送用 SSE，不用 WebSocket，见
+[ADR-0004](adr/0004-sse-instead-of-websocket.md)）：
 
 ```text
-浏览器输入
-  -> Gateway WebSocket
-  -> Room 校验输入并推进逻辑帧
-  -> Room 广播状态或帧数据
-  -> Gateway 推送至房间内玩家
-  -> 结束条件满足
-  -> Room 同步幂等写入对局结果（不走消息队列）
-```
-
-**TASK-008 的实际形态**（WebSocket 属 TASK-009，因此这里用 HTTP 轮询）：
-
-```text
-浏览器轮询 /api/v1/rooms/state?room_id=...
-  -> Gateway 鉴权后转发 RoomService.GetRoomState
-  -> Room 返回权威快照（帧号、双方 HP、状态）
 浏览器提交输入 POST /api/v1/rooms/input
   -> Gateway 从会话取 player_id，转发 RoomService.SubmitInput
   -> Room 记录本帧攻击，在下一个 tick 结算
+
+浏览器订阅 GET /api/v1/stream?room_id=...
+  -> Gateway 校验调用者确实是该房间成员（否则任何登录用户都能偷看别人的血量）
+  -> Gateway 只对**有订阅者的房间**按 100 ms 轮询 RoomService.GetRoomState
+  -> 帧号变化时把权威快照推给该房间的所有订阅者
+  -> 结束条件满足
+  -> Room 同步幂等写入对局结果（不走消息队列）
+  -> Gateway 推送 room.finished 并关闭该流
+```
+
+**为什么推送由 Gateway 轮询驱动，而不是 Room 主动推**：Room 是纯 brpc server，
+没有推送能力。要让它主动推，得引入 brpc 的 streaming RPC 订阅语义；而 Phase 1
+只需要「把房间状态送到浏览器」。Gateway 侧扇入轮询满足需求，且有一条明确不变量：
+**没有订阅者的房间完全不轮询**（由单元测试
+`StreamHubTest.NoSubscribersMeansNoRoomPolling` 锁定）。同房间 N 个客户端也只
+轮询一次。
+
+**轮询接口仍然保留**：`GET /api/v1/rooms/state` 与 `GET /api/v1/results` 不因推送
+上线而删除，它们是断线或代理不支持 SSE 时的兜底。
+
+```text
+轮询兜底 GET /api/v1/rooms/state?room_id=...
+  -> Gateway 鉴权后转发 RoomService.GetRoomState
+  -> Room 返回权威快照（帧号、双方 HP、状态）
 Room 自己的推进线程每 50 ms 调用一次 RoomManager::Tick
   -> 服务端权威推进，客户端不参与判定
 ```
@@ -224,7 +233,7 @@ Room 自己的推进线程每 50 ms 调用一次 RoomManager::Tick
 
 | 状态 | 所有者 | 存储 | 恢复策略 |
 |---|---|---|---|
-| WebSocket 连接 | Gateway | 内存 | 客户端重连后重建 |
+| SSE 连接与订阅 | Gateway | 内存 | 客户端重连后重建（Phase 2） |
 | 玩家会话 | Gateway | Redis | 使用 Session 映射恢复 |
 | 玩家档案 | Gateway | MySQL（`players`） | 数据库恢复 |
 | 匹配队列 | Match | 内存（Phase 1）；Redis 快照属 Phase 2 | 当前重启即丢失；快照与重建在 Phase 2 定义 |
@@ -283,7 +292,7 @@ Room 自己的推进线程每 50 ms 调用一次 RoomManager::Tick
 
 ## 9. 对外与对内接口
 
-- 浏览器到 Gateway：HTTP + WebSocket，消息使用版本化 JSON 信封。
+- 浏览器到 Gateway：上行 HTTP，下行 SSE（服务端推送），消息使用版本化 JSON 信封。不使用 WebSocket，见 ADR-0004。
 - C++ 服务之间：brpc + Protobuf，接口定义位于 `api/proto/`。
 - 异步领域事件：**不使用**。跨服务协作只走 brpc 同步调用，见
   [ADR-0003](adr/0003-scope-reduction.md)。

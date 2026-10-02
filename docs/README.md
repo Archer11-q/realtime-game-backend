@@ -17,7 +17,7 @@
 | 4 | [迭代路线图](02-roadmap.md) | 每个阶段的进入条件、产出和退出标准 |
 | 5 | [开发协作流程](03-development-workflow.md) | 任务交接、分支、PR 和 AI 使用方式 |
 | 6 | [质量与可观测性](04-quality-and-observability.md) | 测试、指标、SLO、压测和故障注入 |
-| 7 | [接口、数据与协议](05-api-and-data.md) | Proto、REST/WebSocket、数据归属和幂等 |
+| 7 | [接口、数据与协议](05-api-and-data.md) | Proto、REST/SSE、数据归属和幂等 |
 | 8 | [环境与运维](06-operations.md) | WSL、Docker、配置、启动、恢复和 Runbook |
 | 9 | [开放决策](07-open-decisions.md) | 尚未冻结的问题、风险和变更入口 |
 | 10 | [验收清单](08-verification-checklist.md) | 任务交付后项目所有者如何逐条验证 |

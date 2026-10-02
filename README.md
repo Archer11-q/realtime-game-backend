@@ -2,7 +2,7 @@
 
 > 面向小型实时对战产品的游戏服务端参考实现
 >
-> C++20 / brpc / Protobuf / WebSocket / Redis / MySQL / Docker Compose / Vue 3
+> C++20 / brpc / Protobuf / SSE / Redis / MySQL / Docker Compose / Vue 3
 
 ## 项目定位
 
@@ -40,7 +40,7 @@
   -> 进入大厅
   -> 发起匹配
   -> 匹配成功并创建房间
-  -> WebSocket 进入对战
+  -> SSE 推送进入对战
   -> 发生断线并重连
   -> 对局结束
   -> Room/Battle 同步幂等写入对局结果
@@ -54,7 +54,7 @@
 ```text
 浏览器演示页 / 机器人客户端
              |
-       HTTP + WebSocket
+       HTTP + SSE
              |
        Gateway Service          ← 会话、鉴权、路由、限流
              |
@@ -85,7 +85,7 @@ MySQL：players（Gateway 拥有）、match_results（Room/Battle 拥有）
 | 开发环境 | WSL2 Ubuntu 26.04 LTS + CLion | Linux 开发、调试和 WSL Toolchain |
 | 语言与构建 | C++20、GCC 15.2、CMake 4.2.3、Ninja 1.13.2、vcpkg | 主流 C++ 工程构建 |
 | 服务通信 | brpc + Protobuf | 内部服务调用和协议契约 |
-| 客户端通信 | HTTP + WebSocket | 浏览器登录、状态推送和实时消息 |
+| 客户端通信 | HTTP + SSE（服务端推送） | 浏览器登录、状态推送和实时消息 |
 | 数据存储 | Redis + MySQL | 会话、缓存、玩家档案和对局结果 |
 | 前端演示 | Vue 3 + TypeScript + Vite + Canvas | 可视化和端到端演示 |
 | 可观测性 | Prometheus + Grafana + OpenTelemetry | 指标、日志、链路和面板 |
@@ -142,7 +142,7 @@ MySQL：players（Gateway 拥有）、match_results（Room/Battle 拥有）
 realtime-game-backend/
 ├── api/proto/                 # Protobuf 接口契约（gateway / match / room）
 ├── src/
-│   ├── gateway/               # HTTP/WebSocket 网关（含本服务内部头文件）
+│   ├── gateway/               # HTTP/SSE 网关（含本服务内部头文件）
 │   ├── match/                 # 匹配服务
 │   └── room/                  # 房间和战斗服务
 ├── include/common/            # 跨服务公共基础设施
