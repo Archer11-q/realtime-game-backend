@@ -33,6 +33,7 @@
 #include "common/mysql_connection.hpp"
 #include "common/version.hpp"
 #include "mysql_match_result_writer.hpp"
+#include "mysql_room_snapshot_reader.hpp"
 #include "mysql_room_snapshot_writer.hpp"
 #include "room_manager.hpp"
 #include "room_service.hpp"
@@ -95,8 +96,22 @@ int main(int argc, char* argv[]) {
     auto snapshot_writer =
         std::make_unique<rgbt::room::MysqlRoomSnapshotWriter>(mysql_connection.get());
 
-    rgbt::room::RoomManager manager(result_writer.get(), snapshot_writer.get());
+    // 快照读取器（TASK-014）。与写入器共用同一条连接，但语义不同：
+    // 读取是启动路径上的前置条件，失败必须让调用方明确知道。
+    auto snapshot_reader =
+        std::make_unique<rgbt::room::MysqlRoomSnapshotReader>(mysql_connection.get());
+
+    rgbt::room::RoomManager manager(result_writer.get(), snapshot_writer.get(),
+                                    snapshot_reader.get());
     rgbt::room::RoomServiceImpl service(&manager);
+
+    // 恢复必须在**开始接受请求之前**完成：否则一个刚连上来的查询会看到
+    // "房间不存在"，而几十毫秒后同样的查询又能成功，客户端无从判断哪个是真的。
+    const rgbt::room::RestoreReport restore = manager.Restore(NowMs());
+    std::printf("启动恢复：扫描 %zu 个未结束房间，恢复 %zu 个，标记 ABORTED %zu 个%s\n",
+                restore.scanned, restore.restored, restore.rejected,
+                restore.load_failed ? "（快照读取失败，本次未恢复任何房间）" : "");
+    std::fflush(stdout);
 
     brpc::Server server;
     brpc::ServerOptions options;

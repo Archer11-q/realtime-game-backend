@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdio>
+#include <mutex>
 #include <utility>
 
 namespace rgbt::common {
@@ -64,12 +65,21 @@ bool IsConnectionLostError(unsigned int error_code) {
 MysqlConnection::MysqlConnection(std::string service_prefix, MysqlOptions options)
     : service_prefix_(std::move(service_prefix)), options_(std::move(options)) {
     // 说明：不使用自动重连选项。它会掩盖连接状态，且不同客户端行为不一致；
-    // 本实现改为每次查询前探测，并在连接失效时显式重试一次（见 Query）。
+    // 本实现改为**不做预检**，只在语句真的失败且错误码表示"连接已失效"时
+    // 显式换一条新连接重试一次（见 QueryLocked）。
     (void)service_prefix_;
 }
 
 MysqlConnection::~MysqlConnection() {
+    // 加锁只为让"析构时的关闭"与其他线程的查询互斥。按契约，对象析构时不应
+    // 还有别的线程在用同一个对象；但那属于调用方的责任，本类不该假设它一定成立。
+    const std::lock_guard<std::mutex> lock(mutex_);
     Disconnect();
+}
+
+std::string MysqlConnection::last_error() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return last_error_;
 }
 
 void MysqlConnection::Disconnect() {
@@ -80,12 +90,30 @@ void MysqlConnection::Disconnect() {
 }
 
 bool MysqlConnection::EnsureConnected() {
-    if (connection_ != nullptr && mysql_ping(connection_) == 0) {
-        return true;
-    }
-    // 连接不可用（或尚未建立）：关闭后重建。
+    // 已有连接就直接用，**不做 mysql_ping 预检**。
+    //
+    // 为什么去掉预检（TASK-014 实测，有 gdb 栈为证）：
+    //   在**一次成功的预处理查询之后**再调用 mysql_ping，会让进程 abort：
+    //
+    //     OPENSSL_die("refcount error")        <- libmariadb 内嵌 OpenSSL
+    //     SSL_CTX_free <- SSL_free <- ma_tls_close
+    //     <- ma_pvio_close <- end_server <- ma_net_safe_read <- mysql_ping
+    //
+    //   即 mysql_ping 的读失败后关闭 TLS 连接时，libmariadb 与 OpenSSL 之间
+    //   的引用计数对不上，直接 abort。这是 libmariadb 3.4.8 + vcpkg OpenSSL
+    //   在「先查后 ping」这个顺序下的问题，不是本项目的代码错误。
+    //
+    //   触发它需要"成功查询 → ping"这个顺序。本项目原有代码从不产生这个顺序
+    //   （探活只在启动时做一次，那时还没有查询），是 TASK-014 的
+    //   `RoomManager::Restore` 先读快照、紧接着启动探活才把它暴露出来。
+    //
+    // 去掉预检不会降低可靠性：连接失效时 `QueryOnce` 会在
+    // `mysql_stmt_prepare` / `mysql_stmt_execute` 上拿到 2002/2003/2006/2013，
+    //   `IsConnectionLostError` 把它们判为"连接已失效"，`Query` 随即换一条
+    //   新连接重试一次。这条路径本来就是为依赖恢复设计的，比 ping 更贴近真实
+    //   使用（它检验的是"能不能真的执行语句"，而不只是"套接字还在不在"）。
     if (connection_ != nullptr) {
-        Disconnect();
+        return true;
     }
 
     connection_ = mysql_init(nullptr);
@@ -125,7 +153,21 @@ bool MysqlConnection::EnsureConnected() {
 }
 
 bool MysqlConnection::Ping() {
-    return EnsureConnected();
+    // 探活走**与真实查询完全相同**的代码路径，而不是 mysql_ping。
+    //
+    // 两个理由：
+    //   1. `mysql_ping` 走 libmariadb 的旧协议路径，而本类所有业务查询都走预处理
+    //      接口。用一条路径探活、另一条路径干活，"探活通过"并不保证查询能成功。
+    //   2. 更要紧的是 `mysql_ping` 在本环境下会崩（原因见 EnsureConnected 的注释）。
+    //      与其在调用顺序上绕开它，不如根本不碰它。
+    //
+    // `QueryLocked` 内部已经包含"连接失效则换新连接重试一次"的逻辑，因此这里
+    // 不需要任何额外处理。
+    //
+    // 注意这里**不能**调用 public 的 `Query`：它也要加同一把锁，会自锁死。
+    const std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<SqlRow> rows;
+    return QueryLocked("SELECT 1", {}, &rows);
 }
 
 bool MysqlConnection::QueryOnce(const std::string& sql, const std::vector<std::string>& params,
@@ -262,6 +304,14 @@ bool MysqlConnection::QueryOnce(const std::string& sql, const std::vector<std::s
 
 bool MysqlConnection::Query(const std::string& sql, const std::vector<std::string>& params,
                             std::vector<SqlRow>* out_rows) {
+    // 整个查询（含可能的重连重试）在一把锁内完成。理由与代价见头文件里
+    // mutex_ 的说明：一条连接是有状态的字节流，并发使用会打乱协议。
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return QueryLocked(sql, params, out_rows);
+}
+
+bool MysqlConnection::QueryLocked(const std::string& sql, const std::vector<std::string>& params,
+                                  std::vector<SqlRow>* out_rows) {
     if (out_rows == nullptr) {
         last_error_ = "null output";
         return false;

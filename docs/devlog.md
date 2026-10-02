@@ -1649,6 +1649,408 @@ Room 一重启，进行中的对局就无声消失，连"这里曾经有一局"�
 - 由项目所有者审阅并运行 `bash scripts/verify-persistence.sh`；确认后合并。
 - 通过后进入 TASK-014（房间重启恢复与恢复边界）。
 
+## TASK-014 实施记录（2026-10-02）
+
+### 起点：一个自带"崩溃待查"的 WIP 提交
+
+接手时仓库里已有 `wip/task-014-partial`（`a35b3ef`），提交信息自己写着
+「读取路径 + 启动恢复，**存在崩溃待查**」。恢复逻辑（快照读取器、校验、`Restore`、
+`FINISHING` 重新纳管）基本成形，但 `scripts/verify-persistence.sh` 全红：
+Room 一启动就 abort。本任务的工作因此是「把首尾收完」，而收尾过程中挖出了三个
+**既有缺陷**，其中两个与 TASK-014 自身无关。
+
+### 崩溃一：同一条 MySQL 连接被多个线程共用（并发协议错乱）
+
+**现象**：只要 `rooms` 表里有一条未结束的快照，Room 启动就 abort：
+
+```text
+启动恢复：扫描 1 个未结束房间，恢复 1 个，标记 ABORTED 0 个
+I… server.cpp:1262] Server[rgbt::room::RoomServiceImpl] is serving on port=18099
+../src/nssl-3.6.4-…/ssl/ssl_lib.c:4362: OpenSSL internal error: refcount error
+../src/nssl-3.6.4-…/ssl/ssl_lib.c:1432: OpenSSL internal error: refcount error
+→ SIGABRT（退出码 134）
+```
+
+**根因**：`room_main.cpp` 只创建**一条** `MysqlConnection`，交给
+`result_writer` / `snapshot_writer` / `snapshot_reader` 三者共用；而 ticker 线程
+（第 137 行启动）会立刻为刚恢复的房间写第一份快照，主线程同一时刻还在做启动探活
+（第 145 行 `IsHealthy()`）。一股 `MYSQL*` 字节流被两个线程同时写，协议被搅乱，
+下一个语句直接报 `Received malformed packet`，走到"连接已失效"的重连分支，
+`mysql_close()` 拆 TLS 时 OpenSSL 引用计数校验失败，进程 abort。
+`MysqlConnection` 当时**没有任何互斥**。
+
+为什么偏偏 TASK-014 撞上：此前 Room 启动时 `rooms` 里没有未结束行（"恢复 0 个"），
+ticker 那一瞬间无快照可写。TASK-014 第一次让"启动时就有房间"成为常态。
+
+**A/B 证据**（`rooms` 表放一条未结束行，各启动 10 次）：
+
+| 版本 | 存活 | 崩溃 | 出现 malformed packet |
+|---|---|---|---|
+| 修复前 | 3/10 | **7/10**（139×5、134×2） | 3/10 |
+| 修复后 | **10/10** | 0/10 | 0/10 |
+
+**修复**：`MysqlConnection` 内部加一把互斥锁，`Query`/`Ping` 各自加锁，把原逻辑
+抽成不持锁的 `QueryLocked`（`Ping` 若直接调 `Query` 会对同一把非递归锁加锁两次，
+那是死锁）；`last_error()` 改为**按值返回**，否则调用方会在另一个线程正写该字符串
+时读它（真实数据竞争）。锁覆盖整个查询（含重连重试），因为"回复配对正确"依赖
+"发出到取回之间没有别的线程插队"。
+
+**这不是"顺手加的保险"，而是 Gateway 一并受益的既有缺陷修复**：
+`gateway_main.cpp` 同样只创建一条连接交给所有 brpc worker 线程。
+
+### 崩溃二：同一条 Redis 连接被多个线程共用（回复张冠李戴）
+
+修好 MySQL 后，`verify-persistence.sh` 新增的 7e（12 个并发登录）立刻暴露出
+**Gateway 的另一个同类缺陷**：`RedisSessionStore` 也只创建一条 hiredis 连接，
+被所有 brpc worker 线程共用，同样没有互斥。
+
+**最直接的证据**是并发登录的响应体：
+
+```json
+{"status_code":200,"token":"OK","expires_in_seconds":604800,...}
+```
+
+`"OK"` 是 `SET … NX` 的 `+OK` 状态回复——它被另一个线程的 `GET` 当成 Token 读走了。
+同批 12 个请求里另有 3 个返回 503（`session_store_unavailable` /
+`player_store_unavailable`），并且出现过一次段错误。
+
+**修复**：与 MySQL 同一套做法——加锁覆盖 public 方法的**整个**命令序列
+（`GET → HSET → EXPIRE → SET NX → 可能的 GET/DEL` 必须一次性持锁，否则回复仍会错配）。
+
+修复后 Token 不再是 `OK`，也不再崩溃；只剩 1/12 返回 `player_store_unavailable`。
+补上 `MysqlPlayerReader` 的失败日志后，那一例的真面目清楚了：
+
+```text
+[gateway] 玩家档案查询失败：prepare failed: TLS/SSL error: unexpected eof while reading
+[mysql] connection lost, reconnecting and retrying once
+```
+
+即：这一节前面停过 MySQL，Gateway 手上那条连接已经死了，**第一个**碰到它的请求
+负责发现断连并重连。这属于"依赖刚恢复时的首次探测"，本身就是设计上允许的可重试
+503，不该算进"并发共用连接"这一项。因此 7e 改为**先预热一次**（顺序登录，
+结果无论 200 还是 503 都只记录、不判失败），再并发打 12 个并断言 12/12 成功。
+预热之后连续 3 次运行均为 12/12。
+
+### 崩溃三（假警报）：构建陈旧 —— `rsync -a` 的 mtime 与 `-p`
+
+排查上面两个缺陷期间出现过两组**看起来很严重、实际不存在**的崩溃：
+
+- Room 在 MySQL 停机时 6/6 SIGSEGV（栈落在 `pthread_mutex_lock`，
+  `this` 是个垃圾值 0x1bcc0）；
+- Gateway 在并发登录时 `free(): invalid pointer`。
+
+**根因在工具链，不在产品代码**：会话的写入位置是 Windows 副本，构建位置在 WSL，
+中间用 `rsync -a` 同步。`-a` 含 `-t`（保留 mtime），把文件同步进构建树后目标
+mtime 可能**早于**上次构建的 `.o`，Ninja 便认为"不需要重建"，于是把**新头文件**
+和**旧目标文件**混着链接。给 `MysqlConnection` 加 mutex 成员改变了类的
+`sizeof`：`room_main.cpp.o` / `gateway_main.cpp.o` 仍按旧尺寸分配对象，而
+`mysql_connection.cpp.o` 已是新布局，互斥锁落在 malloc 的 chunk 头上 →
+表现为 `free(): invalid pointer` 与 `pthread_mutex_lock` 崩溃。
+
+**验证**：清理重建后，同一复现脚本从 6/6 崩溃变成 0/3 崩溃（gdb 下 60 秒不崩）。
+
+**同时修掉第二个同步陷阱**：`rsync -a` 含 `-p`，而 DrvFs（`/mnt/d`）上所有文件都
+呈现为 755，于是 WSL 仓库里 154 个文件被改成 `100755`，`git status` 看起来
+"几乎全仓库都被改了"（内容未变，只有权限位）。现在同步脚本
+**不用 `-p/-o/-g`、对每个真正传输的文件 `touch`、并按 git 记录恢复权限位**。
+
+**教训**：跨 Windows/WSL 的同步必须让构建系统看见"文件变了"。mtime 与权限位
+都能伪装成产品缺陷，而且伪装得很像。
+
+### 修掉验收脚本自身的三处错误（原来的断言不可能通过）
+
+7 节这些用例是 WIP 里新写的，**从未真正通过过**（一跑到那里就崩），因此其中的
+错误断言一直没被发现：
+
+1. **7a「恢复位置精确等于最后一次快照」测错了时刻**。房间一恢复就继续按 10 Hz
+   推进，而脚本是重启后 1~3 秒才通过 Gateway 查询，帧号早已前进——实测
+   `kill 前 30，恢复后 44`，于是"丢失量"算成 **-14 帧**。
+   修法：丢失量的定义改为「kill 时的实时帧 − 最后一次落库的帧」（= 还没来得及
+   写进快照的进度，上界即一个快照间隔）；恢复点则**从 Room 启动日志读**。
+   为此给 `RoomManager::Restore` 增加一行按房间打印的恢复日志
+   （`已恢复房间：… frame=N phase=…`）——这是唯一能在外部观测到"恢复点是哪一帧"
+   的途径，对排障本身也有用。日志在**锁外**打印，沿用"持锁不做 I/O"的规则。
+2. **7b 的前提自相矛盾**。它先停掉 MySQL、把对局打到 `finishing`，然后在 MySQL
+   **仍停机**时重启 Room，再断言"FINISHING 房间被恢复"。但恢复本身就要读 MySQL，
+   而存储不可用时 `Restore` 按设计**一个房间都不恢复**。等于要求"在没有 MySQL 的
+   情况下从 MySQL 恢复"。修法：改为在 **MySQL 正常时**直接写入一条合法的
+   `finishing` 行（正是"进程被杀时结果尚未落库"在库里的样子），重启 Room，
+   断言它被恢复并**把结果补写进 `match_results`**——这才是 TASK-008 那条已知限制的正解。
+3. **第 6 节「MySQL 停机期间对局继续推进」的 2 秒观察窗太窄**。快照写入是在
+   **ticker 线程**上做的（`Tick → FlushSnapshots`），所以一次连不上的写入会让这个
+   线程阻塞在 MySQL 连接超时上（默认 3 秒），停机期间推进是**突发式**的。
+   固定 2 秒窗口可能整段落在一次停顿里，产生误报（实测到过一次 `frame 14 -> 14`）。
+   修法：改成观察"12 秒内是否推进过"，并把这条机制写进
+   `docs/01-architecture.md` 的已知限制——它是真实的设计边界，不是测试问题。
+
+### `verify-all.sh` 里有一行把验收脚本悄悄吃掉了
+
+跑「一条命令」时发现它只跑 6 个脚本，**没有 `verify-persistence.sh`**。
+读脚本发现 `all_scripts=(...)` 写了**两行**，第二行漏掉 `verify-persistence`，
+把第一行整个覆盖：
+
+```bash
+all_scripts=(verify verify-login verify-match verify-room verify-stream verify-web verify-persistence)
+all_scripts=(verify verify-login verify-match verify-room verify-stream verify-web)   # ← 覆盖掉上一行
+```
+
+`git log -S` 显示两行都来自 TASK-013 的提交 `5642b28`。也就是说 TASK-013 的
+devlog 里"已加入 `verify-all.sh`"实际没有生效，它自己的验收脚本从没被这条命令跑到
+——正是 `verify-all.sh` 开头那段理由警告的情况，只是这次坑在脚本自己身上。
+已删除重复行并更新耗时记录。
+
+### 完成
+
+- `include/common/mysql_connection.hpp` + `src/common/mysql_connection.cpp`：
+  内部互斥、`QueryLocked` 拆分、`last_error()` 按值返回。
+- `src/gateway/redis_session_store.hpp` + `.cpp`：内部互斥，锁覆盖整个命令序列。
+- `src/room/room_manager.cpp`：恢复点日志（锁外打印）。
+- `src/gateway/mysql_player_reader.cpp`：失败时打印 MySQL 的真实错误。
+  （调用方只能看到一个 503，具体是断连、权限还是语句被拒只有这一层知道——
+  排查那一例并发 503 时正卡在这里。）
+- `CMakePresets.json`：新增 `brpc-asan` 与 `brpc-tsan` 预设
+  （vcpkg + ASan / TSan，configure/build/test 三处）。
+- `CMakeLists.txt`：`rgbt_apply_sanitizer` 改为按开关选择 ASan 或 TSan，
+  两者互斥（同时打开直接 FATAL_ERROR），并在 TSan 构建里加 `-Wno-tsan`
+  （该告警由第三方头文件里的 `atomic_thread_fence` 触发，不是本项目代码）。
+- `src/gateway/CMakeLists.txt`、`src/match/CMakeLists.txt`、`src/room/CMakeLists.txt`：
+  给三个**服务可执行文件**补上 `rgbt_apply_sanitizer`——此前只有 `*_lib` 与测试
+  目标加了它，服务的 sanitizer 构建根本无法链接，等于 sanitizer 从未覆盖过服务进程。
+- `docs/TASKS.md` + `docs/02-roadmap.md`：清理过期状态标注（TASK-001/002/003/007
+  的「进行中」与 TASK-008 ~ TASK-013 的「待验收」全部更正为已完成并附合并点；
+  roadmap 的「Phase 1 进行中」更正为已完成）。这些标注此前与 git 状态不符，
+  会让人误以为还有一堆任务挂着。
+- `scripts/verify-persistence.sh`：修正 7a 的度量方式、重写 7b 的前提、放宽第 6 节
+  的观察窗、新增 7d（存在未结束房间时连续 3 次重启）与 7e（并发共用一条连接）。
+- `scripts/verify-all.sh`：删掉覆盖 `all_scripts` 的重复行。
+- `docs/01-architecture.md`：新增「房间状态的恢复边界」（精确字段、近似字段与
+  偏差上界、三种失败情形的区分、明确不恢复什么、已知限制）。
+- `docs/05-api-and-data.md`：补上 `rooms` 表（TASK-013 建了表但表清单一直没更新，
+  文档与实现不一致）；表清单标题的"截至 TASK-006"改为"截至 TASK-014"。
+- `tests/unit/room/room_manager_test.cpp`：抽出 `OpenPlayingRoom` helper 并对
+  `Create`/`Join` 断言成功，消掉约 40 处 `[[nodiscard]]` 忽略告警。
+- `tests/unit/match/match_queue_test.cpp`：显式丢弃一处 `GetStatus` 返回值
+  （既有告警，非本任务引入；为了让"构建无告警"这句话成立而顺手修掉）。
+
+### 决策
+
+- **在 `MysqlConnection` / `RedisSessionStore` 内部加锁，而不是"每个线程一条连接"**：
+  这里修的是"同一对象被并发使用"这一确定性错误，最小改动就是互斥。连接的**数量**
+  是另一件事（连接池属 Phase 3，当前没有容量证据，见 CLAUDE.md 第 6 条）。
+  已知代价：锁覆盖整个调用，慢依赖会串行化这条连接上的请求——但一条连接本来
+  就无法并发执行两条命令，真正的扩容手段是连接池，不是去掉锁。
+- **给 `Restore` 加一行日志而不是让验收脚本"大概对得上"**：恢复点帧号在外部
+  不可观测（房间立刻继续推进），要么加日志、要么放弃断言。选择加日志，它对排障
+  本身也有价值。
+- **7b 改为构造 `finishing` 行，而不是保留一个不可能通过的前提**：宁可承认原断言
+  写错了，也不把它改成"看起来能过"的弱断言。
+- **不修"快照写入阻塞 ticker 线程"**：它是真实边界（MySQL 不可用时推进变突发式），
+  但把快照写入移到独立线程属于 Phase 3 的解耦工作，当前没有容量证据，
+  只在 `01-architecture.md` 记录清楚。
+
+### 验证
+
+均在本机 WSL（16 核 / 11 GiB）执行。
+
+- `cmake --build --preset brpc-debug --clean-first`：退出码 0，
+  **全量重建后 0 条 error/warning**（此前遗留的 `match_queue_test.cpp` 一处
+  `[[nodiscard]]` 告警已一并修掉）。
+- `ctest --test-dir build/brpc-debug`：**185/185 通过**。
+- `bash scripts/check-format.sh`：通过（69 个文件）。
+- `bash scripts/verify-all.sh`：**7 个脚本全部通过（228 秒）**；修正 `all_scripts`
+  之后 `verify-persistence` 才真正被这条命令跑到
+  （verify 29s / verify-login 53s / verify-match 38s / verify-room 32s /
+  verify-stream 11s / verify-web 21s / verify-persistence 44s）。
+- 崩溃回归 harness（`rooms` 里放一条未结束行后反复启动 Room）：
+  **修复前 7/10 崩溃（139×5、134×2）→ 修复后 10/10 存活**，
+  `malformed packet` 从 3/10 降到 0/10。
+- 清理重建前后的对照（证明第三个"崩溃"是构建陈旧）：MySQL 停机复现
+  **清理前 6/6 SIGSEGV → 清理后 0/3 崩溃**。
+
+`bash scripts/verify-persistence.sh` 连跑 3 次（这是本任务的验收入口）：
+
+| 运行 | 退出码 | 恢复点 = 最后快照 | 实测进度丢失 | 未结束房间下重启 | 12 并发登录 |
+|---|---|---|---|---|---|
+| 1 | 0 | 是（30） | 0 帧 | 3/3 存活 | 12/12 |
+| 2 | 0 | 是（30） | 0 帧 | 3/3 存活 | 12/12 |
+| 3 | 0 | 是（29） | 1 帧 | 3/3 存活 | 12/12 |
+
+进度丢失量的上界由快照间隔决定（10 帧 = 1 秒），实测 0~1 帧。
+
+**TSan 也已运行，但当前配置下不具指向性**——这也是一个需要记录的事实，不是"跑过了"就完事：
+
+- 为了跑 TSan 补了两处：新增 `brpc-tsan` 预设，以及修掉两个**既有**阻塞点：
+  1. `rgbt_apply_sanitizer` 只作用于 `*_lib` 与测试目标，**三个服务可执行文件从未
+     应用 sanitizer**（ASan 版服务直接链接失败，等于 sanitizer 从未覆盖过服务进程）；
+  2. GCC 的 `-Wtsan`（"TSan 无法插桩 `atomic_thread_fence`"）在 `-Werror` 下直接
+     编译失败，而该构造只出现在 brpc / libstdc++ 头文件里（`grep atomic_thread_fence`
+     在本仓库为空），因此在 TSan 构建里用 `-Wno-tsan` 屏蔽这一条。
+- 实测结果：Room 启动恢复 3 次全部存活、Gateway 12 个并发登录 12/12 成功，
+  但产生 **21 条 TSan 报告**（Room 每次 5 条，Gateway 6 条）。
+- **这 21 条全部指向 brpc 内部**：按栈帧统计，186 帧来自 brpc 源码，
+  `butil::Mutex::lock`、`butil::cpuwide_time_ns`、`butil::IOPortal::pappend_from_file_descriptor`
+  等；来自本项目源码的只有 2 帧，且都是**对象构造点**
+  （`BrpcMatchClient::BrpcMatchClient`、`main`），不是竞争访问。
+- 原因是 vcpkg 提供的 brpc **没有用 TSan 插桩**：brpc 自己的锁与每 CPU 时间缓存
+  在 TSan 看来就是"无同步的裸访问"。要让它成为可用的门禁，必须先用 TSan 重建
+  brpc 及其依赖链（brpc 本体普通编译就要 17 分钟，插桩后更久）。
+  **结论：TSan 预设保留（它是那一步的前置条件），但当前不能当作本项目的并发门禁；
+  并发缺陷的证据仍然来自 A/B 复现（7/10 → 0/10）、ASan 与"废弃 Token `OK`"这类直接现象。**
+  这件事记入 `docs/TASKS.md` 的 Backlog。
+
+**ASan 的运行结果**（`build/brpc-asan`，`detect_leaks=0`：brpc 自身的静态对象会被报成泄漏，
+开着它只会把真正的内存错误淹掉）：
+
+| 场景 | 结果 |
+|---|---|
+| Room 启动恢复 + 立刻写第一份快照，5 次 | 存活 5/5，**ASan/UBSan 报告 0/5** |
+| Gateway 12 个并发登录 | **12/12 成功**，无 ASan/UBSan 报告，进程存活 |
+
+### 问题与风险
+
+- 上面第三个"崩溃"是**我自己造成的假象**（构建陈旧），前后花了两轮排查。
+  记在这里是因为它比产品缺陷更容易重犯：同步目录 + 增量构建这个组合会骗人。
+- 并发缺陷的修复是"让同一条连接串行化"，**没有**消除依赖本身成为瓶颈的可能。
+  锁的代价只在一处被观测到（Redis/MySQL 超时会串行化该连接上的请求），
+  没有做压测，因此**不能**说"性能没有影响"。
+- `verify-persistence.sh` 的 7d/7e 依赖"表里存在未结束快照"这个前置条件，
+  脚本会自己构造并在结束时清理。若前一次运行异常中断，可能留下
+  `m-restart-014` / `m-finishing-014` 这类测试行，需手工删除。
+
+### 下一步
+
+- 交付提交：`fa704f4`（分支 `feat/task-014-room-recovery`，未推送、未合并）。
+  其上 `a35b3ef` 是接手时的 WIP，再往下是 TASK-013 的 `5642b28`。
+  审阅时建议 `git show fa704f4`，或直接用下面两条命令跑验收。
+- 由项目所有者审阅 Diff，并运行：
+  `bash scripts/verify-persistence.sh`（约 45 秒）与 `bash scripts/verify-all.sh`
+  （实测 212 秒）。
+- TASK-015（匹配队列的 Redis 快照与重启恢复）需要项目所有者先决定
+  「Redis 不可用时是明确报错还是降级为纯内存」，见任务单。
+
+## TASK-015 实施记录（2026-10-02）
+
+### 背景
+
+TASK-007 留下的已知限制原文是「**Match 重启即丢失排队状态**」：排队中的玩家会
+突然从 `queued` 变成 `idle`，而且没有任何解释。TASK-015 把队列状态写进 Redis，
+启动时重建，并把停机期间流逝的时间算进超时判定。
+
+项目所有者在本轮确认了任务单里唯一悬着的那项决策：
+**Redis 不可用时降级为纯内存，不阻塞匹配**。
+
+### 完成
+
+- `src/match/match_queue_store.hpp`：快照类型、**纯函数**编解码、存储接口。
+- `src/match/match_queue_store.cpp`：长度前缀文本格式（显式版本号 `1`）。
+- `src/match/redis_match_queue_store.hpp/.cpp`：Redis LIST + 管道化的
+  `MULTI/EXEC` 整份替换，内部互斥（沿用 TASK-014 的教训：共享连接必须加锁）。
+- `src/match/match_queue.{hpp,cpp}`：`Restore`、`MakeSnapshotLocked`、
+  `PersistSnapshot`；清算函数改为返回"是否变化"，只有真的变了才写快照。
+- `src/match/match_main.cpp`：`-redis_host/-redis_port/-redis_timeout_ms/-env_prefix`，
+  恢复在**开始接受请求之前**执行，结果打进启动日志。
+- `tests/unit/match/match_queue_store_test.cpp`：18 个用例。
+- `scripts/verify-persistence.sh`：新增 7f 一节（队列快照、重启恢复、降级）。
+- 文档：本记录 + `docs/TASKS.md` 的 TASK-015 任务单与结果。
+
+### 决策
+
+- **整份重写而不是增量更新**。队列条目之间有 FIFO 顺序，增量更新要自己维护顺序，
+  而整份重写天然给出"要么旧的完整队列、要么新的完整队列"。上限 1000 条，
+  重写开销可以忽略。
+- **`MULTI/EXEC` 包住 `DEL` + 若干 `RPUSH`**。没有这条保证时，进程在改写中途被杀
+  会留下"只剩后半截"的队列——那比丢队列更糟，因为它是**看起来正常**的错误状态。
+  用管道（`redisAppendCommand`）而不是逐条 `redisCommand`：队列上千行时逐条会变成
+  上千次往返，而快照写入发生在入队路径上。**所有管道回复必须全部取走**，
+  否则连接会与回复错位——这正是 TASK-014 实测过的那类缺陷。
+- **编解码是纯函数，且带显式版本号**。本仓库没有 JSON 库，自己写解析器属于引入
+  未验证的复杂度；长度前缀对内容无要求、不需要转义。版本号让"以后改格式"能被
+  **识别并拒绝**，而不是解析出一支乱七八糟的队列。解析玩家数时**先卡上界再循环**，
+  损坏的计数不能变成一次空转。
+- **快照里不存 `request_id`**。它只用于入队幂等，而去重以 `player_id` 为键：
+  重启后同一 `request_id` 重试会被判为 `kAlreadyQueued`，语义不变。
+  附带好处是快照里**不含任何客户端可控的字符串**。
+- **`allocating` 条目按"排队中"写入，重启后退回队列**。重启后无法知道
+  `CreateRoom` 是否已经成功；Room 侧以 `match_id` 幂等，重新分配会拿回同一个
+  `room_id`，因此退回是安全的，丢弃则会让玩家无缘无故消失。
+  已经登记取消意图的条目**不写**：客户端的取消已答复成功，重启后让它重新出现
+  会与那个答复矛盾。
+- **只有状态真的变化才写快照**。轮询是高频率路径，若每次查询都写，每个客户端的
+  每次轮询都会变成一次 Redis 写。清算函数因此返回"是否变化"。
+- **快照与写入成对串行化**（`snapshot_order_mutex_ → mutex_`）。只做"锁内取、
+  锁外写"会引入新问题：两个线程可能各自取到较早的快照 S1 与较晚的 S2，
+  却按 S2 → S1 的顺序写入，把队列**写回退**。先拿前者再取队列锁，
+  既保证顺序，又**不在持有队列锁时做 I/O**。
+
+### 验证（WSL，16 核 / 11 GiB）
+
+- `ctest --test-dir build/brpc-debug`：**203/203 通过**（185 → 203，新增 18 个）。
+- `cmake --build --preset brpc-debug`：0 error / 0 warning。
+- `bash scripts/check-format.sh`：通过（74 个文件）。
+- `bash scripts/verify-persistence.sh`：**退出码 0**。7f 一节实测：
+  - 入队后 `dev:match:queue` 有 1 条快照；
+  - `kill -9` Match 后重启，`GET /api/v1/matches/current` 仍报 `queued`，
+    启动日志打印「队列恢复：扫描 1 行，重建排队 1 人」；
+  - 让 Match 指向一个不可用端口后：启动日志如实报告「队列快照读取失败」，
+    **匹配照常成功**（降级为纯内存），且日志明确记录「队列快照写入失败」。
+
+### 问题与修正（本轮实际踩到的）
+
+- **第一版 7f 测错了对象**。它用 `docker stop rgbt-redis` 来测 Match 的降级，
+  但 **Gateway 的会话也在同一个 Redis 上**：停掉 Redis 后所有 HTTP 请求会先因
+  鉴权失败返回 503，请求根本走不到 Match。失败项指向的其实是 Gateway 的会话存储，
+  与 TASK-015 要验证的行为无关。改为让 **Match 的快照存储**指向一个不可用端口，
+  链路其余部分保持完好，降级行为才被真正隔离验证到。
+  教训：**故障注入要注入到被验证的那个组件上**，否则测到的是链路上游的行为。
+- **一条测试的前提写错了**。`AllocatingEntriesAreSnapshottedAsQueued` 一开始检查
+  "最后一次快照"，但后续操作会覆盖它，于是断言失败。改为在分配回调里捕获
+  "分配期间产生的那个快照"，断言才指向真正想验证的时刻。
+
+### 队列快照跨运行残留：一个被 `verify-match.sh` 抓到的真回归
+
+自己写的新功能第一次跑全套验收就撞上了：`verify-match.sh` 失败于
+`未入队状态异常：HTTP 200 state=timeout`——它断言"没入过队的玩家应当是 idle"，
+但那个玩家报的是 `timeout`。
+
+原因不是断言写错，而是**队列快照把上一轮运行的状态带进了这一轮**：
+Match 启动时会恢复 `dev:match:queue`，而验收脚本此前只清理 `dev:gateway:*`
+（会话与登录幂等），从来没有清过队列快照。上一轮 7f 留下的排队玩家，
+在新一轮里被恢复成内存条目，于是"从没排过队的人"有了状态。
+
+两处修正，分别针对测试隔离与产品语义：
+
+1. **测试隔离**：所有会启动 Match 的脚本（`dev-up.sh`、`verify-login/match/
+   room/stream/web/persistence.sh`）原本就有"清理上一轮 Key"的动作，
+   把 pattern 从 `dev:gateway:*` 放宽到 `dev:*`，队列快照一并清掉。
+   这与它们清理会话的理由完全相同：**验收必须从干净状态开始**。
+2. **产品语义**：`Restore` 不再把"已经超过排队超时"的条目装进内存变成
+   `timeout` 状态，而是**直接不恢复**并计入报告（新增 `expired_results` 计数）。
+   理由是快照可能来自很久以前的一次启动：把这些条目装进内存，会让一个"在这个
+   进程里从没排过队的人"立刻报告 `timeout`，并占着结果保留期不放。
+   停机时间**仍然算在等待里**（这正是"重新判定超时"的含义），只是表达方式从
+   "恢复成已超时"改成"干脆不恢复"——玩家该做的就是重新入队，
+   而"队列里没有他"是这个语义最直接的表达。
+
+修正后 `verify-all.sh` **7/7 通过（195 秒）**。这条也说明 `verify-all.sh` 值回票价：
+它是唯一能发现"新功能污染了别的验收脚本"的地方。
+
+### 未做 / 遗留
+
+- **快照写入仍在入队请求路径上**。Redis **拒绝连接**时几乎不花时间，但 Redis
+  **挂起**（不回包）时会多等一个 Redis 超时（默认 500 ms），与 Gateway 的
+  `match_timeout_ms`（也是 500 ms）同量级，理论上可能让一次入队超时。
+  要彻底消除需要把快照写入移出请求路径（独立写入线程或定时器），
+  那是引入并发的改动，先要有证据。记入 Backlog。
+- 队列的**结果保留期**靠 `stamp_ms` 恢复，与房间快照一样是周期性快照，
+  不构成"精确恢复"。
+- 匹配队列快照只覆盖单实例（ADR-0003 非目标）。
+
+### 下一步
+
+- 由项目所有者审阅 Diff 并运行 `bash scripts/verify-persistence.sh`
+  与 `bash scripts/verify-all.sh`；TASK-014 的 PR 合并后再为 TASK-015 开 PR
+  （依赖关系：TASK-015 的分支基于 TASK-014）。
+
 ## 日志模板
 
 ```markdown

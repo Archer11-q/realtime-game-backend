@@ -21,14 +21,18 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 
 #include "brpc_room_allocator.hpp"
 #include "common/version.hpp"
 #include "match_queue.hpp"
+#include "match_queue_store.hpp"
 #include "match_service.hpp"
+#include "redis_match_queue_store.hpp"
 #include "room_allocator.hpp"
 
 DEFINE_int32(match_port, 8082, "Match Service 监听端口");
@@ -39,6 +43,10 @@ DEFINE_int32(match_max_queue_size, 1000, "匹配队列长度上限，超过后�
 DEFINE_string(room_host, "127.0.0.1", "Room/Battle Service 主机");
 DEFINE_int32(room_port, 8083, "Room/Battle Service 端口");
 DEFINE_int32(room_timeout_ms, 500, "调用 Room/Battle Service 的超时（毫秒）");
+DEFINE_string(redis_host, "127.0.0.1", "Redis 主机（队列快照）");
+DEFINE_int32(redis_port, 6379, "Redis 端口（队列快照）");
+DEFINE_int32(redis_timeout_ms, 500, "Redis 连接与命令超时（毫秒）");
+DEFINE_string(env_prefix, "dev", "Key 前缀的环境标识，取值示例 dev / test / prod");
 DEFINE_int32(idle_timeout_s, -1, "连接空闲超时（秒），-1 表示不超时");
 
 namespace {
@@ -47,6 +55,13 @@ std::atomic<bool> g_stopping{false};
 
 void HandleSignal(int /*sig*/) {
     g_stopping.store(true);
+}
+
+/// 当前墙钟毫秒。恢复时需要它来重算"停机期间流逝了多久"。
+std::int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
 }  // namespace
@@ -67,9 +82,31 @@ int main(int argc, char* argv[]) {
     room_options.timeout_ms = FLAGS_room_timeout_ms;
     rgbt::match::BrpcRoomAllocator room_allocator(room_options);
 
+    // 队列快照存储（TASK-015）。**队列的权威状态仍在内存里**，Redis 只是旁路
+    // 快照：Redis 不可用时匹配照常工作，只是失去"重启可恢复"（降级为纯内存）。
+    // 这条失败策略由项目所有者确认，理由见 docs/TASKS.md 的 TASK-015。
+    rgbt::match::MatchRedisOptions redis_options;
+    redis_options.host = FLAGS_redis_host;
+    redis_options.port = FLAGS_redis_port;
+    redis_options.connect_timeout_ms = FLAGS_redis_timeout_ms;
+    redis_options.command_timeout_ms = FLAGS_redis_timeout_ms;
+    rgbt::match::RedisMatchQueueStore queue_store(FLAGS_env_prefix, redis_options);
+
     rgbt::match::MatchQueue queue(&room_allocator, {}, FLAGS_match_timeout_seconds * 1000LL,
                                   FLAGS_match_result_ttl_seconds * 1000LL,
-                                  static_cast<std::size_t>(FLAGS_match_max_queue_size));
+                                  static_cast<std::size_t>(FLAGS_match_max_queue_size),
+                                  &queue_store);
+
+    // 恢复必须在**开始接受请求之前**完成：否则一个刚入队的玩家要与一个
+    // 尚未恢复的队列竞争，队列里可能已经有他的旧记录。
+    const rgbt::match::MatchRestoreReport restore = queue.Restore(NowMs());
+    std::printf(
+        "队列恢复：扫描 %zu 行，重建排队 %zu 人、已配对 %zu 人，"
+        "跳过 %zu 行、已超时未恢复 %zu 人、结果已过期未恢复 %zu 人%s\n",
+        restore.scanned, restore.queued, restore.matched, restore.dropped, restore.timed_out,
+        restore.expired_results,
+        restore.load_failed ? "（快照读取失败，本次未恢复任何排队状态）" : "");
+    std::fflush(stdout);
 
     rgbt::match::MatchServiceImpl service(&queue);
 

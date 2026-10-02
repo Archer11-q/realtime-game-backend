@@ -1,7 +1,10 @@
 #include "room_manager.hpp"
 
 #include <cstdio>
+#include <optional>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "common/token.hpp"
 
@@ -19,10 +22,114 @@ std::string GenerateRoomId() {
 }  // namespace
 
 RoomManager::RoomManager(MatchResultWriter* writer, RoomSnapshotWriter* snapshot_writer,
+                         RoomSnapshotReader* snapshot_reader,
                          std::function<std::string()> room_id_factory)
     : writer_(writer),
       snapshot_writer_(snapshot_writer),
+      snapshot_reader_(snapshot_reader),
       room_id_factory_(room_id_factory ? std::move(room_id_factory) : GenerateRoomId) {}
+
+RestoreReport RoomManager::Restore(std::int64_t now_ms) {
+    RestoreReport report;
+    if (snapshot_reader_ == nullptr) {
+        // 没配读取器：不恢复，也不报错。单元测试与"不关心持久化"的部署会走这里。
+        return report;
+    }
+
+    std::vector<RoomSnapshotRow> rows;
+    if (!snapshot_reader_->LoadUnfinished(&rows)) {
+        // 存储不可用时**不恢复任何房间**，并如实报告 load_failed。
+        // 空手启动是安全的：玩家发现房间没了会重新匹配。
+        // 而"以为恢复了其实没有"会让后续每次查询都得到难以解释的结果。
+        report.load_failed = true;
+        std::fprintf(stderr, "[room] 房间快照读取失败：本次启动不恢复任何房间\n");
+        return report;
+    }
+    report.scanned = rows.size();
+
+    std::vector<std::pair<RoomSnapshotRecord, std::string>> rejected;
+    // 成功重建的房间也要留一份记录，好在锁外打日志。**不能在持锁循环里打**：
+    // 持锁做 I/O 是本项目明确避免的（见 room_manager.hpp 的并发说明）。
+    std::vector<RoomSnapshotRecord> restored_records;
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        for (const RoomSnapshotRow& row : rows) {
+            // 解析层与校验层的问题都汇聚在 problem 里，这里只认"非空即拒绝"。
+            if (!row.problem.empty()) {
+                rejected.emplace_back(row.record, row.problem);
+                continue;
+            }
+            std::optional<BattleRoom> room = BattleRoom::RestoreFrom(row.record, now_ms);
+            if (!room.has_value()) {
+                rejected.emplace_back(row.record, "无法由该快照重建房间");
+                continue;
+            }
+            const std::string room_id = room->room_id();
+            const std::string match_id = room->match_id();
+            // 幂等：内存里已有同一房间或同一对局时保留内存里的那份。
+            // Restore 只在启动时调用一次，这里防御的是"调用方重复调用"。
+            if (rooms_.count(room_id) != 0U || match_index_.count(match_id) != 0U) {
+                continue;
+            }
+            rooms_.emplace(room_id, std::make_unique<BattleRoom>(std::move(*room)));
+            match_index_.emplace(match_id, room_id);
+            restored_records.push_back(row.record);
+            ++report.restored;
+        }
+    }
+    report.rejected = rejected.size();
+
+    // 每个恢复出来的房间各打一行，带上**恢复点帧号**。
+    //
+    // 为什么必须有这条日志：房间一恢复就继续按 10 Hz 推进，因此重启后从 Gateway
+    // 查询到的帧号**已经往前走了**，"恢复点究竟是哪一帧"在外部观测不到。
+    // 验收脚本（scripts/verify-persistence.sh 第 7 节）靠这一行断言
+    // "恢复位置精确等于最后一次快照"，否则那条断言只能退化成"大致对得上"。
+    for (const RoomSnapshotRecord& record : restored_records) {
+        std::fprintf(stderr, "[room] 已恢复房间：match_id=%s room_id=%s frame=%lld phase=%s\n",
+                     record.match_id.c_str(), record.room_id.c_str(),
+                     static_cast<long long>(record.frame), ToString(record.phase));
+    }
+
+    // 日志与写回都在锁外：持锁做 I/O 是本项目明确避免的。
+    RejectSnapshots(rejected, now_ms);
+    return report;
+}
+
+void RoomManager::RejectSnapshots(
+    const std::vector<std::pair<RoomSnapshotRecord, std::string>>& rejected, std::int64_t now_ms) {
+    if (rejected.empty()) {
+        return;
+    }
+    for (const auto& entry : rejected) {
+        std::fprintf(stderr,
+                     "[room] 房间快照不可用，标记为 ABORTED（不静默丢弃）："
+                     "match_id=%s room_id=%s 原因=%s\n",
+                     entry.first.match_id.c_str(), entry.first.room_id.c_str(),
+                     entry.second.c_str());
+    }
+    if (snapshot_writer_ == nullptr) {
+        // 没有写入器：只记日志，**不假装写回去了**。
+        std::fprintf(stderr, "[room] 未配置快照写入器，被拒绝的快照只记日志\n");
+        return;
+    }
+
+    for (const auto& entry : rejected) {
+        RoomSnapshotRecord record = entry.first;
+        record.phase = RoomPhase::kAborted;
+        record.finish_reason = FinishReason::kAborted;
+        record.winner_id.clear();
+        // snapshot_at_ms 必须用当前时刻：写入器靠"新不旧于旧"防止迟到的旧快照
+        // 覆盖新快照，沿用原值会被它拒掉，于是这一行永远改不成终态、
+        // 下次启动又被扫出来、又被拒绝。
+        record.snapshot_at_ms = now_ms;
+        if (snapshot_writer_->Save(record) != SnapshotWriteStatus::kOk) {
+            std::fprintf(stderr,
+                         "[room] 标记 ABORTED 的写回失败：match_id=%s（下次启动会再次扫到它）\n",
+                         record.match_id.c_str());
+        }
+    }
+}
 
 std::string RoomManager::MakeRoomId() const {
     return room_id_factory_ ? room_id_factory_() : std::string();

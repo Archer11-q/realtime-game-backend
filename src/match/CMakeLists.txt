@@ -14,6 +14,8 @@
 find_package(Protobuf REQUIRED)
 # vcpkg 的 brpc 以 unofficial-brpc 为包名导出，目标名是 unofficial::brpc::brpc。
 find_package(unofficial-brpc CONFIG REQUIRED)
+# TASK-015：队列快照写入 Redis，需要 hiredis（与 gateway 用的是同一个包）。
+find_package(hiredis CONFIG REQUIRED)
 
 rgbt_add_service_proto(rgbt_match_proto match)
 
@@ -25,7 +27,9 @@ add_library(
   rgbt_match_lib STATIC
   brpc_room_allocator.cpp
   match_queue.cpp
+  match_queue_store.cpp
   match_service.cpp
+  redis_match_queue_store.cpp
   room_allocator.cpp
 )
 
@@ -41,6 +45,8 @@ target_link_libraries(
     # 需要 Room 的生成代码与服务桩。
     rgbt_room_proto
     unofficial::brpc::brpc
+    # TASK-015：队列快照存储。
+    hiredis::hiredis
 )
 
 rgbt_set_project_warnings(rgbt_match_lib)
@@ -51,6 +57,10 @@ rgbt_set_project_warnings(rgbt_match_lib)
 
 add_executable(rgbt_match match_main.cpp)
 target_link_libraries(rgbt_match PRIVATE rgbt_match_lib unofficial::brpc::brpc)
+
+# 服务可执行文件也要过 sanitizer，理由见 src/room/CMakeLists.txt 里的说明：
+# 只给 *_lib 加 sanitizer 会让服务二进制链接失败，ASan 实际覆盖不到服务进程。
+rgbt_apply_sanitizer(rgbt_match)
 
 set_target_properties(
   rgbt_match

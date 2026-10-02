@@ -1,5 +1,6 @@
 #include "mysql_player_reader.hpp"
 
+#include <cstdio>
 #include <vector>
 
 namespace rgbt::gateway {
@@ -27,6 +28,11 @@ ReaderStatus MysqlPlayerReader::QueryOne(const std::string& sql, std::string_vie
 
     std::vector<rgbt::common::SqlRow> rows;
     if (!connection_->Query(sql, {std::string(param)}, &rows)) {
+        // 失败原因必须打出来。调用方只能看到「玩家档案不可用」这一个 503，
+        // 而到底是"连接断了""权限不对"还是"语句被拒"只有这一层知道。
+        // TASK-014 期间排查并发登录里那一例 503 时就卡在这里：没有这行日志，
+        // 只能反复猜。与 MysqlRoomSnapshotWriter 的做法保持一致。
+        std::fprintf(stderr, "[gateway] 玩家档案查询失败：%s\n", connection_->last_error().c_str());
         return ReaderStatus::kUnavailable;
     }
     if (rows.empty()) {

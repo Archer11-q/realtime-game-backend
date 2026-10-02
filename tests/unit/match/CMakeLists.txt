@@ -6,7 +6,7 @@
 # 这些用例只链接 rgbt_match_lib（其中已包含不依赖 brpc 服务器逻辑的 MatchQueue），
 # 因此不启动任何网络服务。
 
-add_executable(rgbt_match_tests match_queue_test.cpp)
+add_executable(rgbt_match_tests match_queue_test.cpp match_queue_store_test.cpp)
 
 target_link_libraries(rgbt_match_tests PRIVATE rgbt_match_lib GTest::gtest_main)
 

@@ -366,7 +366,9 @@ TEST_F(MatchQueueTest, NoRemoteCallWhenNothingToRetry) {
     queue_->Enqueue("p-0001", "req-1", kT0);
     const int before = allocator_.allocate_calls;
     for (int i = 0; i < 5; ++i) {
-        queue_->GetStatus("p-0001", kT0 + 10 * (i + 1));
+        // 只为驱动惰性重试路径，返回值与本用例的断言无关。
+        // GetStatus 带 [[nodiscard]]，这里显式丢弃，避免产生 -Wunused-result 告警。
+        (void)queue_->GetStatus("p-0001", kT0 + 10 * (i + 1));
     }
     EXPECT_EQ(allocator_.allocate_calls, before);
 }

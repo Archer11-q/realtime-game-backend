@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdarg>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -50,6 +51,9 @@ RedisSessionStore::RedisSessionStore(std::string env_prefix, RedisOptions option
       session_ttl_seconds_(session_ttl_seconds > 0 ? session_ttl_seconds : 60) {}
 
 RedisSessionStore::~RedisSessionStore() {
+    // 加锁只为让"析构时的关闭"与其他线程的命令互斥。按契约对象析构时不应还有
+    // 别的线程在用同一个对象，但那属于调用方的责任，本类不该假设它一定成立。
+    const std::lock_guard<std::mutex> lock(mutex_);
     if (context_ != nullptr) {
         redisFree(context_);
         context_ = nullptr;
@@ -118,6 +122,9 @@ StoreStatus RedisSessionStore::CreateSession(const std::string& request_id,
     if (out_token == nullptr) {
         return StoreStatus::kUnavailable;
     }
+    // 整个登录会话创建过程（GET -> HSET -> EXPIRE -> SET NX -> 可能的 GET/DEL）
+    // 必须一次性持锁：中途被别的线程插队会让回复张冠李戴，这正是本次修掉的问题。
+    const std::lock_guard<std::mutex> lock(mutex_);
     const std::int32_t ttl = ttl_seconds > 0 ? ttl_seconds : session_ttl_seconds_;
     const std::string idem_key = KeyForLoginIdempotency(request_id);
 
@@ -189,6 +196,7 @@ StoreStatus RedisSessionStore::GetSession(const std::string& token, SessionRecor
     if (out_session == nullptr) {
         return StoreStatus::kUnavailable;
     }
+    const std::lock_guard<std::mutex> lock(mutex_);
     const std::string session_key = KeyForSession(token);
 
     void* reply =
@@ -226,6 +234,7 @@ StoreStatus RedisSessionStore::GetSession(const std::string& token, SessionRecor
 }
 
 StoreStatus RedisSessionStore::DeleteSession(const std::string& token) {
+    const std::lock_guard<std::mutex> lock(mutex_);
     const std::string session_key = KeyForSession(token);
 
     void* exists_reply = ExecuteCommand("EXISTS %s", session_key.c_str());
@@ -247,6 +256,7 @@ StoreStatus RedisSessionStore::DeleteSession(const std::string& token) {
 }
 
 bool RedisSessionStore::IsHealthy() {
+    const std::lock_guard<std::mutex> lock(mutex_);
     void* reply = ExecuteCommand("PING");
     if (reply == nullptr) {
         return false;

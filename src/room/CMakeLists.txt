@@ -1,4 +1,5 @@
-# room 服务：TASK-008 房间生命周期与权威状态 + TASK-013 房间快照写入。
+# room 服务：TASK-008 房间生命周期与权威状态 + TASK-013 房间快照写入
+# + TASK-014 启动时从快照恢复。
 #
 # 依赖 vcpkg 提供的 brpc 与 libmariadb，因此本目录只在启用 vcpkg 工具链时加入
 # （见 src/CMakeLists.txt），保证默认构建与 CI 不受影响。
@@ -22,9 +23,11 @@ add_library(
   rgbt_room_lib STATIC
   battle_room.cpp
   mysql_match_result_writer.cpp
+  mysql_room_snapshot_reader.cpp
   mysql_room_snapshot_writer.cpp
   room_manager.cpp
   room_service.cpp
+  room_snapshot_reader.cpp
 )
 
 target_include_directories(rgbt_room_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -49,6 +52,12 @@ rgbt_set_project_warnings(rgbt_room_lib)
 
 add_executable(rgbt_room room_main.cpp)
 target_link_libraries(rgbt_room PRIVATE rgbt_room_lib unofficial::brpc::brpc)
+
+# 服务可执行文件也要过 sanitizer。**这一行是必需的**：TASK-014 之前
+# rgbt_apply_sanitizer 只作用于 *_lib 与测试目标，服务二进制没有链接 ASan 运行时，
+# 于是 "用 ASan 构建的服务" 直接链接失败（undefined reference to `__asan_*`），
+# 也就是说 ASan 从来没有真正覆盖过三个服务的进程（而崩溃恰恰发生在它们里面）。
+rgbt_apply_sanitizer(rgbt_room)
 
 set_target_properties(
   rgbt_room

@@ -18,8 +18,8 @@
 # 每个脚本的输出保存在 .run/verify-<名字>.log，失败时直接看那个文件。
 #
 # 实测耗时（2026-10-02，本机 16 核 / 11 GiB，ccache 已预热）：
-#   verify 30s / verify-login 23s / verify-match 31s / verify-room 28s
-#   / verify-stream 10s / verify-web 20s，合计 142 秒。
+#   verify 29s / verify-login 53s / verify-match 38s / verify-room 32s
+#   / verify-stream 11s / verify-web 21s / verify-persistence 44s，合计 228 秒。
 # 冷缓存（ccache 为空）时 verify.sh 会明显更久，因为它要重新编译三个预设。
 
 set -uo pipefail
@@ -31,8 +31,12 @@ mkdir -p "$run_dir"
 # 顺序有依赖关系：先构建与格式，再按「登录 -> 匹配 -> 房间 -> 推送 -> 前端 ->
 # 持久化」由下而上。前一个失败时后面的通常也会失败，因此默认不用 fail-fast，
 # 一次性看到全部结果更有用。
+#
+# ⚠ 2026-10-02 修正：这里原本有**两行** all_scripts，第二行漏掉了 verify-persistence，
+# 把第一行整个覆盖掉，于是 TASK-013 的验收脚本从来没有被这条"一条命令"跑到——
+# 正是本脚本开头那段理由所警告的情况，只是这次坑在脚本自己身上。
+# 数组只保留一行；新增验收脚本时改这一行。
 all_scripts=(verify verify-login verify-match verify-room verify-stream verify-web verify-persistence)
-all_scripts=(verify verify-login verify-match verify-room verify-stream verify-web)
 
 fail_fast=0
 only=""
