@@ -1,0 +1,54 @@
+# Prometheus 抓取配置（TASK-020）
+#
+# 抓谁：三个服务各自的 `/metrics`（TASK-019 暴露的 Prometheus 文本格式端点）。
+#
+# 地址为什么是 host.docker.internal：
+#   服务跑在宿主机（WSL 发行版）上，Prometheus 跑在容器里。实测（2026-10-03）：
+#   * `172.17.0.1`（默认 bridge 网关）不通；
+#   * 发行版 eth0 地址能通但每次重启会变，不能写进静态配置；
+#   * `192.168.65.254`（Docker Desktop VM 网关）能通，但属于实现细节；
+#   * `host.docker.internal` + `extra_hosts: host-gateway` 可用（compose 里已加），
+#     实测 up=1 且能查到 rgbt_* 时间序列。
+#
+# 端口写的是**默认开发端口**（8080/8082/8083）。若用 -port 改了服务端口，
+# 必须同步改这里——Prometheus v3.1.0 **不支持**在配置里展开环境变量
+# （`--config.expand-env` 不是它的标志，实测报 unknown long flag），
+# 所以这里只能写字面量。scripts/observability-up.sh 会先探测端口并在不一致时提示。
+
+global:
+  # 5 秒够用：这些指标都是计数器/瞬时 gauge，不需要更细；也更省内存。
+  scrape_interval: 5s
+  scrape_timeout: 3s
+  # 不设置 evaluation_interval 的告警规则：任务单明确不做告警（没有值班对象）。
+  external_labels:
+    env: dev
+
+scrape_configs:
+  - job_name: rgbt-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          service: gateway
+
+  - job_name: rgbt-match
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8082"]
+        labels:
+          service: match
+
+  - job_name: rgbt-room
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8083"]
+        labels:
+          service: room
+
+  # 抓 Prometheus 自己：面板上要能看出"采集本身是否健康"。
+  # 没有它的时候，指标变少会同时有"服务挂了"和"采集坏了"两种解释。
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+        labels:
+          service: prometheus

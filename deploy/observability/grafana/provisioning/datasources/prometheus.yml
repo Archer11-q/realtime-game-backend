@@ -1,0 +1,24 @@
+# Grafana 数据源（TASK-020）
+#
+# 用 provisioning 而不是"起来后在界面上点"：手工点的配置只存在于数据卷里，
+# `--down` 删卷之后就没了，而"面板上的数字能与验收脚本对得上"这件事必须可复现。
+#
+# Prometheus 的地址用容器名 `prometheus`：两者在同一个 compose 网络里，
+# 不需要经过宿主机。
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    # 固定 uid：面板 JSON 里用 uid 引用数据源，否则导入到新环境时会找不到数据源。
+    uid: rgbt-prometheus
+    isDefault: true
+    jsonData:
+      # 抓取间隔与 prometheus.yml 保持一致，让面板的 $__rate_interval 更准。
+      timeInterval: 5s
+      # 不开启 exemplars：本项目没有接 trace 后端（TASK-021 才做）。
+      httpMethod: POST
+    editable: false

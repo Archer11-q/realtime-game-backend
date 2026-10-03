@@ -41,6 +41,16 @@ mkdir -p "$run_dir"
 #   bash scripts/verify-observability.sh --logs | --metrics
 all_scripts=(verify verify-login verify-match verify-room verify-stream verify-web verify-persistence verify-observability)
 
+# 每个脚本的运行参数（TASK-020）。
+#
+# verify-observability 显式传 `--logs --metrics` 而**不传 `--scrape`**：
+# scrape 要求监控栈已经在跑（bash scripts/observability-up.sh），把它塞进默认的
+# verify-all 会让"没起监控栈"变成整个套件的失败。要验抓取时单独跑：
+#   bash scripts/observability-up.sh && bash scripts/verify-observability.sh --scrape
+declare -A script_args=(
+  [verify-observability]="--logs --metrics"
+)
+
 fail_fast=0
 only=""
 for arg in "$@"; do
@@ -95,7 +105,9 @@ for name in "${scripts[@]}"; do
   echo "########## scripts/$name.sh ##########"
   start=$(date +%s)
   # 不用管道接 tail：$(...) 捕获会丢掉退出码，且管道会让 PIPESTATUS 变复杂。
-  bash "scripts/$name.sh" >"$log" 2>&1
+  # 每个脚本可以带参数（见下面的 script_args）。
+  # shellcheck disable=SC2086
+  bash "scripts/$name.sh" ${script_args[$name]:-} >"$log" 2>&1
   rc=$?
   end=$(date +%s)
   elapsed=$((end - start))

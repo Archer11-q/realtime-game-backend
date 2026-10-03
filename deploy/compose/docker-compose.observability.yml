@@ -1,0 +1,95 @@
+# 可观测性栈：Prometheus + Grafana（TASK-020）
+#
+# **独立文件，不并入 docker-compose.yml**：业务依赖（Redis/MySQL）是"跑服务必须有的"，
+# 而监控栈是"看服务用的"。混在一起会让 `docker compose up` 顺带拉起两个几百 MB 的
+# 容器，也让只想跑测试的人被迫等监控起来。任务单把这一点列为明确非范围。
+#
+# 用法（在仓库根目录）：
+#   bash scripts/observability-up.sh      # 起监控栈，并打印面板地址
+#   bash scripts/observability-down.sh    # 停监控栈（保留数据卷）
+#
+# 网络：Prometheus 在容器里，被监控的三个服务在**宿主机（WSL 发行版）**上。
+# 这里用 `host.docker.internal` 并在容器内把它映射到宿主机网关。
+# 为什么不用固定 IP：实测（2026-10-03）在 WSL + Docker Desktop 下
+#   * `172.17.0.1`（默认 bridge 网关）不通；
+#   * 发行版 eth0 地址（如 172.28.x.x）能通，但每次重启会变，不能写进静态配置；
+#   * `192.168.65.254`（Docker Desktop VM 网关）能通，但它是实现细节；
+#   * `host.docker.internal` + `host-gateway` 可用，且由 Docker 负责解析，
+#     因此是这里的选择。注意它在本机只解析到 IPv6（fdc4:...::254），
+#     curl 的默认解析会失败，但 Prometheus 抓取正常（实测 up=1）。
+
+# 注意卷路径的基准：compose 的**相对路径相对本文件所在目录**（deploy/compose/），
+# 因此观测栈的配置要写 `../observability/...`。写成 `./observability/...` 会解析到
+# deploy/compose/observability/（不存在），报错是 "mount ... not a directory"，
+# 完全看不出是路径基准问题（实测踩到）。
+
+name: realtime-game-backend-observability
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: rgbt-prometheus
+    restart: unless-stopped
+    # 只绑到本机：Prometheus 的查询接口没有任何鉴权，不该暴露到局域网。
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    # 让容器能解析到宿主机。Linux 上 host-gateway 由 Docker 提供。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 挂载**目录**而不是单个文件：Docker Desktop + WSL 下把宿主的普通文件
+      # bind mount 进容器会失败（报错 "not a directory"，看不出根因）。挂目录可行
+      # ——业务 compose 挂载 ../../migrations 就是同一做法。因此下面的
+      # --config.file 指向目录内的文件名。
+      - ../observability/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 保留 6 小时就够：这是本地演示环境（任务单明确不做长期存储与远程写）。
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    healthcheck:
+      # `/-/healthy` 是 Prometheus 自带的存活探测，不依赖任何业务指标。
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9090/-/healthy"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: rgbt-grafana
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    environment:
+      # 匿名只读访问：本地面板不需要登录，但**不允许改任何东西**。
+      # 这样"打开浏览器就能看"与"不会被误改"同时成立。
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # 关掉版本检查与更新提示：本地环境不需要外网依赖。
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      # 数据源在 provisioning 里定义（见 grafana/provisioning/datasources/）。
+    volumes:
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      # 只表达启动顺序，不等健康：Grafana 起得比 Prometheus 慢也没关系，
+      # 数据源是 provisioning 时建立的，不依赖 Prometheus 当场可达。
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+volumes:
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local

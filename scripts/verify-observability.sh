@@ -5,6 +5,7 @@
 #   bash scripts/verify-observability.sh            # 日志 + 指标
 #   bash scripts/verify-observability.sh --logs      # 只验结构化日志（TASK-018）
 #   bash scripts/verify-observability.sh --metrics   # 只验 /metrics 指标（TASK-019）
+#   bash scripts/verify-observability.sh --scrape    # 只验 Prometheus 抓取与面板口径（TASK-020）
 #
 # 两个模式合在一起的理由：它们共用"起三个服务 + 跑一次真实对局"这段代价最高的
 # 准备，分开跑要各起一遍。
@@ -27,15 +28,18 @@ keep_running=0
 manage_docker=1
 run_logs=1
 run_metrics=1
+run_scrape=1
 
 if [ "$#" -gt 0 ]; then
   run_logs=0
   run_metrics=0
+  run_scrape=0
 fi
 for arg in "$@"; do
   case "$arg" in
     --logs) run_logs=1 ;;
     --metrics) run_metrics=1 ;;
+    --scrape) run_scrape=1 ;;
     --keep) keep_running=1 ;;
     --no-docker) manage_docker=0 ;;
     -h | --help)
@@ -490,6 +494,172 @@ if [ "$run_metrics" -eq 1 ]; then
   fi
 fi
 
+
+if [ "$run_scrape" -eq 1 ]; then
+  # =========================================================================
+  echo
+  echo "===== 5b. Prometheus 抓取与面板口径（TASK-020） ====="
+
+  : "${PROMETHEUS_PORT:=9090}"
+  prom="http://127.0.0.1:${PROMETHEUS_PORT}"
+
+  # 5b-0. Prometheus 本身要活着。它不在时后面每条断言都会失败，
+  #       先单独报出来，避免把"监控栈没起"误判成"抓取配置写错"。
+  if curl -s -o /dev/null --max-time 3 "$prom/-/ready"; then
+    ok "Prometheus 可访问（$prom）"
+  else
+    fail "Prometheus 不可访问（$prom）——先执行 bash scripts/observability-up.sh"
+  fi
+
+  # 5b-1. 三个 target 必须都 up。这是容器能否访问宿主服务的**唯一判据**：
+  #       容器 healthy、Grafana 打得开，都不代表抓得到。
+  sleep 6
+  up_total=$(curl -s --max-time 5 "$prom/api/v1/targets" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print(-1)
+    sys.exit(0)
+targets = data.get("data", {}).get("activeTargets", [])
+rgbt = [t for t in targets if str(t.get("labels", {}).get("job", "")).startswith("rgbt-")]
+print(sum(1 for t in rgbt if t.get("health") == "up"))
+' 2>/dev/null)
+  if [ "${up_total:-0}" = "3" ]; then
+    ok "Prometheus 的 3 个 rgbt target 全部 up"
+  else
+    fail "Prometheus 的 rgbt target 只有 ${up_total:-0} 个 up（应为 3）"
+    curl -s --max-time 5 "$prom/api/v1/targets" 2>/dev/null | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+for t in data.get("data", {}).get("activeTargets", []):
+    job = t.get("labels", {}).get("job", "")
+    if job.startswith("rgbt-"):
+        print("      %s: %s %s" % (job, t.get("health"), t.get("lastError", "")))
+' 2>/dev/null || true
+  fi
+
+  # 5b-2. **面板口径核对**：Prometheus 存下来的数值必须与端点导出的数值一致。
+  #       只断言"target up"不够——up 只说明 HTTP 通了，不说明数据被正确解析。
+  #       做法：同一个指标分别从"端点"与"Prometheus"取，比较是否相等。
+  prom_value() {
+    # $1=PromQL 查询
+    curl -s --max-time 5 --data-urlencode "query=$1" "$prom/api/v1/query" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("MISSING")
+    sys.exit(0)
+result = data.get("data", {}).get("result", [])
+print(result[0]["value"][1] if result else "MISSING")
+' 2>/dev/null
+  }
+
+  # 取对局正在推进时的一个真实数字：帧推进累计量。
+  # 先制造一点流量，保证对局在走。
+  http_post /api/v1/matches/current "{\"token\":\"$alice\",\"request_id\":\"obs-scrape\"}" >/dev/null
+  sleep 8
+
+  # **不能**用"端点与 Prometheus 的瞬时值相等"来证明一致：Prometheus 只在抓取
+  # 时刻取新值，最多滞后一个 scrape_interval（5 秒）；而帧推进约 20 帧/秒，
+  # 正常滞后就有约 100 帧。实测曾因此把正确状态判成"差距过大（1322 vs 1206）"。
+  #
+  # 这里改用两条能被数据证实的判据：
+  #   1. Prometheus 里的值**在增长**（隔几秒采样两次）——直接证明数据在持续入库，
+  #      比"相等"更强：它排除了"只抓了一次然后僵住"；
+  #   2. Prometheus 的值落在 [端点首次采样值, 端点当前值] 这个单调区间内。
+  curl -s --max-time 5 "http://127.0.0.1:$room_port/metrics" >"$log_dir/room.scrape.metrics"
+  endpoint_frames_first=$(metric_value "$log_dir/room.scrape.metrics" 'rgbt_room_frames_advanced_total')
+  prom_frames_first=$(prom_value 'rgbt_room_frames_advanced_total{job="rgbt-room"}')
+
+  sleep 8
+  curl -s --max-time 5 "http://127.0.0.1:$room_port/metrics" >"$log_dir/room.scrape2.metrics"
+  endpoint_frames_last=$(metric_value "$log_dir/room.scrape2.metrics" 'rgbt_room_frames_advanced_total')
+  prom_frames_last=$(prom_value 'rgbt_room_frames_advanced_total{job="rgbt-room"}')
+
+  echo "  帧推进：端点 $endpoint_frames_first -> $endpoint_frames_last"
+  echo "          Prometheus $prom_frames_first -> $prom_frames_last"
+
+  if [ "$prom_frames_first" = "MISSING" ] || [ "$prom_frames_last" = "MISSING" ]; then
+    fail "Prometheus 里查不到 rgbt_room_frames_advanced_total（抓到了但没入库？）"
+  elif [ "$endpoint_frames_first" = "MISSING" ]; then
+    fail "端点没有导出 rgbt_room_frames_advanced_total"
+  elif [ "$prom_frames_last" -gt "$prom_frames_first" ]; then
+    ok "Prometheus 里的帧推进在增长（$prom_frames_first -> $prom_frames_last），数据在持续入库"
+    # 区间关系：Prometheus 的值不应超过端点当前值（不可能比源头更新），
+    # 也不应低于端点首次采样值太多（低于说明丢了数据）。
+    if [ "$prom_frames_last" -le "$endpoint_frames_last" ] &&
+      [ "$prom_frames_last" -ge "$endpoint_frames_first" ]; then
+      ok "面板口径与端点一致（在 [$endpoint_frames_first, $endpoint_frames_last] 区间内）"
+    else
+      fail "Prometheus 的帧推进 $prom_frames_last 落在端点区间 [$endpoint_frames_first, $endpoint_frames_last] 之外"
+    fi
+  else
+    fail "Prometheus 里的帧推进没有增长（$prom_frames_first -> $prom_frames_last）"
+  fi
+
+  # 5b-3. 关键计数在 Prometheus 里必须存在。逐项点名，避免"有一个指标就通过"。
+  for spec in \
+    'rgbt_http_requests_total|Gateway HTTP 请求计数' \
+    'rgbt_rpc_calls_total|服务间 brpc 调用计数' \
+    'rgbt_match_queue_length|匹配队列长度' \
+    'rgbt_rooms|房间数（按阶段）' \
+    'rgbt_snapshot_write_total|快照写入计数' \
+    'rgbt_sse_connections|SSE 连接数'; do
+    metric="${spec%%|*}"
+    label="${spec#*|}"
+    series=$(curl -s --max-time 5 --data-urlencode "match[]={__name__=\"$metric\"}" \
+      "$prom/api/v1/series" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print(-1)
+    sys.exit(0)
+print(len(data.get("data", [])))
+' 2>/dev/null)
+    if [ "${series:-0}" -ge 1 ]; then
+      ok "$label 在 Prometheus 里有 ${series} 条时间序列"
+    else
+      fail "$label（$metric）在 Prometheus 里查不到"
+    fi
+  done
+
+  # 5b-4. Grafana 必须可访问且面板已 provisioning。
+  : "${GRAFANA_PORT:=3000}"
+  grafana="http://127.0.0.1:${GRAFANA_PORT}"
+  health=$(curl -s --max-time 5 "$grafana/api/health" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("database", "unknown"))
+except Exception:
+    print("unreachable")
+' 2>/dev/null)
+  if [ "$health" = "ok" ]; then
+    ok "Grafana 可访问且数据库正常（$grafana）"
+  else
+    fail "Grafana 不可访问或未就绪（$grafana，database=$health）"
+  fi
+
+  # 面板通过 provisioning 加载：用 API 确认它真的在，而不是只确认容器起来了。
+  # 匿名只读角色可以读 /api/search。
+  dash=$(curl -s --max-time 5 "$grafana/api/search?query=Realtime" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("PARSE_FAIL")
+    sys.exit(0)
+print(len([d for d in data if d.get("type") == "dash-db"]))
+' 2>/dev/null)
+  if [ "${dash:-0}" -ge 1 ]; then
+    ok "Grafana 已加载 ${dash} 块面板"
+  else
+    fail "Grafana 里没找到已加载的面板（provisioning 未生效）"
+  fi
+fi
+
 # ===========================================================================
 echo
 echo "===== 6. 优雅退出 ====="
@@ -574,6 +744,10 @@ if [ "${#failures[@]}" -eq 0 ]; then
   if [ "$run_logs" -eq 1 ]; then
     echo "  [TASK-018] 三个服务的结构化日志都带 service= 且未被字段值断行；"
     echo "          同一 request_id 在 Gateway 与 Room 之间贯通（含订阅拒绝路径）"
+  fi
+  if [ "$run_scrape" -eq 1 ]; then
+    echo "  [TASK-020] Prometheus 的 3 个 target 全部 up；关键指标在 Prometheus 里可查；"
+    echo "          帧推进的面板口径与 /metrics 端点一致；Grafana 已加载面板"
   fi
   if [ "$run_metrics" -eq 1 ]; then
     echo "  [TASK-019] 三个服务的 /metrics 都返回 text/plain 且样本带 TYPE；"
