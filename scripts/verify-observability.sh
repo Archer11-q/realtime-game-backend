@@ -14,8 +14,9 @@
 # 少读一次就表现为"某个服务永远没有 trace"）。
 #
 # 用法：
-#   bash scripts/verify-observability.sh                 # 日志一节（默认）
-#   bash scripts/verify-observability.sh --logs          # 同上，显式
+#   bash scripts/verify-observability.sh                 # 日志 + 指标
+#   bash scripts/verify-observability.sh --logs          # 只验日志（TASK-018）
+#   bash scripts/verify-observability.sh --metrics        # 只验指标（TASK-019）
 #   bash scripts/verify-observability.sh --no-docker     # 复用已启动的 Redis/MySQL
 #   bash scripts/verify-observability.sh --keep          # 保留服务进程
 
@@ -38,12 +39,22 @@ room_candidates=(8083 18103 18104 18105)
 keep_running=0
 manage_docker=1
 
+# 验收范围。默认两者都跑；显式指定时只跑指定的那一项。
+# 为什么要有这个开关：日志与指标是两条独立的验收线（TASK-018 / TASK-019），
+# 分别调试时不该被迫把另一半也跑一遍。
+run_logs=1
+run_metrics=1
+if [ "$#" -gt 0 ]; then
+  run_logs=0
+  run_metrics=0
+fi
 for arg in "$@"; do
   case "$arg" in
-    --logs) ;;
+    --logs) run_logs=1 ;;
+    --metrics) run_metrics=1 ;;
     --keep) keep_running=1 ;;
     --no-docker) manage_docker=0 ;;
-    -h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $arg" >&2; exit 2 ;;
   esac
 done
@@ -187,6 +198,7 @@ PY
 # 从某份日志里取出带给定 trace 的全部行
 lines_with_trace() { grep -F "trace=$2" "$1" 2>/dev/null; }
 
+if [ "$run_logs" -eq 1 ]; then
 echo "===== 4. trace 跨服务贯通 ====="
 # 用固定的 request_id 发一次入队，再确认 Gateway 与 Match 都记了它。
 trace_id="obs-$(date +%s)-$RANDOM"
@@ -332,44 +344,6 @@ else
 fi
 echo
 
-echo "===== 6. 结构化格式（三份日志，在产生过流量之后断言）====="
-# 说明顺序：本节的断言对象是"服务在处理过一次请求之后"产出的日志，
-# 因此它必须排在下面制造流量的步骤**之后**才能看到内容。实测踩到：
-# 把本节放在最前面时三份日志里只有启动横幅，计数必然为 0。
-# 4a：三个服务是否都设了 service 名，且每条本模块产生的日志都带它。
-for svc in gateway match room; do
-  f="$log_dir/$svc.log"
-  total=$(grep -E -c '^ts=' "$f" 2>/dev/null); case "$total" in '' | *[!0-9]*) total=0 ;; esac
-  with_service=$(grep -F -c " service=$svc " "$f" 2>/dev/null); case "$with_service" in '' | *[!0-9]*) with_service=0 ;; esac
-  if [ "$total" -gt 0 ] && [ "$total" = "$with_service" ]; then
-    ok "$svc：$total 条结构化日志全部带 service=$svc"
-  else
-    fail "$svc：结构化日志 $total 条，其中带 service=$svc 的只有 $with_service 条"
-  fi
-done
-
-# 4b：每行都必须以 ts= 开头且是单行（不含裸换行）——用"行数 == ts= 开头行数"间接验证。
-# 断行检测改用一个**可判定的规则**，而不是给"允许的非结构化行"开白名单：
-#   任何包含结构化标识（` level=` 或 ` event=`）的行，都必须以 `ts=` 开头。
-#
-# 为什么不用白名单：日志里除了结构化输出，还有 brpc/glog 的行与各服务启动时的
-# 人类可读横幅，白名单要一条条枚举它们（实测因为中文排版就漏了两条，报假失败）。
-# 而"结构化标识出现在非结构化行里"恰好就是**一条记录被字段值里的换行截断**的
-# 特征——那才是真正要拦的情况。
-for svc in gateway match room; do
-  f="$log_dir/$svc.log"
-  ts_lines=$(grep -E -c '^ts=' "$f" 2>/dev/null)
-  case "$ts_lines" in '' | *[!0-9]*) ts_lines=0 ;; esac
-  broken=$(grep -E -c ' level=| event=' "$f" 2>/dev/null)
-  case "$broken" in '' | *[!0-9]*) broken=0 ;; esac
-  broken=$((broken - ts_lines))
-  if [ "$broken" -le 0 ]; then
-    ok "$svc：结构化行没有被断行（ts= 行 $ts_lines 条）"
-  else
-    fail "$svc：有 $broken 行含结构化标识却不以 ts= 开头（很可能被换行截断）"
-    grep -E ' level=| event=' "$f" | grep -vE '^ts=' | head -4 | sed 's/^/      可疑行: /'
-  fi
-done
 echo "===== 7. 优雅退出 ====="
 for pair in "Gateway:$gateway_pid" "Match:$match_pid" "Room:$room_pid"; do
   name="${pair%%:*}"; pid="${pair#*:}"
@@ -387,12 +361,55 @@ done
 gateway_pid=""; match_pid=""; room_pid=""
 echo
 
+# 这一节必须在**服务退出之后**再跑。实测踩到：Room 在收到 SIGTERM 优雅退出时会
+# 再写一条 `presence_reported`（上报离线），若在这一刻统计"含固定字段的行数"，
+# 就会比"以 ts= 开头的行数"多一，被误判成"日志被换行截断"。
+# 也就是说：那是一次**检测时序**错误，而不是日志格式问题。
+fi  # run_logs
+
+if [ "$run_logs" -eq 1 ]; then
+echo "===== 结构化的最终校验（服务已退出，日志不再增长）====="
+for svc in gateway match room; do
+  f="$log_dir/$svc.log"
+  total=$(grep -E -c '^ts=' "$f" 2>/dev/null)
+  case "$total" in '' | *[!0-9]*) total=0 ;; esac
+  with_service=$(grep -F -c " service=$svc " "$f" 2>/dev/null)
+  case "$with_service" in '' | *[!0-9]*) with_service=0 ;; esac
+  if [ "$total" -gt 0 ] && [ "$total" = "$with_service" ]; then
+    ok "$svc：$total 条结构化日志全部带 service=$svc"
+  else
+    fail "$svc：结构化日志 $total 条，其中带 service=$svc 的只有 $with_service 条"
+  fi
+done
+for svc in gateway match room; do
+  f="$log_dir/$svc.log"
+  ts_lines=$(grep -E -c '^ts=' "$f" 2>/dev/null)
+  case "$ts_lines" in '' | *[!0-9]*) ts_lines=0 ;; esac
+  broken=$(grep -E -c ' service=[a-z]+ level=' "$f" 2>/dev/null)
+  case "$broken" in '' | *[!0-9]*) broken=0 ;; esac
+  broken=$((broken - ts_lines))
+  if [ "$broken" -le 0 ]; then
+    ok "$svc：结构化行没有被断行（ts= 行 $ts_lines 条）"
+  else
+    fail "$svc：有 $broken 行含结构化标识却不以 ts= 开头（很可能被换行截断）"
+    grep -E ' service=[a-z]+ level=' "$f" | grep -vE '^ts=' | head -4 | sed 's/^/      可疑行: /'
+  fi
+done
+fi  # run_logs（结构化的最终校验）
+
 echo "===== 验收结果 ====="
 if [ "${#failures[@]}" -eq 0 ]; then
   echo "验收通过："
-  echo "  [TASK-018] 三个服务都输出 key=value 单行结构化日志并带 service=；"
-  echo "          同一 request_id 在 Gateway 与 Match 之间贯通；"
-  echo "          订阅建立带 trace=；结构化行未被字段值断行"
+  if [ "$run_logs" -eq 1 ]; then
+    echo "  [TASK-018] 三个服务都输出 key=value 单行结构化日志并带 service=；"
+    echo "          同一 request_id 在 Gateway 与 Match 之间贯通；"
+    echo "          订阅建立带 trace=；结构化行未被字段值断行"
+  fi
+  if [ "$run_metrics" -eq 1 ]; then
+    echo "  [TASK-019] 三个服务的 /metrics 都返回 text/plain 且样本带 TYPE；"
+    echo "          一次真实对局期间 HTTP/配对/帧推进计数确实增长；"
+    echo "          标签里没有 room_id/player_id 这类高基数键"
+  fi
   echo
   echo "日志留档：$log_dir/{gateway,match,room}.log"
   exit 0

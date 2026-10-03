@@ -311,6 +311,35 @@ GatewayServiceImpl::GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* 
       stream_(stream),
       session_ttl_seconds_(session_ttl_seconds > 0 ? session_ttl_seconds
                                                    : kDefaultSessionTtlSeconds) {
+    // TASK-019：SSE 相关指标。全部用**回调式 gauge** 读 StreamHub 已有的累计量
+    // （理由见本文件顶部关于"单一真相来源"的说明）。
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricSseConnections, "当前 SSE 连接数", [this]() -> std::uint64_t {
+            return stream_ == nullptr ? 0 : static_cast<std::uint64_t>(stream_->ConnectionCount());
+        });
+
+    // 名字里不带 `_total`：它按惯例表示 counter，而这里读的是别人维护的累计量，
+    // 类型上仍声明为 gauge。宁可名字朴素，也不制造第二份计数。
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricPushBackfilledFrames, "累计补发出去的推送帧数",
+        [this]() -> std::uint64_t {
+            return stream_ == nullptr ? 0
+                                      : static_cast<std::uint64_t>(stream_->BackfilledFrameCount());
+        });
+
+    // 每个 reason 都登记（即使从未发生）：否则"这个原因还没出现过"在面板上表现为
+    // "这条曲线不存在"，无法与"指标坏了"区分。
+    for (const char* reason : {"id_malformed", "id_ahead", "id_out_of_window", "id_current"}) {
+        rgbt::common::Metrics().Gauge(
+            rgbt::common::kMetricPushResetTotal, "累计发出 stream.reset 的次数，按原因分组",
+            [this, reason]() -> std::uint64_t {
+                return stream_ == nullptr
+                           ? 0
+                           : static_cast<std::uint64_t>(stream_->ResetEventCount(reason));
+            },
+            {{"reason", reason}});
+    }
+
     // TASK-019：构造完成后才开始记账。登记表是进程级的，句柄在首次使用时解析，
     // 这里只是把"可以记账了"这个事实记下来。
     metrics_ready_ = true;

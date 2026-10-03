@@ -165,8 +165,12 @@ inline constexpr const char* kMetricHttpRequestSeconds = "rgbt_http_request_seco
 /// 当前 SSE 连接数（gauge）。
 inline constexpr const char* kMetricSseConnections = "rgbt_sse_connections";
 
-/// 推送补发出去的帧总数。
-inline constexpr const char* kMetricPushBackfilledFramesTotal = "rgbt_push_backfilled_frames_total";
+/// 累计补发出去的推送帧数。
+///
+/// 名字里**没有** `_total`：Prometheus 的惯例是 `_total` 表示 counter，而本进程
+/// 读的是 StreamHub 维护的累计量、类型上仍声明为 gauge。宁可名字朴素，也不为了
+/// 命名惯例去制造第二份计数（见 gateway_service.cpp 里的说明）。
+inline constexpr const char* kMetricPushBackfilledFrames = "rgbt_push_backfilled_frames";
 
 /// `stream.reset` 次数。标签：`reason`（稳定标识）。
 inline constexpr const char* kMetricPushResetTotal = "rgbt_push_reset_total";
