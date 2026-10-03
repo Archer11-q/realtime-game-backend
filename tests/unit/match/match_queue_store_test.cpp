@@ -40,8 +40,8 @@ public:
     /// 分配期间要执行的动作（用于在"分配中"这一瞬间观察队列状态）。
     std::function<void()> on_allocate;
 
-    std::string Allocate(std::string_view match_id,
-                         const std::vector<std::string>& /*player_ids*/) override {
+    std::string Allocate(std::string_view match_id, const std::vector<std::string>& /*player_ids*/,
+                         std::string_view /*request_id*/) override {
         if (on_allocate) {
             on_allocate();
         }

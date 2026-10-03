@@ -248,6 +248,61 @@ std::string MatchStateName(MatchState state) {
 
 }  // namespace
 
+/// TASK-021：HTTP 状态码 -> 日志级别。
+///
+/// 为什么按状态码分级而不是一律 `info`：trace 的用途是"顺着一条链把一次请求看
+/// 完"，而 `grep 'level=error'` 是最常用的第一刀。全记成 info 会让这一刀失效
+/// ——4xx/5xx 混在几百条成功行里，等于把"出问题了"这件事藏起来。
+rgbt::common::LogLevel LogLevelForStatus(std::int32_t status_code) {
+    if (status_code >= 500) {
+        return rgbt::common::LogLevel::kError;
+    }
+    if (status_code >= 400) {
+        return rgbt::common::LogLevel::kWarn;
+    }
+    return rgbt::common::LogLevel::kInfo;
+}
+
+/// TASK-021：把 restful 路径映射成稳定的操作名（`op=` 字段）。
+///
+/// **为什么要有 op，而不只记 `path=`**：`path` 是**接口路径**，`op` 是**动作名**。
+/// 排障时的问法是"这次登录为什么失败"，而不是"这个 URI 为什么失败"；动作名也是
+/// 唯一能在三个服务的日志之间对齐的粒度（Room 记的是 `room_joined`，
+/// 与 Gateway 的 `op=join_room` 指的是同一次调用）。
+///
+/// 取值与 `gateway_main.cpp` 的 `restful_mappings` **一一对应**，那张表是本仓库
+/// 路径的唯一真相来源；这里是它的只读视图。因此新增接口时必须同时加两处——
+/// 与 TASK-019 的路径标签是同一个约束。写错的后果是 `op=unknown`（而不是崩溃
+/// 或一条假的操作名），因此它是可发现的、不会误导。
+///
+/// 找不到就返回 `unknown`：**不编造**一个看起来合理的名字。`unknown` 本身
+/// 就是"这里漏了一个映射"的信号。
+const char* OperationForPath(std::string_view path) {
+    struct Mapping {
+        std::string_view path;
+        const char* op;
+    };
+    static constexpr Mapping kMappings[] = {
+        {"/api/v1/login", "login"},
+        {"/api/v1/players/me", "get_current_player"},
+        {"/api/v1/logout", "logout"},
+        {"/api/v1/matches", "enqueue_match"},
+        {"/api/v1/matches/current", "get_match_status"},
+        {"/api/v1/matches/current/cancel", "cancel_match"},
+        {"/api/v1/rooms/join", "join_room"},
+        {"/api/v1/rooms/input", "submit_input"},
+        {"/api/v1/rooms/state", "get_room_state"},
+        {"/api/v1/results", "get_match_result"},
+        {"/api/v1/stream", "stream_events"},
+    };
+    for (const Mapping& mapping : kMappings) {
+        if (mapping.path == path) {
+            return mapping.op;
+        }
+    }
+    return "unknown";
+}
+
 /// TASK-019：把一次 HTTP 请求记到指标上。
 ///
 /// 路径标签取 **restful 映射里的模板路径**（`/api/v1/matches`、`/api/v1/rooms/state`…），
@@ -294,11 +349,43 @@ void GatewayServiceImpl::RecordHttpRequest(::google::protobuf::RpcController* co
     handle.Add();
 }
 
-/// TASK-019：设置状态码并记账。所有处理函数都走这里。
+/// TASK-021：每个 HTTP 请求结束时留一条可按 trace 检索的记录。
+///
+/// **为什么放在收敛点而不是每个处理函数里**：`ApplyHttpStatusAndRecord` 是
+/// Gateway 所有 HTTP 响应（含成功路径）的唯一出口，放在这里"漏记"就不可能发生。
+/// 此前 15 个接口里只有 2 个有结构化日志——登录、进房、结算三条关键路径在
+/// Gateway 侧一条可检索记录都没有，"按 trace 取出一条完整调用序"因此做不到。
+///
+/// 无 HTTP 上下文时（单元测试直接调用服务）读不到路径，此时记 `op=unknown`：
+/// 仍然留痕，只是没有路径可推导。这不是错误路径，不需要特殊处理。
+///
+/// 显式构造 `LogRecord` 而不是用 `LogInfo(...)` 便捷入口：级别由状态码决定，
+/// 便捷入口是按级别的三个函数，这里不想把同一个调用点复制三份。
+void GatewayServiceImpl::RecordRequestDone(::google::protobuf::RpcController* controller,
+                                           std::int32_t status_code,
+                                           const std::string& request_id) noexcept {
+    std::string op = "unknown";
+    if (const auto* cntl = static_cast<const brpc::Controller*>(controller);
+        cntl != nullptr && cntl->has_http_request()) {
+        op = OperationForPath(cntl->http_request().uri().path());
+    }
+
+    rgbt::common::LogRecord record;
+    record.trace_id = request_id;
+    record.level = LogLevelForStatus(status_code);
+    record.event = "request_done";
+    record.fields = {{"op", op}, {"status", std::to_string(status_code)}};
+    rgbt::common::Log(record);
+}
+
+/// TASK-019 + TASK-021：设置状态码、记账、并留一条 `request_done`。
+/// 所有处理函数都走这里，因此这三件事都不会被漏掉。
 void GatewayServiceImpl::ApplyHttpStatusAndRecord(::google::protobuf::RpcController* controller,
-                                                  std::int32_t status_code) {
+                                                  std::int32_t status_code,
+                                                  const std::string& request_id) {
     ApplyHttpStatus(controller, status_code);
     RecordHttpRequest(controller, status_code);
+    RecordRequestDone(controller, status_code, request_id);
 }
 
 GatewayServiceImpl::GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* players,
@@ -373,7 +460,7 @@ void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, input_error,
                       "登录请求参数不合法", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -385,14 +472,14 @@ void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAUTHENTICATED,
                                               "invalid_credential", "账号或密码不正确", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
     if (credential == CredentialStatus::kAccountDisabled) {
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAUTHENTICATED,
                                               "account_disabled", "账号已被禁用", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
     if (credential == CredentialStatus::kUnavailable) {
@@ -402,7 +489,7 @@ void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::UNAVAILABLE, "player_store_unavailable",
                       "玩家档案暂时不可用，请稍后重试", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -417,12 +504,12 @@ void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                       "session_store_unavailable", "会话存储暂时不可用，请稍后重试", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200);
+    ApplyHttpStatusAndRecord(controller, 200, request_id);
     response->set_token(token);
     response->set_expires_in_seconds(session_ttl_seconds_);
     *response->mutable_player() = player;
@@ -448,7 +535,7 @@ void GatewayServiceImpl::GetCurrentPlayer(::google::protobuf::RpcController* con
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth);
+        ApplyHttpStatusAndRecord(controller, auth, request_id);
         return;
     }
 
@@ -458,12 +545,12 @@ void GatewayServiceImpl::GetCurrentPlayer(::google::protobuf::RpcController* con
             FillError(response->mutable_error(), ErrorCode::NOT_FOUND, "player_not_found",
                       "会话对应的玩家不存在", request_id);
         response->set_status_code(http_status);
-        ApplyHttpStatusAndRecord(controller, http_status);
+        ApplyHttpStatusAndRecord(controller, http_status, request_id);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200);
+    ApplyHttpStatusAndRecord(controller, 200, request_id);
     *response->mutable_player() = player.value();
 }
 
@@ -483,7 +570,7 @@ void GatewayServiceImpl::Logout(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, token_error,
                       "Token 缺失或格式不合法", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -493,13 +580,13 @@ void GatewayServiceImpl::Logout(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                       "session_store_unavailable", "会话存储暂时不可用，请稍后重试", request_id);
         response->set_status_code(http_status);
-        ApplyHttpStatusAndRecord(controller, http_status);
+        ApplyHttpStatusAndRecord(controller, http_status, request_id);
         return;
     }
 
     // 会话本就不存在时也返回成功：登出是幂等操作，重复登出不应报错。
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200);
+    ApplyHttpStatusAndRecord(controller, 200, request_id);
 }
 
 std::int32_t GatewayServiceImpl::ResolvePlayerId(const std::string& token,
@@ -678,7 +765,7 @@ void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* control
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth);
+        ApplyHttpStatusAndRecord(controller, auth, request_id);
         return;
     }
 
@@ -694,7 +781,7 @@ void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* control
                                {"http_status", std::to_string(status)}});
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -708,7 +795,7 @@ void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* control
                            {"room_id", snapshot.room_id}});
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200);
+    ApplyHttpStatusAndRecord(controller, 200, request_id);
     FillMatchStatus(snapshot, response->mutable_match());
 }
 
@@ -727,7 +814,7 @@ void GatewayServiceImpl::GetMatchStatus(::google::protobuf::RpcController* contr
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth);
+        ApplyHttpStatusAndRecord(controller, auth, request_id);
         return;
     }
 
@@ -737,12 +824,12 @@ void GatewayServiceImpl::GetMatchStatus(::google::protobuf::RpcController* contr
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200);
+    ApplyHttpStatusAndRecord(controller, 200, request_id);
     FillMatchStatus(snapshot, response->mutable_match());
 }
 
@@ -761,7 +848,7 @@ void GatewayServiceImpl::CancelMatch(::google::protobuf::RpcController* controll
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth);
+        ApplyHttpStatusAndRecord(controller, auth, request_id);
         return;
     }
 
@@ -772,12 +859,12 @@ void GatewayServiceImpl::CancelMatch(::google::protobuf::RpcController* controll
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200);
+    ApplyHttpStatusAndRecord(controller, 200, request_id);
     FillMatchStatus(snapshot, response->mutable_match());
 }
 
@@ -797,7 +884,7 @@ void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth);
+        ApplyHttpStatusAndRecord(controller, auth, request_id);
         return;
     }
 
@@ -806,7 +893,7 @@ void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
                       "缺少 room_id", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -814,7 +901,7 @@ void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "room_unavailable", "房间服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -824,12 +911,12 @@ void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200);
+    ApplyHttpStatusAndRecord(controller, 200, request_id);
     FillRoomState(snapshot, response->mutable_room());
 }
 
@@ -849,7 +936,7 @@ void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controll
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth);
+        ApplyHttpStatusAndRecord(controller, auth, request_id);
         return;
     }
 
@@ -858,7 +945,7 @@ void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controll
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
                       "缺少 room_id", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -866,7 +953,7 @@ void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controll
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "room_unavailable", "房间服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -878,12 +965,12 @@ void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controll
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200);
+    ApplyHttpStatusAndRecord(controller, 200, request_id);
     FillRoomState(snapshot, response->mutable_room());
 }
 
@@ -903,7 +990,7 @@ void GatewayServiceImpl::GetRoomState(::google::protobuf::RpcController* control
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth);
+        ApplyHttpStatusAndRecord(controller, auth, request_id);
         return;
     }
     // 这里只校验身份，不使用 player_id：房间快照对同局玩家是共享信息，
@@ -915,7 +1002,7 @@ void GatewayServiceImpl::GetRoomState(::google::protobuf::RpcController* control
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
                       "缺少 room_id", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -923,7 +1010,7 @@ void GatewayServiceImpl::GetRoomState(::google::protobuf::RpcController* control
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "room_unavailable", "房间服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -933,12 +1020,12 @@ void GatewayServiceImpl::GetRoomState(::google::protobuf::RpcController* control
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200);
+    ApplyHttpStatusAndRecord(controller, 200, request_id);
     FillRoomState(snapshot, response->mutable_room());
 }
 
@@ -958,7 +1045,7 @@ void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* contr
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth);
+        ApplyHttpStatusAndRecord(controller, auth, request_id);
         return;
     }
     (void)player_id;
@@ -968,7 +1055,7 @@ void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* contr
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "match_id_required",
                       "缺少 match_id", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -976,7 +1063,7 @@ void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* contr
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "room_unavailable", "房间服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -992,12 +1079,12 @@ void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* contr
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200);
+    ApplyHttpStatusAndRecord(controller, 200, request_id);
     if (view.has_result) {
         rgbt::gateway::v1::MatchResultInfo* result = response->mutable_result();
         result->set_match_id(view.result.match_id);
@@ -1030,7 +1117,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth);
+        ApplyHttpStatusAndRecord(controller, auth, request_id);
         return;
     }
 
@@ -1039,7 +1126,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
                       "缺少 room_id", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -1047,7 +1134,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "room_unavailable", "房间服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -1064,7 +1151,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         const std::int32_t status = HandleRoomFailure(lookup, request_id, &error);
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
     bool is_member = false;
@@ -1085,7 +1172,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "not_a_member",
                       "该玩家不是这一局的成员", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -1093,7 +1180,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "stream_unavailable", "推送服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -1105,7 +1192,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
             FillError(response->mutable_error(), ErrorCode::INTERNAL, "stream_requires_http",
                       "推送接口只能通过 HTTP 访问", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -1126,7 +1213,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::INTERNAL,
                                               "stream_unavailable", "无法创建推送通道", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -1155,7 +1242,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::INTERNAL,
                                               "stream_unavailable", "订阅注册失败", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status);
+        ApplyHttpStatusAndRecord(controller, status, request_id);
         return;
     }
 
@@ -1178,7 +1265,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
                            {"player", player_id},
                            {"last_event_id", last_event_id_text}});
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200);
+    ApplyHttpStatusAndRecord(controller, 200, request_id);
 }
 
 bool GatewayServiceImpl::DependenciesHealthy() {

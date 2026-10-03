@@ -39,7 +39,10 @@ mkdir -p "$run_dir"
 # TASK-019 起加入 verify-observability：它同时验结构化日志（TASK-018）与
 # /metrics 指标（TASK-019）。不加参数即跑两项；单独调试时用
 #   bash scripts/verify-observability.sh --logs | --metrics
-all_scripts=(verify verify-login verify-match verify-room verify-stream verify-web verify-persistence verify-observability)
+# TASK-021 起加入 verify-trace：五条关键路径的 trace id 贯通。它与 verify-observability
+# 是**两件事**——那边验"日志格式与 service 字段是否合规"，这边验"同一个 id 能不能把
+# 一次请求在三个服务里的环节串成一条有序的链"；失败原因完全不同，因此各自成脚本。
+all_scripts=(verify verify-login verify-match verify-room verify-stream verify-web verify-persistence verify-observability verify-trace)
 
 # 每个脚本的运行参数（TASK-020）。
 #

@@ -31,11 +31,15 @@ public:
     int allocate_calls = 0;
     /// 最近一次分配收到的玩家列表。用于验证 Match 把完整成员名单交给了 Room。
     std::vector<std::string> last_player_ids;
+    /// TASK-021：最近一次分配收到的关联 id（trace）。用于验证 Match 把 trace
+    /// 透传给了 Room 分配器——修复前这里传的是 match_id 那个伪 id。
+    std::string last_request_id;
 
-    std::string Allocate(std::string_view match_id,
-                         const std::vector<std::string>& player_ids) override {
+    std::string Allocate(std::string_view match_id, const std::vector<std::string>& player_ids,
+                         std::string_view request_id) override {
         ++allocate_calls;
         last_player_ids = player_ids;
+        last_request_id = std::string(request_id);
         if (fail || match_id.empty()) {
             return {};
         }
@@ -380,7 +384,8 @@ TEST_F(MatchQueueTest, CancelDuringAllocationAbandonsTheMatch) {
     public:
         MatchQueue* queue = nullptr;
         std::string Allocate(std::string_view match_id,
-                             const std::vector<std::string>& /*player_ids*/) override {
+                             const std::vector<std::string>& /*player_ids*/,
+                             std::string_view /*request_id*/) override {
             // 分配期间取消 p-0002。
             queue->Cancel("p-0002", kT0);
             return "room-" + std::string(match_id);
@@ -405,13 +410,44 @@ TEST_F(MatchQueueTest, CancelDuringAllocationAbandonsTheMatch) {
 // 房间分配器本身
 // ---------------------------------------------------------------------------
 
+// TASK-021：配对时传给 Room 的关联 id 必须是**队首玩家**的 request_id。
+//
+// 这条断言锁定的是本任务修掉的缺陷：此前 BrpcRoomAllocator 把 match_id 当成
+// request_id 发给 Room，于是 Room 的 `room_created` 记下一个在 Gateway 与 Match
+// 日志里都不存在的 id，"匹配 → 建房间"这条跨服务链路是断的。
+// 取队首而不是"触发配对的那个人"：配对可能由轮询触发的惰性重试完成，
+// 那时触发方只是一个来查状态的无关玩家。
+TEST_F(MatchQueueTest, AllocatorReceivesTheHeadPlayersRequestId) {
+    queue_->Enqueue("p-0001", "req-head", kT0);
+    queue_->Enqueue("p-0002", "req-second", kT0);
+
+    EXPECT_EQ(allocator_.allocate_calls, 1);
+    EXPECT_EQ(allocator_.last_request_id, "req-head");
+    // 幂等键与 trace 是两个不同的值：混用正是本任务修掉的问题。
+    EXPECT_NE(allocator_.last_request_id, "m-fixed");
+}
+
+// 第二次配对（前一组已被取走）同样取**新的队首**，不会沿用上一组的 id。
+TEST_F(MatchQueueTest, EachPairGroupCarriesItsOwnHeadRequestId) {
+    queue_->Enqueue("p-0001", "req-a1", kT0);
+    queue_->Enqueue("p-0002", "req-a2", kT0);
+    EXPECT_EQ(allocator_.last_request_id, "req-a1");
+
+    queue_->Enqueue("p-0003", "req-b1", kT0);
+    queue_->Enqueue("p-0004", "req-b2", kT0);
+    EXPECT_EQ(allocator_.allocate_calls, 2);
+    EXPECT_EQ(allocator_.last_request_id, "req-b1");
+}
+
 TEST(DerivedRoomAllocatorTest, SameMatchIdYieldsSameRoomId) {
     DerivedRoomAllocator allocator;
     const std::vector<std::string> players = {"p-0001", "p-0002"};
-    const std::string first = allocator.Allocate("m-abc", players);
-    const std::string second = allocator.Allocate("m-abc", players);
+    const std::string first = allocator.Allocate("m-abc", players, "req-1");
+    const std::string second = allocator.Allocate("m-abc", players, "req-2");
 
     // 幂等：同一个 match_id 必须得到同一个 room_id，否则同局双方会进入不同房间。
+    // 注意两次传的 request_id **不同**——占位实现只依赖 match_id，
+    // 这条断言同时证明 trace 没有混进幂等语义。
     EXPECT_EQ(first, second);
     EXPECT_EQ(first, "room-m-abc");
 }
@@ -419,12 +455,13 @@ TEST(DerivedRoomAllocatorTest, SameMatchIdYieldsSameRoomId) {
 TEST(DerivedRoomAllocatorTest, DifferentMatchIdsYieldDifferentRoomIds) {
     DerivedRoomAllocator allocator;
     const std::vector<std::string> players = {"p-0001", "p-0002"};
-    EXPECT_NE(allocator.Allocate("m-abc", players), allocator.Allocate("m-def", players));
+    EXPECT_NE(allocator.Allocate("m-abc", players, "req-1"),
+              allocator.Allocate("m-def", players, "req-1"));
 }
 
 TEST(DerivedRoomAllocatorTest, EmptyMatchIdIsRejected) {
     DerivedRoomAllocator allocator;
-    EXPECT_TRUE(allocator.Allocate("", {"p-0001", "p-0002"}).empty());
+    EXPECT_TRUE(allocator.Allocate("", {"p-0001", "p-0002"}, "req-1").empty());
 }
 
 }  // namespace

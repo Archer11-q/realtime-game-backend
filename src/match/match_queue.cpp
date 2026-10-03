@@ -310,10 +310,15 @@ bool MatchQueue::RunPairingRound(std::int64_t now_ms) {
     //
     // 阶段三：回到锁内提交。分配失败时把玩家放回队首等下一次配对，因此「Room 不可用」
     // 不会让玩家被莫名标记为超时，也不会产生半成品匹配。
+    //
+    // TASK-021：把这一组的 trace 一并传下去。它取自队首玩家（见
+    // TakePairGroupsLocked），Room 侧会用它写 `room_created`，于是 Gateway 的
+    // `request_done`、Match 的 `match_enqueued` 与 Room 的 `room_created` 能用
+    // 同一个 id 串起来。
     for (const PendingGroup& group : groups) {
         std::string room_id;
         if (allocator_ != nullptr) {
-            room_id = allocator_->Allocate(group.match_id, group.player_ids);
+            room_id = allocator_->Allocate(group.match_id, group.player_ids, group.request_id);
         }
         const std::lock_guard<std::mutex> lock(mutex_);
         CommitGroupLocked(group, room_id, now_ms);
@@ -495,6 +500,13 @@ std::vector<MatchQueue::PendingGroup> MatchQueue::TakePairGroupsLocked() {
         PendingGroup pending;
         pending.match_id = match_id;
         pending.player_ids = group;
+        // TASK-021：这一组的 trace 取**队首玩家**的 request_id。
+        // group 非空（上面已保证取满两人），因此 group.front() 一定安全。
+        // 取不到（条目已被并发删除）时保持空串：宁缺勿假，room_created 会因此
+        // 少一个 trace，而不是出现一个别处查不到的伪 id。
+        if (const auto head = entries_.find(group.front()); head != entries_.end()) {
+            pending.request_id = head->second.request_id;
+        }
 
         for (const std::string& player_id : group) {
             auto it = entries_.find(player_id);

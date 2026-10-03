@@ -152,11 +152,21 @@ private:
                                    rgbt::gateway::v1::Error* error,
                                    const char* not_found_reason = "room_not_found");
 
-    /// 设置 HTTP 状态码并记一次指标。处理函数一律调用本函数而不是
-    /// `ApplyHttpStatus`，这样"漏记账"就不可能发生——这是选它做收敛点的理由：
-    /// 新增接口时忘记录指标不会有任何报错，只会让面板数字悄悄偏低。
+    /// 设置 HTTP 状态码、记一次指标、并输出一条 `request_done`（TASK-021）。
+    ///
+    /// 处理函数一律调用本函数而不是 `ApplyHttpStatus`，这样"漏记账"就不可能发生
+    /// ——这是选它做收敛点的理由：新增接口时忘了写日志或指标不会有任何报错，
+    /// 只会让面板数字悄悄偏低、让这条路径在日志里完全消失。
+    ///
+    /// TASK-021 之所以把 `request_done` 放在这里：它是**所有** HTTP 响应（含成功
+    /// 路径）的唯一收敛点，因此"每个请求都留下一条可按 trace 检索的记录"这件事
+    /// 不依赖谁来记得加日志。此前 15 个接口里只有 2 个（匹配入队、SSE 订阅）
+    /// 有结构化日志，登录、进房、结算三条关键路径在 Gateway 侧一条都没有。
+    ///
+    /// @param request_id 这次请求的关联 id（trace）。为空时不输出 `trace=` 字段
+    ///        （宁缺勿假，见 logging.hpp）——**不生成一个伪 id**。
     void ApplyHttpStatusAndRecord(::google::protobuf::RpcController* controller,
-                                  std::int32_t status_code);
+                                  std::int32_t status_code, const std::string& request_id);
 
     /// 真正的记账逻辑。参数用 `google::protobuf::RpcController`（而不是
     /// `brpc::Controller`）是为了让本头文件**不依赖 brpc**：brpc 的头文件对
@@ -165,6 +175,12 @@ private:
     /// 实现里再做一次 downcast。
     void RecordHttpRequest(::google::protobuf::RpcController* controller,
                            std::int32_t status_code) noexcept;
+
+    /// 写一条 `request_done`。与 `RecordHttpRequest` 分开两个函数、而不是塞进一个：
+    /// 指标只对 `/api/v1/` 前缀的路径记账（brpc 内置端点不该混进业务 QPS），
+    /// 而"这次请求结束了"这件事对所有接口都要记。
+    void RecordRequestDone(::google::protobuf::RpcController* controller, std::int32_t status_code,
+                           const std::string& request_id) noexcept;
 
     /// 构造完成标志。构造过程中不该记账，否则会用到尚未就绪的登记表。
     bool metrics_ready_ = false;

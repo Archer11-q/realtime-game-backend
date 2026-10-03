@@ -6,11 +6,19 @@
 
 #include "gateway_service.hpp"
 
+#include <brpc/controller.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include "common/token.hpp"
 #include "error.hpp"
@@ -1209,6 +1217,379 @@ TEST_F(GatewayServiceTest, StreamEventsWithoutHttpContextReturns500) {
     // 关键：没有登记任何订阅。登记了就会给同一个房间凭空增加轮询。
     EXPECT_EQ(hub.ConnectionCount(), 0U);
     EXPECT_EQ(hub.RoomPollCount(), 0U);
+}
+
+// ---------------------------------------------------------------------------
+// TASK-021：每个 HTTP 请求都必须留下一条可按 trace 检索的 request_done
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// 把 stderr 重定向到一个临时文件，析构时读回内容并恢复。
+///
+/// 为什么必须捕获进程级 stderr 而不是"断言格式化结果"：本任务的全部价值在于
+/// 「**每个**请求都留下记录」。这一点只有在真的发出一个请求、再去看输出里
+/// 有没有那一行时才算被验证；直接断言 `FormatLogLine` 只能证明格式化函数没问题，
+/// 证明不了"收敛点确实被调用了"。
+///
+/// 为什么用 `setvbuf(_IOFBF, ...)`：把 stderr 切成全缓冲后，产品代码的输出会先落在
+/// 我们提供的数组里。析构时先恢复文件描述符与缓冲模式（此时 libc 会把缓冲区刷进
+/// 临时文件），再读文件。这样既不依赖任何 libc 内部细节，也不需要在多线程下工作
+/// （单元测试是单线程顺序执行的）。
+class CapturedStderr {
+public:
+    CapturedStderr() {
+        const char* tmp = std::getenv("TMPDIR");
+        path_ = std::string(tmp != nullptr && tmp[0] != '\0' ? tmp : "/tmp") +
+                "/rgbt-gateway-request-done-" + std::to_string(::getpid()) + ".log";
+        file_ = std::fopen(path_.c_str(), "w+");
+        if (file_ == nullptr) {
+            return;
+        }
+        saved_fd_ = ::dup(fileno(stderr));
+        if (saved_fd_ < 0) {
+            std::fclose(file_);
+            file_ = nullptr;
+            return;
+        }
+        std::fflush(stderr);
+        std::setvbuf(stderr, buffer_.data(), _IOFBF, buffer_.size());
+        ::dup2(fileno(file_), fileno(stderr));
+    }
+
+    CapturedStderr(const CapturedStderr&) = delete;
+    CapturedStderr& operator=(const CapturedStderr&) = delete;
+
+    ~CapturedStderr() { Stop(); }
+
+    /// 停止捕获并返回捕获到的全部文本。可重复调用（第二次返回同一份内容）。
+    std::string Stop() {
+        if (saved_fd_ < 0) {
+            return text_;
+        }
+        std::fflush(stderr);
+        ::dup2(saved_fd_, fileno(stderr));
+        ::close(saved_fd_);
+        saved_fd_ = -1;
+        std::setvbuf(stderr, nullptr, _IONBF, 0);
+
+        std::fflush(file_);
+        std::fseek(file_, 0, SEEK_END);
+        const long size = std::ftell(file_);
+        if (size > 0) {
+            text_.resize(static_cast<std::size_t>(size));
+            std::fseek(file_, 0, SEEK_SET);
+            const std::size_t read = std::fread(text_.data(), 1, text_.size(), file_);
+            text_.resize(read);
+        }
+        std::fclose(file_);
+        file_ = nullptr;
+        std::remove(path_.c_str());
+        return text_;
+    }
+
+private:
+    std::string path_;
+    std::FILE* file_ = nullptr;
+    int saved_fd_ = -1;
+    std::array<char, 1 << 16> buffer_{};
+    std::string text_;
+};
+
+/// 在文本里找同时含 `needle_a` 与 `needle_b` 的行。找不到返回空串。
+std::string FindLineWith(const std::string& text, std::string_view needle_a,
+                         std::string_view needle_b) {
+    std::size_t begin = 0;
+    while (begin <= text.size()) {
+        const std::size_t end = text.find('\n', begin);
+        const std::string line =
+            text.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        if (line.find(needle_a) != std::string::npos && line.find(needle_b) != std::string::npos) {
+            return line;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    return {};
+}
+
+/// `request_done` 出现次数。
+std::size_t CountRequestDone(const std::string& text) {
+    std::size_t count = 0;
+    std::size_t pos = text.find("event=request_done");
+    while (pos != std::string::npos) {
+        ++count;
+        pos = text.find("event=request_done", pos + 1);
+    }
+    return count;
+}
+
+}  // namespace
+
+/// 补齐所有映射路径都要留下 request_done，且 op 与 restful 映射一一对应。
+///
+/// 为什么逐条覆盖全部 11 个路径而不是抽查两个：本任务修的是"15 个接口里只有 2 个
+/// 有日志"这个**覆盖面**问题。抽查通不过只能证明抽查的那两条在，证明不了别的。
+TEST_F(GatewayServiceTest, EveryMappedPathEmitsRequestDoneWithItsOperation) {
+    const std::string token = LoginAlice();
+
+    using Handler = std::int32_t (*)(GatewayServiceImpl&, ::google::protobuf::RpcController*,
+                                     const std::string&, const std::string&);
+    struct Case {
+        const char* path;
+        const char* op;
+        Handler invoke;
+    };
+
+    const std::vector<Case> cases = {
+        {"/api/v1/login", "login",
+         [](GatewayServiceImpl& service, ::google::protobuf::RpcController* controller,
+            const std::string&, const std::string& trace) -> std::int32_t {
+             LoginRequest request;
+             request.set_request_id(trace);
+             LoginResponse response;
+             service.Login(controller, &request, &response, nullptr);
+             return response.status_code();
+         }},
+        {"/api/v1/players/me", "get_current_player",
+         [](GatewayServiceImpl& service, ::google::protobuf::RpcController* controller,
+            const std::string& token, const std::string& trace) -> std::int32_t {
+             GetCurrentPlayerRequest request;
+             request.set_token(token);
+             request.set_request_id(trace);
+             GetCurrentPlayerResponse response;
+             service.GetCurrentPlayer(controller, &request, &response, nullptr);
+             return response.status_code();
+         }},
+        {"/api/v1/logout", "logout",
+         [](GatewayServiceImpl& service, ::google::protobuf::RpcController* controller,
+            const std::string& token, const std::string& trace) -> std::int32_t {
+             LogoutRequest request;
+             request.set_token(token);
+             request.set_request_id(trace);
+             LogoutResponse response;
+             service.Logout(controller, &request, &response, nullptr);
+             return response.status_code();
+         }},
+        {"/api/v1/matches", "enqueue_match",
+         [](GatewayServiceImpl& service, ::google::protobuf::RpcController* controller,
+            const std::string& token, const std::string& trace) -> std::int32_t {
+             EnqueueMatchRequest request;
+             request.set_token(token);
+             request.set_request_id(trace);
+             EnqueueMatchResponse response;
+             service.EnqueueMatch(controller, &request, &response, nullptr);
+             return response.status_code();
+         }},
+        {"/api/v1/matches/current", "get_match_status",
+         [](GatewayServiceImpl& service, ::google::protobuf::RpcController* controller,
+            const std::string& token, const std::string& trace) -> std::int32_t {
+             GetMatchStatusRequest request;
+             request.set_token(token);
+             request.set_request_id(trace);
+             GetMatchStatusResponse response;
+             service.GetMatchStatus(controller, &request, &response, nullptr);
+             return response.status_code();
+         }},
+        {"/api/v1/matches/current/cancel", "cancel_match",
+         [](GatewayServiceImpl& service, ::google::protobuf::RpcController* controller,
+            const std::string& token, const std::string& trace) -> std::int32_t {
+             CancelMatchRequest request;
+             request.set_token(token);
+             request.set_request_id(trace);
+             CancelMatchResponse response;
+             service.CancelMatch(controller, &request, &response, nullptr);
+             return response.status_code();
+         }},
+        {"/api/v1/rooms/join", "join_room",
+         [](GatewayServiceImpl& service, ::google::protobuf::RpcController* controller,
+            const std::string& token, const std::string& trace) -> std::int32_t {
+             JoinRoomRequest request;
+             request.set_token(token);
+             request.set_request_id(trace);
+             request.set_room_id("r-1");
+             JoinRoomResponse response;
+             service.JoinRoom(controller, &request, &response, nullptr);
+             return response.status_code();
+         }},
+        {"/api/v1/rooms/input", "submit_input",
+         [](GatewayServiceImpl& service, ::google::protobuf::RpcController* controller,
+            const std::string& token, const std::string& trace) -> std::int32_t {
+             SubmitInputRequest request;
+             request.set_token(token);
+             request.set_request_id(trace);
+             request.set_room_id("r-1");
+             SubmitInputResponse response;
+             service.SubmitInput(controller, &request, &response, nullptr);
+             return response.status_code();
+         }},
+        {"/api/v1/rooms/state", "get_room_state",
+         [](GatewayServiceImpl& service, ::google::protobuf::RpcController* controller,
+            const std::string& token, const std::string& trace) -> std::int32_t {
+             GetRoomStateRequest request;
+             request.set_token(token);
+             request.set_request_id(trace);
+             request.set_room_id("r-1");
+             GetRoomStateResponse response;
+             service.GetRoomState(controller, &request, &response, nullptr);
+             return response.status_code();
+         }},
+        {"/api/v1/results", "get_match_result",
+         [](GatewayServiceImpl& service, ::google::protobuf::RpcController* controller,
+            const std::string& token, const std::string& trace) -> std::int32_t {
+             GetMatchResultRequest request;
+             request.set_token(token);
+             request.set_request_id(trace);
+             request.set_match_id("m-1");
+             GetMatchResultResponse response;
+             service.GetMatchResult(controller, &request, &response, nullptr);
+             return response.status_code();
+         }},
+        {"/api/v1/stream", "stream_events",
+         [](GatewayServiceImpl& service, ::google::protobuf::RpcController* controller,
+            const std::string& token, const std::string& trace) -> std::int32_t {
+             StreamEventsRequest request;
+             request.set_token(token);
+             request.set_request_id(trace);
+             request.set_room_id("r-1");
+             StreamEventsResponse response;
+             service.StreamEvents(controller, &request, &response, nullptr);
+             return response.status_code();
+         }},
+    };
+
+    for (const Case& item : cases) {
+        const std::string trace = std::string("trace-") + item.op;
+        brpc::Controller controller;
+        controller.http_request().uri().set_path(item.path);
+        controller.http_request().set_method(brpc::HTTP_METHOD_POST);
+        controller.http_request().SetHeader("Content-Type", "application/json");
+
+        CapturedStderr captured;
+        const std::int32_t status_code = item.invoke(*service_, &controller, token, trace);
+        const std::string line =
+            FindLineWith(captured.Stop(), "event=request_done", std::string("trace=") + trace);
+        // 这一条断言是本次任务的核心：请求结束时**一定**有一行记录，且 op 正确。
+        EXPECT_FALSE(line.empty()) << "路径 " << item.path << " 没有留下 request_done";
+        EXPECT_NE(line.find(std::string("op=") + item.op), std::string::npos)
+            << "路径 " << item.path << " 的 op 不是 " << item.op << "：实际行 = " << line;
+        // 状态码必须写进这一行，且与实际响应一致：否则"失败了但显示 200"
+        // 这种表现在日志里完全看不出来。这里不写死具体数字——
+        // `players/me` 与 `logout` 带合法 Token 时会成功（200），
+        // 断言 4xx 会把正确行为判成失败（第一版就是这么写错的）。
+        EXPECT_NE(line.find("status=" + std::to_string(status_code)), std::string::npos)
+            << "路径 " << item.path << " 的 request_done 状态码与响应不一致（响应 " << status_code
+            << "）：实际行 = " << line;
+    }
+}
+
+/// trace 字段的完整语义：给了就带上，没给就**不编造**。
+TEST_F(GatewayServiceTest, RequestDoneCarriesTheCallersTraceAndNeverFabricatesOne) {
+    const std::string token = LoginAlice();
+
+    brpc::Controller controller;
+    controller.http_request().uri().set_path("/api/v1/matches");
+    controller.http_request().set_method(brpc::HTTP_METHOD_POST);
+
+    EnqueueMatchRequest with_trace;
+    with_trace.set_token(token);
+    with_trace.set_request_id("trace-explicit-021");
+    EnqueueMatchResponse response;
+    CapturedStderr first;
+    service_->EnqueueMatch(&controller, &with_trace, &response, nullptr);
+    const std::string capture = first.Stop();
+
+    // 这一次请求留下两条记录：业务日志（match_enqueue_ok）与收敛点的 request_done，
+    // 两者带**同一个** trace —— 这正是"一条链能串起来"的字面含义。
+    const std::string business_line =
+        FindLineWith(capture, "event=match_enqueue_ok", "trace=trace-explicit-021");
+    const std::string done_line =
+        FindLineWith(capture, "event=request_done", "trace=trace-explicit-021");
+    EXPECT_FALSE(business_line.empty()) << "业务日志没带上 trace：" << capture;
+    EXPECT_FALSE(done_line.empty()) << "request_done 没带上调用方的 trace：" << capture;
+    // 一次请求只留一条 request_done：多写一处会让"按 trace 数请求数"这个用法失真。
+    EXPECT_EQ(CountRequestDone(capture), 1U) << "一次请求应只留一条 request_done";
+
+    EnqueueMatchRequest without_trace;
+    without_trace.set_token(token);
+    EnqueueMatchResponse response2;
+    CapturedStderr second;
+    service_->EnqueueMatch(&controller, &without_trace, &response2, nullptr);
+    const std::string capture2 = second.Stop();
+    // 没有 request_id 时**不输出** trace=，而不是输出 trace=- 或生成一个伪 id。
+    // 判据钉在 `event=request_done` 之后紧跟的字段上：结构化行里它是紧随 event 的
+    // 恒定字段，因此这个子串一旦出现就说明真的写了空的 trace。
+    EXPECT_EQ(capture2.find("event=request_done trace="), std::string::npos)
+        << "空 request_id 时不应输出 trace 字段：捕获内容 = " << capture2;
+    EXPECT_NE(capture2.find("event=request_done"), std::string::npos)
+        << "即便没有 trace，request_done 也必须留下";
+}
+
+/// 失败请求必须在级别上可分辨：`grep 'level=error'` 要能一刀切出 5xx。
+TEST_F(GatewayServiceTest, RequestDoneLevelFollowsTheHttpStatus) {
+    // 500：没有 HTTP 上下文的 SSE 订阅（见 StreamEventsWithoutHttpContextReturns500）。
+    const std::string token = LoginAlice();
+    room_.snapshot.players.push_back(RoomPlayerSnapshot{"p-0001", 100, true});
+    StreamHub hub(&room_);
+    GatewayServiceImpl service(&sessions_, players_.get(), &match_, &room_, &hub);
+
+    StreamEventsRequest request;
+    request.set_token(token);
+    request.set_room_id("r-1");
+    request.set_request_id("trace-500");
+    StreamEventsResponse response;
+    CapturedStderr captured;
+    service.StreamEvents(nullptr, &request, &response, nullptr);
+    ASSERT_EQ(response.status_code(), 500);
+
+    const std::string line = FindLineWith(captured.Stop(), "event=request_done", "status=500");
+    EXPECT_FALSE(line.empty()) << "500 响应没有留下 request_done";
+    EXPECT_NE(line.find("level=error"), std::string::npos) << "5xx 应为 level=error：" << line;
+    EXPECT_NE(line.find("trace=trace-500"), std::string::npos)
+        << "失败路径同样要能按 trace 定位：" << line;
+    // 无 HTTP 上下文时推导不出 op，但**不能编造**一个：unknown 本身就是线索。
+    EXPECT_NE(line.find("op=unknown"), std::string::npos) << "无路径时应记 op=unknown：" << line;
+
+    // 4xx：未认证的匹配入队。
+    brpc::Controller controller;
+    controller.http_request().uri().set_path("/api/v1/matches");
+    controller.http_request().set_method(brpc::HTTP_METHOD_POST);
+    EnqueueMatchRequest bad;
+    bad.set_request_id("trace-400");
+    EnqueueMatchResponse bad_response;
+    CapturedStderr warn_captured;
+    service_->EnqueueMatch(&controller, &bad, &bad_response, nullptr);
+    ASSERT_EQ(bad_response.status_code(), 400);
+    const std::string warn_line =
+        FindLineWith(warn_captured.Stop(), "event=request_done", "status=400");
+    EXPECT_FALSE(warn_line.empty()) << "400 响应没有留下 request_done";
+    EXPECT_NE(warn_line.find("level=warn"), std::string::npos)
+        << "4xx 应为 level=warn：" << warn_line;
+    EXPECT_NE(warn_line.find("trace=trace-400"), std::string::npos)
+        << "被拒绝的请求也要能按 trace 定位：" << warn_line;
+}
+
+/// 未被 restful 映射的路径必须记成 `op=unknown`，而不是猜一个看起来合理的动作名。
+TEST_F(GatewayServiceTest, UnmappedPathIsRecordedAsUnknownOperation) {
+    const std::string token = LoginAlice();
+    brpc::Controller controller;
+    controller.http_request().uri().set_path("/status");
+    controller.http_request().set_method(brpc::HTTP_METHOD_GET);
+
+    GetCurrentPlayerRequest request;
+    request.set_token(token);
+    GetCurrentPlayerResponse response;
+    CapturedStderr captured;
+    service_->GetCurrentPlayer(&controller, &request, &response, nullptr);
+    const std::string capture = captured.Stop();
+
+    EXPECT_NE(capture.find("event=request_done"), std::string::npos);
+    EXPECT_NE(capture.find("op=unknown"), std::string::npos)
+        << "非映射路径必须记 op=unknown，不能猜一个动作名：" << capture;
+    EXPECT_EQ(capture.find("op=get_current_player"), std::string::npos)
+        << "op 必须由实际路径推导，不能来自处理函数名：" << capture;
 }
 
 }  // namespace
