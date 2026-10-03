@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 
+#include "common/metrics.hpp"
 #include "room.pb.h"
 #include "room_manager.hpp"
 
@@ -61,6 +62,9 @@ public:
 
 private:
     [[nodiscard]] std::int64_t NowMs() const;
+
+    // TASK-019：指标登记完成标志。
+    bool metrics_ready_ = false;
 
     RoomManager* manager_;
     std::function<std::int64_t()> clock_;

@@ -533,6 +533,32 @@ std::size_t RoomManager::RoomCount() {
     return rooms_.size();
 }
 
+RoomPhaseCounts RoomManager::PhaseCounts() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    RoomPhaseCounts counts;
+    for (const auto& entry : rooms_) {
+        for (std::size_t i = 0; i < RoomPhaseCounts::kPhaseCount; ++i) {
+            if (kAllRoomPhases[i] == entry.second->phase()) {
+                ++counts.counts[i];
+                break;
+            }
+        }
+    }
+    return counts;
+}
+
+std::uint64_t RoomManager::TotalFramesAdvanced() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    std::uint64_t total = 0;
+    for (const auto& entry : rooms_) {
+        const std::int64_t frame = entry.second->frame();
+        if (frame > 0) {
+            total += static_cast<std::uint64_t>(frame);
+        }
+    }
+    return total;
+}
+
 std::size_t RoomManager::PlayingCount() {
     const std::lock_guard<std::mutex> lock(mutex_);
     std::size_t count = 0;

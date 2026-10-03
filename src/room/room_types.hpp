@@ -217,6 +217,41 @@ struct RoomSnapshotRecord {
     return "unknown";
 }
 
+/// 全部房间阶段，顺序固定。给"按阶段计数"与指标标签遍历使用。
+///
+/// 为什么要一个显式列表而不是直接遍历枚举：C++ 的 `enum class` **不能**被遍历，
+/// 而按阶段计数必须覆盖每一个阶段（漏掉一个就意味着某类房间在指标里消失）。
+/// 把它写成常量数组，并在 RoomPhaseCounts::Total() 里断言"数组长度 == 计数数组长度"，
+/// 将来新增阶段时会被编译期/测试挡住。
+inline constexpr RoomPhase kAllRoomPhases[] = {
+    RoomPhase::kCreated,   RoomPhase::kWaiting,  RoomPhase::kPlaying,
+    RoomPhase::kFinishing, RoomPhase::kFinished, RoomPhase::kAborted,
+};
+
+/// 各阶段的房间数（TASK-019）。索引与 `kAllRoomPhases` 一一对应。
+struct RoomPhaseCounts {
+    static constexpr std::size_t kPhaseCount = sizeof(kAllRoomPhases) / sizeof(kAllRoomPhases[0]);
+    std::size_t counts[kPhaseCount] = {};
+
+    /// 按阶段取计数。索引由 `kAllRoomPhases` 的顺序决定。
+    [[nodiscard]] std::size_t At(RoomPhase phase) const {
+        for (std::size_t i = 0; i < kPhaseCount; ++i) {
+            if (kAllRoomPhases[i] == phase) {
+                return counts[i];
+            }
+        }
+        return 0;
+    }
+
+    [[nodiscard]] std::size_t Total() const {
+        std::size_t total = 0;
+        for (const std::size_t count : counts) {
+            total += count;
+        }
+        return total;
+    }
+};
+
 /// 把结束原因转成可读字符串。
 [[nodiscard]] inline const char* ToString(FinishReason reason) {
     switch (reason) {

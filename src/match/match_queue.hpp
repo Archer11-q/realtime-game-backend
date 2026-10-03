@@ -40,6 +40,7 @@
 #ifndef RGBT_MATCH_MATCH_QUEUE_HPP
 #define RGBT_MATCH_MATCH_QUEUE_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -185,6 +186,13 @@ public:
     /// @brief 当前队列长度。仅供测试与可观测性使用。
     [[nodiscard]] std::size_t QueueSize();
 
+    /// TASK-019：快照写入成功/失败累计。供指标与测试读取。
+    ///
+    /// 为什么要在这里计数而不是让指标层去数日志：日志会滚动、会被采样，
+    /// 而"降级为纯内存"这个事实必须有一个不会被冲掉的数字支撑。
+    [[nodiscard]] std::uint64_t SnapshotWriteCount() const;
+    [[nodiscard]] std::uint64_t SnapshotFailureCount() const;
+
     /// @brief 当前处于房间分配中的人数。仅供测试与可观测性使用。
     [[nodiscard]] std::size_t AllocatingCount();
 
@@ -259,6 +267,12 @@ private:
 
     RoomAllocator* allocator_;
     MatchQueueStore* store_;
+
+    // TASK-019：快照写入计数。用原子而非普通成员：`PersistSnapshot` 由多个
+    // brpc 工作线程触发（入队/取消/领取结果都会触发持久化）。
+    std::atomic<std::uint64_t> snapshot_write_count_{0};
+    std::atomic<std::uint64_t> snapshot_failure_count_{0};
+
     std::function<std::string()> match_id_factory_;
     std::int64_t match_timeout_ms_;
     std::int64_t result_ttl_ms_;

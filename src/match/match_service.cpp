@@ -40,7 +40,40 @@ std::int64_t NowUnixMillis() {
 
 MatchServiceImpl::MatchServiceImpl(MatchQueue* queue, std::function<std::int64_t()> clock)
     : queue_(queue),
-      clock_(clock ? std::move(clock) : std::function<std::int64_t()>(NowUnixMillis)) {}
+      clock_(clock ? std::move(clock) : std::function<std::int64_t()>(NowUnixMillis)) {
+    const auto event_counter = [](const char* event) {
+        return rgbt::common::Metrics().Counter(rgbt::common::kMetricMatchEventsTotal,
+                                               "Match 的事件计数，按事件类型分组",
+                                               {{"event", event}});
+    };
+    // 四个标签取值在构造时就登记，因此导出里能看到全 0 的序列 ——
+    // 否则"事件还没发生"与"指标没注册"在采集端无法区分（见 metrics.hpp）。
+    event_enqueued_ = event_counter("enqueued");
+    event_rejected_ = event_counter("rejected");
+    event_paired_ = event_counter("paired");
+    event_canceled_ = event_counter("canceled");
+
+    // 队列长度是 gauge：**采集时去问队列**，而不是自己维护一个副本。
+    // 副本会漏掉队列内部的清理（超时淘汰、结果过期），很快与真实值不一致。
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricMatchQueueLength, "Match 队列当前等待配对的玩家数",
+        [this]() -> std::uint64_t {
+            return queue_ == nullptr ? 0 : static_cast<std::uint64_t>(queue_->QueueSize());
+        });
+    // TASK-019：快照写入成功/失败。两个标签取值都登记，因此导出里能看到全 0
+    // 的序列——"从未写过快照"与"指标没注册"必须是可区分的。
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricQueueSnapshotTotal, "Match 队列快照写入次数，按结果分组",
+        [this]() -> std::uint64_t { return queue_ == nullptr ? 0 : queue_->SnapshotWriteCount(); },
+        {{"outcome", "ok"}});
+    rgbt::common::Metrics().Gauge(rgbt::common::kMetricQueueSnapshotTotal,
+                                  "Match 队列快照写入次数，按结果分组",
+                                  [this]() -> std::uint64_t {
+                                      return queue_ == nullptr ? 0 : queue_->SnapshotFailureCount();
+                                  },
+                                  {{"outcome", "failed"}});
+    metrics_ready_ = true;
+}
 
 bool MatchServiceImpl::FillError(rgbt::match::v1::MatchError* error,
                                  rgbt::match::v1::MatchErrorCode code, const std::string& reason,
@@ -108,6 +141,27 @@ void MatchServiceImpl::EnqueueMatch(::google::protobuf::RpcController* /*control
     const std::int64_t now_ms = clock_();
 
     const EnqueueOutcome outcome = queue_->Enqueue(player_id, request_id, now_ms);
+
+    // TASK-019：**一处**覆盖四种结果。`kQueued` 里还要看是不是当场配成了局：
+    // 第二个人入队时会在同一次调用内配对，此时该记的是"配对"。
+    if (metrics_ready_) {
+        event_enqueued_.Add();
+        switch (outcome) {
+            case EnqueueOutcome::kQueued: {
+                const MatchStatusSnapshot outcome_snapshot = queue_->GetStatus(player_id, now_ms);
+                if (outcome_snapshot.state == MatchStatusSnapshot::State::kMatched) {
+                    event_paired_.Add();
+                }
+                break;
+            }
+            case EnqueueOutcome::kAlreadyQueued:
+            case EnqueueOutcome::kQueueFull:
+            case EnqueueOutcome::kInvalidArgument:
+                event_rejected_.Add();
+                break;
+        }
+    }
+
     switch (outcome) {
         case EnqueueOutcome::kQueued: {
             // 入队成功。注意状态可能是 QUEUED，也可能在同一次调用内就变成 MATCHED
@@ -163,7 +217,13 @@ void MatchServiceImpl::CancelMatch(::google::protobuf::RpcController* /*controll
 
     // 取消是幂等操作：不在队列中（返回 false）也视为成功，与登出保持一致。
     // 因此这里不使用返回值判断成败，只回读最终状态。
-    queue_->Cancel(player_id, now_ms);
+    // TASK-019：接收返回值，因为"取消率"这个指标只应统计**真的取消了**的次数。
+    // 返回 false 表示本来就不在队列里（幂等成功），算进去会让指标失去意义。
+    // 注意：这不改变幂等语义 —— 无论返回什么，对外都按成功处理。
+    const bool canceled = queue_->Cancel(player_id, now_ms);
+    if (canceled && metrics_ready_) {
+        event_canceled_.Add();
+    }
     FillStatus(queue_->GetStatus(player_id, now_ms), response->mutable_status());
 }
 

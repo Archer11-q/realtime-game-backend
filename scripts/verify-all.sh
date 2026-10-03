@@ -36,7 +36,10 @@ mkdir -p "$run_dir"
 # 把第一行整个覆盖掉，于是 TASK-013 的验收脚本从来没有被这条"一条命令"跑到——
 # 正是本脚本开头那段理由所警告的情况，只是这次坑在脚本自己身上。
 # 数组只保留一行；新增验收脚本时改这一行。
-all_scripts=(verify verify-login verify-match verify-room verify-stream verify-web verify-persistence)
+# TASK-019 起加入 verify-observability：它同时验结构化日志（TASK-018）与
+# /metrics 指标（TASK-019）。不加参数即跑两项；单独调试时用
+#   bash scripts/verify-observability.sh --logs | --metrics
+all_scripts=(verify verify-login verify-match verify-room verify-stream verify-web verify-persistence verify-observability)
 
 fail_fast=0
 only=""

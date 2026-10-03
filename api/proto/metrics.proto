@@ -1,0 +1,40 @@
+// 指标暴露契约（TASK-019）。
+//
+// 为什么单独一个 proto，而不是往 gateway/match/room 各加一个 rpc：
+//   * `/metrics` 的响应类型在三个服务里**完全一样**（都是 Prometheus 文本）。
+//     放进各自的 proto 就要在三处重复定义同一个 message，而它们是同一份契约；
+//   * 它也不属于任何一个服务的**业务**能力：它是所有服务共有的运维接口，
+//     与 brpc 内置的 `/status`、`/vars` 同级。把它塞进 GatewayService 会让人
+//     以为 Match/Room 也具备 Gateway 的业务能力。
+//
+// 三个服务在**各自的端口**上注册本服务（`brpc::Server` 支持同端口注册多个服务），
+// 因此 Prometheus 分别抓三个端口即可，不需要额外的聚合进程。
+
+syntax = "proto3";
+
+package rgbt.metrics.v1;
+
+option cc_generic_services = true;
+
+// 采集请求。不需要参数：一次抓取就是"把当前全部指标导出一遍"。
+message ScrapeRequest {
+  // 仅用于日志关联（TASK-018）。可选。
+  string request_id = 1;
+}
+
+message ScrapeResponse {
+  // Prometheus 文本暴露格式（text/plain; version=0.0.4）。
+  // 出错时为空，并填充 `error`。
+  string body = 1;
+
+  // 失败原因。当前只有"无法分配响应缓冲"这一种，因此没有错误码枚举。
+  string error = 2;
+}
+
+// HTTP: GET /metrics
+//
+// 只读、无鉴权：与 brpc 内置的 `/status` 一致，**只应监听本机或内网**，
+// 不要暴露到公网（见 docs/04-quality-and-observability.md 第 4 节）。
+service MetricsService {
+  rpc Scrape(ScrapeRequest) returns (ScrapeResponse);
+}

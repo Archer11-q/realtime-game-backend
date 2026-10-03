@@ -218,11 +218,22 @@ void MatchQueue::PersistSnapshot() {
     if (!store_->Save(snapshot)) {
         // 快照可以丢弃：不重试、不阻塞。Redis 不可用时匹配照常工作，
         // 只是失去"重启可恢复"——这是项目所有者确认过的降级策略。
+        snapshot_failure_count_.fetch_add(1, std::memory_order_relaxed);
         rgbt::common::LogWarn("queue_snapshot_write_failed",
                               {{"queued", std::to_string(snapshot.queued.size())},
                                {"matched", std::to_string(snapshot.matched.size())},
                                {"policy", "可丢弃、不重试，当前降级为纯内存"}});
+        return;
     }
+    snapshot_write_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t MatchQueue::SnapshotWriteCount() const {
+    return snapshot_write_count_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MatchQueue::SnapshotFailureCount() const {
+    return snapshot_failure_count_.load(std::memory_order_relaxed);
 }
 
 EnqueueOutcome MatchQueue::Enqueue(const std::string& player_id, const std::string& request_id,

@@ -203,6 +203,18 @@ public:
     /// @brief 当前房间总数。仅供指标与验收脚本使用。
     [[nodiscard]] std::size_t RoomCount();
 
+    /// TASK-019：各阶段的房间数。**一次持锁数完**：若给每个阶段一个 getter，
+    /// 按阶段导出指标就要加六把锁，而且六次读数之间房间状态会变，
+    /// 面板上出现的"总数对不上"就是这么来的。
+    [[nodiscard]] RoomPhaseCounts PhaseCounts();
+
+    /// TASK-019：所有房间当前帧号之和，单调不减。
+    ///
+    /// 用它而不是"每次推进加一"的独立计数器：帧号本身就是累计量，
+    /// 二者语义等价，但求和不需要在 `BattleRoom::Tick` 的热路径上再插一次写入，
+    /// 也就不会出现"计数器与真实帧号不同步"这类只能靠对账才发现的问题。
+    [[nodiscard]] std::uint64_t TotalFramesAdvanced();
+
     /// @brief 当前处于 PLAYING 的房间数。仅供指标与验收脚本使用。
     [[nodiscard]] std::size_t PlayingCount();
 

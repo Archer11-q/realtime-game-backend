@@ -3,13 +3,45 @@
 #include <brpc/channel.h>
 #include <brpc/controller.h>
 
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
+#include "common/metrics.hpp"
 #include "room.pb.h"
 
 namespace rgbt::gateway {
 namespace {
+
+/// TASK-019：把一次服务间调用的结果记到指标上。
+///
+/// 为什么包装 `return XxxCallStatus::...` 而不是改每个调用点：这是真正的 RPC 层，
+/// 每个方法都以一个 CallStatus 收敛。包装 return 保证**零遗漏**——漏一个调用点
+/// 不会有任何报错，只会让"错误率"这个指标悄悄偏低，而那正是排障时最依赖的数字。
+///
+/// `ok` 只认 `kOk`：其余取值（含 `kResultPending`、`kNotAMember` 这类业务性拒绝）
+/// 对"服务间调用是否成功"这个问题的答案都是"没成功"。
+void RecordRpcCall(bool ok) {
+    static std::mutex cache_mutex;
+    static std::unordered_map<std::string, rgbt::common::CounterHandle> cache;
+    const std::string key = ok ? "ok" : "failed";
+
+    rgbt::common::CounterHandle handle;
+    {
+        const std::lock_guard<std::mutex> lock(cache_mutex);
+        const auto it = cache.find(key);
+        if (it == cache.end()) {
+            handle = rgbt::common::Metrics().Counter(rgbt::common::kMetricRpcCallsTotal,
+                                                     "Gateway 发起的服务间 RPC 调用数",
+                                                     {{"target", "room"}, {"outcome", key}});
+            cache.emplace(key, handle);
+        } else {
+            handle = it->second;
+        }
+    }
+    handle.Add();
+}
 
 /// 把 Room 的状态枚举转成 Gateway 自己的枚举。
 RoomState ToState(rgbt::room::v1::RoomState state) {
@@ -103,23 +135,32 @@ SnapshotWindowStatus ToWindowStatus(rgbt::room::v1::SnapshotWindowStatus status)
 RoomCallStatus ToCallStatus(rgbt::room::v1::RoomErrorCode code) {
     switch (code) {
         case rgbt::room::v1::ROOM_ERROR_CODE_UNSPECIFIED:
+            RecordRpcCall(true);
             return RoomCallStatus::kOk;
         case rgbt::room::v1::ROOM_INVALID_ARGUMENT:
+            RecordRpcCall(false);
             return RoomCallStatus::kInvalidArgument;
         case rgbt::room::v1::ROOM_NOT_A_MEMBER:
+            RecordRpcCall(false);
             return RoomCallStatus::kNotAMember;
         case rgbt::room::v1::ROOM_NOT_PLAYING:
+            RecordRpcCall(false);
             return RoomCallStatus::kNotPlaying;
         case rgbt::room::v1::ROOM_NOT_FOUND:
+            RecordRpcCall(false);
             return RoomCallStatus::kNotFound;
         case rgbt::room::v1::ROOM_ALREADY_FINISHED:
+            RecordRpcCall(false);
             return RoomCallStatus::kAlreadyFinished;
         case rgbt::room::v1::ROOM_RESULT_PENDING:
+            RecordRpcCall(false);
             return RoomCallStatus::kResultPending;
         case rgbt::room::v1::ROOM_STORE_UNAVAILABLE:
+            RecordRpcCall(false);
             return RoomCallStatus::kStoreUnavailable;
         case rgbt::room::v1::ROOM_INTERNAL:
         default:
+            RecordRpcCall(false);
             return RoomCallStatus::kInternal;
     }
 }
@@ -167,6 +208,7 @@ RoomCallStatus BrpcRoomClient::Join(const std::string& room_id, const std::strin
     stub.JoinRoom(&controller, &request, &response, nullptr);
 
     if (controller.Failed()) {
+        RecordRpcCall(false);
         return RoomCallStatus::kUnavailable;
     }
     if (out_snapshot != nullptr) {
@@ -195,6 +237,7 @@ RoomCallStatus BrpcRoomClient::SubmitAttack(const std::string& room_id,
     stub.SubmitInput(&controller, &request, &response, nullptr);
 
     if (controller.Failed()) {
+        RecordRpcCall(false);
         return RoomCallStatus::kUnavailable;
     }
     if (out_snapshot != nullptr) {
@@ -220,6 +263,7 @@ RoomCallStatus BrpcRoomClient::SetPresence(const std::string& room_id, const std
     stub.SetPlayerPresence(&controller, &request, &response, nullptr);
 
     if (controller.Failed()) {
+        RecordRpcCall(false);
         return RoomCallStatus::kUnavailable;
     }
     if (out_snapshot != nullptr) {
@@ -242,6 +286,7 @@ RoomCallStatus BrpcRoomClient::GetState(const std::string& room_id, const std::s
     stub.GetRoomState(&controller, &request, &response, nullptr);
 
     if (controller.Failed()) {
+        RecordRpcCall(false);
         return RoomCallStatus::kUnavailable;
     }
     if (out_snapshot != nullptr) {
@@ -264,6 +309,7 @@ RoomCallStatus BrpcRoomClient::GetResult(const std::string& match_id, const std:
     stub.GetMatchResult(&controller, &request, &response, nullptr);
 
     if (controller.Failed()) {
+        RecordRpcCall(false);
         return RoomCallStatus::kUnavailable;
     }
 
@@ -306,6 +352,7 @@ RoomCallStatus BrpcRoomClient::GetSnapshotsSince(const std::string& room_id,
     stub.GetRoomSnapshotsSince(&controller, &request, &response, nullptr);
 
     if (controller.Failed()) {
+        RecordRpcCall(false);
         return RoomCallStatus::kUnavailable;
     }
 
@@ -325,6 +372,7 @@ RoomCallStatus BrpcRoomClient::GetSnapshotsSince(const std::string& room_id,
             out_range->snapshots.push_back(ToSnapshot(snapshot));
         }
     }
+    RecordRpcCall(true);
     return RoomCallStatus::kOk;
 }
 

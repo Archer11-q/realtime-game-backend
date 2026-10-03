@@ -152,6 +152,23 @@ private:
                                    rgbt::gateway::v1::Error* error,
                                    const char* not_found_reason = "room_not_found");
 
+    /// 设置 HTTP 状态码并记一次指标。处理函数一律调用本函数而不是
+    /// `ApplyHttpStatus`，这样"漏记账"就不可能发生——这是选它做收敛点的理由：
+    /// 新增接口时忘记录指标不会有任何报错，只会让面板数字悄悄偏低。
+    void ApplyHttpStatusAndRecord(::google::protobuf::RpcController* controller,
+                                  std::int32_t status_code);
+
+    /// 真正的记账逻辑。参数用 `google::protobuf::RpcController`（而不是
+    /// `brpc::Controller`）是为了让本头文件**不依赖 brpc**：brpc 的头文件对
+    /// include 顺序有要求（glog 的导出宏必须在它之前定义），一旦泄漏进这个被广泛
+    /// 包含的头，就会以"glog 没有被正确包含"这种看不出根因的报错出现（实测踩到）。
+    /// 实现里再做一次 downcast。
+    void RecordHttpRequest(::google::protobuf::RpcController* controller,
+                           std::int32_t status_code) noexcept;
+
+    /// 构造完成标志。构造过程中不该记账，否则会用到尚未就绪的登记表。
+    bool metrics_ready_ = false;
+
     SessionStore* sessions_;
     // 不加 const：接口方法本身不是 const（实现需要查询外部依赖），
     // 与 sessions_ 的写法保持一致。
