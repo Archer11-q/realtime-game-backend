@@ -34,7 +34,24 @@ jobs:
       - name: 安装构建依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache clang-format
+          sudo apt-get install -y ninja-build ccache
+
+      # clang-format 必须与开发环境同主版本（21.x），不能用 ubuntu-24.04 源里的
+      # 18.x：默认换行/对齐策略跨版本会变，同一个文件两边判定不一致，表现为
+      # **本地绿、CI 红**，而门禁无法在本地复现（实测踩到：PR #16 三个预设全红，
+      # 原因只是 src/gateway/stream_hub.cpp 在 18 与 21 下的判定不同）。
+      # scripts/check-format.sh 会校验主版本并在不符时明确报错，两边读同一处要求。
+      - name: 安装 clang-format 21（版本必须与开发环境一致）
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-21 main" |
+            sudo tee /etc/apt/sources.list.d/llvm-21.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y clang-format-21
+          # 让 `clang-format` 指向 21，脚本与本地都按同一命令调用。
+          sudo ln -sf /usr/bin/clang-format-21 /usr/local/bin/clang-format
 
       - name: 缓存编译产物
         uses: actions/cache@v4
@@ -49,6 +66,7 @@ jobs:
           cmake --version | head -1
           g++ --version | head -1
           ninja --version
+          clang-format --version
 
       - name: 配置
         run: cmake --preset ${{ matrix.preset }}
