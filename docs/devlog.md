@@ -2659,6 +2659,57 @@ Grafana 可访问且面板已 provisioning 加载。
 只有定义、没有调用）。因此 P50/P95/P99 没有数据。面板描述里已标注这一点。
 接上它需要给 HTTP 处理器加计时，属下一步工作。
 
+## TASK-021 前期调研（2026-10-03）
+
+已建分支 `feat/task-021-trace`，但**尚未开始实现**。本轮先查证了三件会决定实现方式的事，
+记下来避免重复调研。
+
+### 1. Gateway 的 trace 缺口（用数据确认，不是印象）
+
+逐个处理函数统计"是否使用 request_id / 是否产生结构化日志"：
+
+| 处理函数 | 产生结构化日志 |
+|---|---|
+| `EnqueueMatch` | ✅ 2 条（`match_enqueue_ok` / `match_enqueue_failed`） |
+| `StreamEvents` | ✅ 3 条（`subscribe_ready`、两条 `subscribe_rejected`） |
+| `Login` | ❌ **0 条** |
+| `GetCurrentPlayer` / `Logout` | ❌ 0 条 |
+| `GetMatchStatus` / `CancelMatch` | ❌ 0 条 |
+| `JoinRoom` / `SubmitInput` / `GetRoomState` | ❌ 0 条 |
+| `GetMatchResult` | ❌ 0 条 |
+
+也就是说：**登录、进房、结算这三条关键路径在整个 Gateway 侧一条可检索的记录都没有**。
+"按 trace id 取出一条完整调用序"目前做不到。
+
+### 2. 解决方案的落点（已确认可行）
+
+`ApplyHttpStatusAndRecord` 是 Gateway **所有** HTTP 响应（含成功路径）的唯一收敛点
+（TASK-019 就是靠它记账）。在它里面统一输出一条 `request_done` 行，就能覆盖全部处理函数，
+不需要逐个改。携带 `trace`（即 request_id）与 `status`，`op` 由请求路径推导。
+
+### 3. brpc 不提供"请求开始时间"（查证结论，会改变实现方式）
+
+查 `brpc/controller.h`：
+
+- `start_realtime_us` **只是 `IssueRPC(int64_t)` 的参数**（客户端），
+  **不是** Controller 上的访问器 → 服务端拿不到请求开始时刻；
+- `latency_us()` 的注释明确写着：客户端是 RPC 延迟，**服务端是"处理前的排队时间"**
+  （`it gets queue time before server processes the RPC call`）
+  → 它**不能**当作处理耗时用。
+
+结论：HTTP 耗时直方图（`rgbt_http_request_seconds`）必须**逐处理函数计时**，
+或者选一个统一的落点。注意这与"trace 用收敛点统一输出"是两件事——
+trace 只需要 request_id（处理函数里已经有了），而耗时需要开始时刻（只能在函数入口取）。
+
+### 4. 延迟直方图的现状（TASK-020 的遗留项）
+
+`rgbt_http_request_seconds` 的指标名（`metrics.hpp`）与 `Observe()`（`metrics.cpp`）都已实现，
+但**全仓库没有任何 `Observe(` 调用点**。因此 TASK-020 的延迟面板是空的。
+
+接入方式（二选一，实现时决定）：
+- 在每个处理函数入口记 `now`，出口 `Observe`；或
+- 在 `StreamHub`/服务基类之外加一层薄包装统一计时。
+
 ## CI 格式门禁的版本漂移（2026-10-03）
 
 **现象**：PR #16 与 #17 的三个预设（debug / release / asan）**全部失败**，且都发生在
