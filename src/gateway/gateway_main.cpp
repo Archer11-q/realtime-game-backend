@@ -32,6 +32,7 @@
 
 #include "brpc_match_client.hpp"
 #include "brpc_room_client.hpp"
+#include "common/logging.hpp"
 #include "common/mysql_connection.hpp"
 #include "common/version.hpp"
 #include "database_player_directory.hpp"
@@ -89,6 +90,10 @@ void HandleSignal(int /*sig*/) {
 
 int main(int argc, char* argv[]) {
     google::ParseCommandLineFlags(&argc, &argv, true);
+
+    // TASK-018：结构化日志的 service 字段。必须在任何日志之前设置，
+    // 否则进程启动阶段（最容易出问题的那一段）的日志会缺服务名。
+    rgbt::common::SetServiceName("gateway");
 
     const std::string env_prefix = FLAGS_env_prefix;
 
@@ -181,12 +186,13 @@ int main(int argc, char* argv[]) {
     brpc::ServiceOptions service_options;
     service_options.restful_mappings = mappings;
     if (server.AddService(&service, service_options) != 0) {
-        std::fprintf(stderr, "注册 GatewayService 失败：restful 映射可能不合法\n");
+        rgbt::common::LogError("service_register_failed", {{"detail", "restful 映射可能不合法"}});
         return 1;
     }
 
     if (server.Start(FLAGS_port, &options) != 0) {
-        std::fprintf(stderr, "启动 Gateway 失败，端口 %d 可能已被占用\n", FLAGS_port);
+        rgbt::common::LogError("service_start_failed", {{"port", std::to_string(FLAGS_port)},
+                                                        {"hint", "端口可能已被占用"}});
         return 1;
     }
 

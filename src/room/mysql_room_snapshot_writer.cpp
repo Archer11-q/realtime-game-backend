@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include "common/logging.hpp"
+
 namespace rgbt::room {
 namespace {
 
@@ -98,11 +100,10 @@ SnapshotWriteStatus MysqlRoomSnapshotWriter::Save(const RoomSnapshotRecord& reco
         //
         // 顺便说明为什么这条日志是 stderr 而不是丢弃：快照可以丢弃，
         // 但"一直写不进去"必须被看见——那意味着"重启可恢复"已经不成立了。
-        std::fprintf(stderr,
-                     "[room] 房间快照写入失败（可丢弃，不重试，下个周期覆盖）："
-                     "match_id=%s frame=%lld err=%s\n",
-                     record.match_id.c_str(), static_cast<long long>(record.frame),
-                     connection_->last_error().c_str());
+        rgbt::common::LogWarn("room_snapshot_write_failed", record.match_id,
+                              {{"frame", std::to_string(record.frame)},
+                               {"err", connection_->last_error()},
+                               {"policy", "可丢弃、不重试，下个周期覆盖"}});
         return SnapshotWriteStatus::kUnavailable;
     }
     return SnapshotWriteStatus::kOk;

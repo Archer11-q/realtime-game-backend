@@ -13,6 +13,7 @@
 #include <string_view>
 #include <utility>
 
+#include "common/logging.hpp"
 #include "common/token.hpp"
 #include "error.hpp"
 
@@ -597,11 +598,25 @@ void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* control
     const MatchCallStatus call = match_->Enqueue(player_id, request_id, &snapshot);
     const std::int32_t status = HandleMatchFailure(call, request_id, &error);
     if (status != 200) {
+        // 失败也要记：否则"客户端说入队失败"在 Gateway 侧查不到任何痕迹。
+        rgbt::common::LogWarn("match_enqueue_failed", request_id,
+                              {{"player", player_id},
+                               {"reason", error.reason()},
+                               {"http_status", std::to_string(status)}});
         *response->mutable_error() = error;
         response->set_status_code(status);
         ApplyHttpStatus(controller, status);
         return;
     }
+
+    // TASK-018：与 Match 侧的 `match_enqueued` 共用同一个 request_id，
+    // 于是"点开始匹配"这件事在两个服务的日志里能用同一个键串起来——这正是
+    // Phase 3 退出标准第一条要求的能力。
+    rgbt::common::LogInfo("match_enqueue_ok", request_id,
+                          {{"player", player_id},
+                           {"match_state", std::string(MatchStateName(snapshot.state))},
+                           {"match_id", snapshot.match_id},
+                           {"room_id", snapshot.room_id}});
 
     response->set_status_code(200);
     ApplyHttpStatus(controller, 200);
@@ -715,7 +730,7 @@ void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
     }
 
     RoomSnapshot snapshot;
-    const RoomCallStatus call = room_->Join(room_id, player_id, &snapshot);
+    const RoomCallStatus call = room_->Join(room_id, player_id, request_id, &snapshot);
     const std::int32_t status = HandleRoomFailure(call, request_id, &error);
     if (status != 200) {
         *response->mutable_error() = error;
@@ -769,7 +784,7 @@ void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controll
     RoomSnapshot snapshot;
     // player_id 来自会话，请求体里即使带同名字段也会被忽略：
     // 否则任何登录用户都能替别人提交输入。
-    const RoomCallStatus call = room_->SubmitAttack(room_id, player_id, &snapshot);
+    const RoomCallStatus call = room_->SubmitAttack(room_id, player_id, request_id, &snapshot);
     const std::int32_t status = HandleRoomFailure(call, request_id, &error);
     if (status != 200) {
         *response->mutable_error() = error;
@@ -824,7 +839,7 @@ void GatewayServiceImpl::GetRoomState(::google::protobuf::RpcController* control
     }
 
     RoomSnapshot snapshot;
-    const RoomCallStatus call = room_->GetState(room_id, &snapshot);
+    const RoomCallStatus call = room_->GetState(room_id, request_id, &snapshot);
     const std::int32_t status = HandleRoomFailure(call, request_id, &error);
     if (status != 200) {
         *response->mutable_error() = error;
@@ -877,7 +892,7 @@ void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* contr
     }
 
     MatchResultView view;
-    const RoomCallStatus call = room_->GetResult(match_id, &view);
+    const RoomCallStatus call = room_->GetResult(match_id, request_id, &view);
     const std::int32_t status = HandleRoomFailure(call, request_id, &error, "result_not_found");
 
     // 房间快照在成功与「结果待落库」两种情况下都可能存在，先填上。
@@ -912,7 +927,12 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
     brpc::ClosureGuard done_guard(done);
 
     const std::string token = ExtractToken(controller, request->token());
-    const std::string request_id = request->request_id();
+    // TASK-018：`request_id` 也从 query string 读。GET /stream 没有请求体，而 brpc
+    // **不会**把 query string 映射进 protobuf 字段（与 token/room_id 同一个坑），
+    // 于是这里原来永远是空串——订阅链路因此无法按 id 与其它服务关联。
+    // 这是排查入口，不是契约变更：取值顺序仍是"请求体优先，其次 query"。
+    const std::string request_id =
+        ExtractQueryParam(controller, "request_id", request->request_id());
     const std::string room_id = ExtractQueryParam(controller, "room_id", request->room_id());
 
     std::string player_id;
@@ -947,8 +967,11 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
     // 没有这一步，任何登录用户只要猜到（或用别人给的）room_id，就能长期订阅到
     // 别人房间的血量与胜负。room_id 由服务端随机生成，但「难猜」不是访问控制。
     RoomSnapshot snapshot;
-    const RoomCallStatus lookup = room_->GetState(room_id, &snapshot);
+    const RoomCallStatus lookup = room_->GetState(room_id, request_id, &snapshot);
     if (lookup != RoomCallStatus::kOk) {
+        rgbt::common::LogWarn(
+            "subscribe_rejected", request_id,
+            {{"reason", "room_lookup_failed"}, {"room", room_id}, {"player", player_id}});
         const std::int32_t status = HandleRoomFailure(lookup, request_id, &error);
         *response->mutable_error() = error;
         response->set_status_code(status);
@@ -963,6 +986,12 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         }
     }
     if (!is_member) {
+        // TASK-018：拒绝也要留痕。此前这条路径**什么都不记**，于是"客户端说订阅被拒"
+        // 在服务端查不到任何证据——而这正是最需要日志的时刻（可能是攻击，也可能是
+        // 前端把 room_id 传错了）。
+        rgbt::common::LogWarn(
+            "subscribe_rejected", request_id,
+            {{"reason", "not_a_member"}, {"room", room_id}, {"player", player_id}});
         const std::int32_t status =
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "not_a_member",
                       "该玩家不是这一局的成员", request_id);
@@ -1024,6 +1053,11 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
     SubscribeOptions subscribe_options;
     subscribe_options.last_event_id = last_event_id.value;
     subscribe_options.last_event_id_malformed = last_event_id.malformed;
+    // TASK-018：把本次 HTTP 请求的 request_id 交给订阅表，让这条连接引发的所有
+    // Room 调用（上报 presence、轮询状态、补发历史）都带同一个关联键。
+    // 漏了这一行时的表现是：Gateway 自己的日志有 trace=，而 Room 侧那几条
+    // `presence_reported` 没有——跨服务链路断在中间（实测踩到）。
+    subscribe_options.request_id = request_id;
 
     const SubscriptionReport subscription = stream_->Subscribe(
         player_id, room_id, std::make_unique<ProgressiveAttachmentSink>(attachment),
@@ -1044,13 +1078,16 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
     // （实测踩过同类问题：HTTP 头不会被 brpc 映射进 protobuf 字段，漏读一次
     // 就表现为"永远不补发"，而链路上没有任何报错。）
     //
-    // `last_event_id_text` 必须先落到具名变量：`std::to_string(...).c_str()`
-    // 里的临时 std::string 会在整条语句结束时析构，日志拿到的是悬空指针。
+    // 三态要能分辨：malformed（头坏了）/ none（没带头，第一次订阅）/ 具体帧号。
+    // 把 "none" 与 "0" 分开是必要的——0 是一个**合法帧号**（对局刚建好时就是它），
+    // 而"没带头"是完全不同的意思，混在一起排障时会误判。
     const std::string last_event_id_text =
         last_event_id.malformed ? std::string("malformed") : std::to_string(last_event_id.value);
-    std::fprintf(stderr, "[gateway] 订阅已建立：sub=%llu room=%s player=%s last_event_id=%s\n",
-                 static_cast<unsigned long long>(subscription.id), room_id.c_str(),
-                 player_id.c_str(), last_event_id_text.c_str());
+    rgbt::common::LogInfo("subscribe_ready", request_id,
+                          {{"sub", std::to_string(subscription.id)},
+                           {"room", room_id},
+                           {"player", player_id},
+                           {"last_event_id", last_event_id_text}});
     response->set_status_code(200);
     ApplyHttpStatus(controller, 200);
 }

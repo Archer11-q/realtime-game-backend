@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <utility>
 
+#include "common/logging.hpp"
+
 namespace rgbt::gateway {
 namespace {
 
@@ -19,6 +21,20 @@ std::int64_t SystemNowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+/// 由订阅的关联键派生"轮询用"的 request_id（TASK-018）。
+///
+/// 为什么需要派生而不是直接用订阅的 request_id：同一条订阅在生命周期内会发起
+/// 很多次 `GetRoomState`（每 100 ms 一次）。若它们全都用建立订阅时的那个
+/// request_id，日志里就分不清"这一次轮询"和"建立订阅"——而排障时恰恰需要区分。
+/// 加 `:poll` 后缀既保留了可关联性（前缀相同、可 grep 到同一条链路），
+/// 又标明了来源。订阅没有关联键时回落到 `room:<id>`。
+std::string PollRequestId(const std::string& subscription_request_id, const std::string& room_id) {
+    if (subscription_request_id.empty()) {
+        return "room:" + room_id;
+    }
+    return subscription_request_id + ":poll";
 }
 
 /// JSON 字符串转义。
@@ -245,6 +261,7 @@ SubscriptionReport StreamHub::Subscribe(std::string player_id, std::string room_
         subscription.id = id;
         subscription.player_id = std::move(player_id);
         subscription.room_id = std::move(room_id);
+        subscription.request_id = options.request_id;
         subscription.sink = std::shared_ptr<EventSink>(std::move(sink));
         // TASK-017：补发请求挂在这里，由下一次 Tick 在锁外执行。
         // **不在 Subscribe 里写数据**：此刻 brpc 的响应还没提交，
@@ -263,22 +280,25 @@ SubscriptionReport StreamHub::Subscribe(std::string player_id, std::string room_
 
     // TASK-016：把"这个玩家的推送连接建立了"如实上报给 Room。
     // 在锁外做（本项目一贯规则：持锁不做 I/O）。
-    ReportPresence(report_room_id, report_player_id, true);
+    ReportPresence(report_room_id, report_player_id, true, options.request_id);
     return report;
 }
 
 void StreamHub::ReportPresence(const std::string& room_id, const std::string& player_id,
-                               bool online) {
+                               bool online, const std::string& request_id) {
     if (room_ == nullptr) {
         return;
     }
-    const RoomCallStatus status = room_->SetPresence(room_id, player_id, online, nullptr);
+    const RoomCallStatus status =
+        room_->SetPresence(room_id, player_id, online, request_id, nullptr);
     if (status != RoomCallStatus::kOk && status != RoomCallStatus::kAlreadyFinished) {
         // 不重试、不阻塞推送：Room 短暂不可用时，客户端的轮询兜底仍然可用；
         // 下一次连接变化（或重连）会重新上报。
-        std::fprintf(stderr,
-                     "[gateway] 上报连接状态失败（不重试）：room_id=%s player_id=%s online=%d\n",
-                     room_id.c_str(), player_id.c_str(), online ? 1 : 0);
+        rgbt::common::LogWarn("presence_report_failed", request_id,
+                              {{"room", room_id},
+                               {"player", player_id},
+                               {"online", online ? "true" : "false"},
+                               {"policy", "不重试（下一次连接变化会覆盖）"}});
     }
 }
 
@@ -301,6 +321,7 @@ void StreamHub::Unsubscribe(std::uint64_t id) {
     std::shared_ptr<EventSink> sink;
     std::string room_id;
     std::string player_id;
+    std::string request_id;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         const auto it = subscriptions_.find(id);
@@ -310,11 +331,12 @@ void StreamHub::Unsubscribe(std::uint64_t id) {
         sink = it->second.sink;
         room_id = it->second.room_id;
         player_id = it->second.player_id;
+        request_id = it->second.request_id;
         subscriptions_.erase(it);
     }
     // TASK-016：连接已经结束，上报"断线"让 Room 进入宽限期。
     // 注意这也覆盖 Gateway 主动断开（优雅退出）的情况——那是事实。
-    ReportPresence(room_id, player_id, false);
+    ReportPresence(room_id, player_id, false, request_id);
     // 在锁外关闭：Close 可能触发写与刷出。
     if (sink != nullptr) {
         sink->Close();
@@ -333,6 +355,8 @@ void StreamHub::Tick(std::int64_t now_ms) {
 
     // 阶段一：锁内取快照。按房间分组以便扇入，另行收集需要首发、补发与心跳的订阅。
     std::unordered_map<std::string, std::vector<SinkRef>> by_room;
+    /// room_id -> 该房间任一订阅的关联键，供轮询日志使用（TASK-018）。
+    std::unordered_map<std::string, std::string> room_request_ids;
     std::vector<ReadyTarget> need_ready;
     std::vector<SinkRef> need_heartbeat;
     std::vector<BackfillTarget> need_backfill;
@@ -356,10 +380,12 @@ void StreamHub::Tick(std::int64_t now_ms) {
                 sub.backfill_pending && (sub.backfill_from.has_value() || sub.backfill_malformed);
             if (should_backfill) {
                 need_backfill.push_back(BackfillTarget{sub.id, sub.sink, sub.room_id,
-                                                       sub.backfill_from, sub.backfill_malformed});
+                                                       sub.request_id, sub.backfill_from,
+                                                       sub.backfill_malformed});
                 continue;
             }
             by_room[sub.room_id].push_back(SinkRef{sub.id, sub.sink});
+            room_request_ids[sub.room_id] = sub.request_id;
             if (!sub.ready_sent) {
                 need_ready.push_back(ReadyTarget{sub.id, sub.sink, sub.player_id, sub.room_id});
             } else if (now_ms - sub.last_heartbeat_ms >= options_.heartbeat_interval_ms) {
@@ -397,7 +423,11 @@ void StreamHub::Tick(std::int64_t now_ms) {
     }
 
     for (const auto& entry : by_room) {
-        TickRoom(entry.first, entry.second, now_ms, &failed);
+        const auto request_id_it = room_request_ids.find(entry.first);
+        const std::string poll_request_id = PollRequestId(
+            request_id_it == room_request_ids.end() ? std::string() : request_id_it->second,
+            entry.first);
+        TickRoom(entry.first, entry.second, poll_request_id, now_ms, &failed);
     }
 
     for (const ReadyTarget& target : need_ready) {
@@ -415,6 +445,7 @@ void StreamHub::Tick(std::int64_t now_ms) {
 
     // 阶段四：回锁内提交状态，并清理写失败的订阅。
     std::vector<std::pair<std::string, std::string>> gone;  // room_id, player_id
+    std::vector<std::string> gone_request_ids;              // 与 gone 一一对应
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& entry : backfilled) {
@@ -477,6 +508,7 @@ void StreamHub::Tick(std::int64_t now_ms) {
                 // （由 stream_hub_test 的 WriteFailureReportsPlayerOffline 锁定）。
                 // 上了锁，所以只把 id 收集起来，出锁后再做 I/O。
                 gone.emplace_back(it->second.room_id, it->second.player_id);
+                gone_request_ids.push_back(it->second.request_id);
                 std::shared_ptr<EventSink> sink = it->second.sink;
                 subscriptions_.erase(it);
                 if (sink != nullptr) {
@@ -488,8 +520,8 @@ void StreamHub::Tick(std::int64_t now_ms) {
 
     // 出锁后再上报：断网的客户端必须让 Room 进入宽限期，否则这些对局在服务端
     // 看起来一切正常，而玩家其实已经掉线了。
-    for (const auto& entry : gone) {
-        ReportPresence(entry.first, entry.second, false);
+    for (std::size_t i = 0; i < gone.size(); ++i) {
+        ReportPresence(gone[i].first, gone[i].second, false, gone_request_ids[i]);
     }
 }
 
@@ -508,10 +540,11 @@ StreamHub::BackfillOutcome StreamHub::BackfillSubscription(const BackfillTarget&
     // `payload` 必须是**当前完整状态**：客户端要按它刷新，而不是再发一次查询。
     // 取不到它时不调用本函数（见各分支的 have_current 判断）。
     const auto send_reset = [&](const char* reason, const RoomSnapshot& payload) {
-        std::fprintf(stderr,
-                     "[gateway] 发出 stream.reset：room_id=%s reason=%s window=[%lld,%lld]\n",
-                     target.room_id.c_str(), reason, static_cast<long long>(range.oldest_frame),
-                     static_cast<long long>(range.latest_frame));
+        rgbt::common::LogInfo("stream_reset_sent", target.request_id,
+                              {{"room", target.room_id},
+                               {"reason", reason},
+                               {"window_oldest", std::to_string(range.oldest_frame)},
+                               {"window_latest", std::to_string(range.latest_frame)}});
         outcome.write_failed = !target.sink->Write(SseEvent(
             "stream.reset", StreamResetJson(reason, payload, SystemNowMs()), payload.frame));
         outcome.reset_sent = !outcome.write_failed;
@@ -531,7 +564,8 @@ StreamHub::BackfillOutcome StreamHub::BackfillSubscription(const BackfillTarget&
         // 不变量（stream_hub_test 的 MalformedLastEventIdSendsResetWithItsOwnReason
         // 断言 get_snapshots_calls == 0）。
         RoomSnapshot current;
-        if (room_->GetState(target.room_id, &current) != RoomCallStatus::kOk) {
+        if (room_->GetState(target.room_id, PollRequestId(target.request_id, target.room_id),
+                            &current) != RoomCallStatus::kOk) {
             return outcome;  // 房间查不到：保持连接，什么都不发。
         }
         outcome.attempted = true;
@@ -554,13 +588,16 @@ StreamHub::BackfillOutcome StreamHub::BackfillSubscription(const BackfillTarget&
         return outcome;
     }
     const std::int64_t since_frame = *target.since_frame;
-    if (room_->GetSnapshotsSince(target.room_id, since_frame, &range) != RoomCallStatus::kOk) {
+    if (room_->GetSnapshotsSince(target.room_id, since_frame,
+                                 PollRequestId(target.request_id, target.room_id),
+                                 &range) != RoomCallStatus::kOk) {
         // Room 不可用（或房间已回收）：**不补发、不发事件、不关闭连接**。
         // 沿用 TASK-009 的取舍——一次抖动的代价不该是逼客户端重连；
         // 下一轮 Tick 会照常推当前状态（它同样会失败，直到 Room 回来）。
-        std::fprintf(stderr,
-                     "[gateway] 补发失败（Room 不可用，连接保持）：room_id=%s since_frame=%lld\n",
-                     target.room_id.c_str(), static_cast<long long>(since_frame));
+        rgbt::common::LogWarn("backfill_unavailable", target.request_id,
+                              {{"room", target.room_id},
+                               {"since_frame", std::to_string(since_frame)},
+                               {"policy", "保持连接并在下一轮重试"}});
         return outcome;
     }
 
@@ -583,7 +620,9 @@ StreamHub::BackfillOutcome StreamHub::BackfillSubscription(const BackfillTarget&
     // 重连都平白多一个可能超时的依赖调用。
     RoomSnapshot current;
     const bool have_current =
-        need_reset && room_->GetState(target.room_id, &current) == RoomCallStatus::kOk;
+        need_reset &&
+        room_->GetState(target.room_id, PollRequestId(target.request_id, target.room_id),
+                        &current) == RoomCallStatus::kOk;
     if (need_reset) {
         if (!have_current) {
             // 取不到当前状态：不发一条指向未知状态的指令。保持连接，
@@ -612,9 +651,10 @@ StreamHub::BackfillOutcome StreamHub::BackfillSubscription(const BackfillTarget&
     outcome.attempted = true;
     outcome.frames = range.snapshots.size();
 
-    std::fprintf(stderr, "[gateway] 已补发 %zu 帧：room_id=%s since_frame=%lld\n",
-                 range.snapshots.size(), target.room_id.c_str(),
-                 static_cast<long long>(since_frame));
+    rgbt::common::LogInfo("backfill_done", target.request_id,
+                          {{"room", target.room_id},
+                           {"frames", std::to_string(range.snapshots.size())},
+                           {"since_frame", std::to_string(since_frame)}});
     return outcome;
 }
 
@@ -645,7 +685,8 @@ std::string StreamHub::StateSignature(const RoomSnapshot& snapshot) {
 }
 
 void StreamHub::TickRoom(const std::string& room_id, const std::vector<SinkRef>& sinks,
-                         std::int64_t now_ms, std::vector<std::uint64_t>* failed) {
+                         const std::string& request_id, std::int64_t now_ms,
+                         std::vector<std::uint64_t>* failed) {
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         ++room_poll_count_;
@@ -656,7 +697,7 @@ void StreamHub::TickRoom(const std::string& room_id, const std::vector<SinkRef>&
     }
 
     RoomSnapshot snapshot;
-    if (room_->GetState(room_id, &snapshot) != RoomCallStatus::kOk) {
+    if (room_->GetState(room_id, request_id, &snapshot) != RoomCallStatus::kOk) {
         // 房间暂时查不到（已回收，或 Room 不可用）。这里**不关闭连接**：
         // Room 抖动恢复后同一房间仍可继续推送，而关闭连接会强迫客户端重连。
         // 也不推送 error，避免一次故障刷出一串事件。
@@ -745,7 +786,8 @@ void StreamHub::CloseAll() {
     for (auto& entry : taken) {
         // TASK-016：进程要走了，这些连接事实上就是断了。如实上报，
         // 让 Room 开始各自的宽限计时——客户端重连后会重新上报 online。
-        ReportPresence(entry.second.room_id, entry.second.player_id, false);
+        ReportPresence(entry.second.room_id, entry.second.player_id, false,
+                       entry.second.request_id);
         if (entry.second.sink != nullptr) {
             entry.second.sink->Close();
         }

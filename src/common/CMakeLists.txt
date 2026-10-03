@@ -5,6 +5,7 @@
 
 add_library(
   rgbt_common STATIC
+  logging.cpp
   token.cpp
   version.cpp
 )

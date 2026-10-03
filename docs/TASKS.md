@@ -1,13 +1,17 @@
 # 当前任务
 
-> 状态：**Phase 1 已完成，Phase 2 进行中。**
-> `main` 上已合并：**TASK-000 ~ TASK-013**（TASK-011 与 TASK-013 经 PR #10
-> 合并，合并提交 `cde8918`）。
-> **TASK-014（房间重启恢复与恢复边界）与 TASK-015（匹配队列的 Redis 快照与
-> 重启恢复）已实现，待项目所有者审阅与验收**，两者都作为**单个提交**落在
-> `feat/phase-2` 上（分支粒度见
-> [docs/03-development-workflow.md](03-development-workflow.md) 第 9 节）。
-> 阶段推进依据见 docs/02-roadmap.md 与 docs/devlog.md。
+> 状态：**Phase 1 与 Phase 2 均已完成并合并到 `main`；Phase 3 已确认拆分，
+> TASK-018 待开工。**
+> `main` 已包含 **TASK-000 ~ TASK-017**：TASK-013 ~ TASK-016 分别经
+> PR #10 ~ #13 合并；**TASK-017 经 PR #15 合并（merge commit `a61495a7`，
+> 2026-10-02）**。
+> Phase 2 的退出标准逐条对照表见 `docs/devlog.md` 的
+> 「Phase 2 退出标准对照表」，恢复时间的测量结果与上界见同文件的
+> 「推送连续性与恢复时间汇总」。
+> **Phase 3**（可观测性和容量基线）已由项目所有者确认拆为 5 个任务
+> （TASK-018 ~ TASK-022，见本文档「Phase 3 任务拆分」一节）；
+> **TASK-018 的任务单已确认、可开工**，TASK-019 及之后逐个确认后再开始。
+> 未经确认不开始编码。
 >
 > **2026-10-02 分支粒度纠正**：上一轮误按 Phase 1 的「一任务一分支」建了
 > `feat/task-014-*` / `feat/task-015-*` 两条分支（并建议 squash 合并），
@@ -1034,8 +1038,9 @@ Phase 2 要还的历史欠账（此前各任务明确标注为 "Phase 2" 的）�
 
 ### TASK-017：推送连续性与恢复时间报告
 
-- 状态：**待实施**（2026-10-02 任务单已写出，等待开工）。
-  按第 9 节的分支粒度，本任务是 `feat/phase-2` 上的**单个提交**。
+- 状态：**已完成（已合并到 main：`a61495a7`，PR #15，2026-10-02）**。
+  分支提交 `2d2edf29`，父提交 `335f149`（TASK-016）；合并是**真正的 merge commit**
+  （两个父提交），不是 squash。
 - 背景问题：Gateway 重启后所有 SSE 订阅丢失，客户端只能自己发现；且断线期间
   错过的 `room.state` 无法补发——SSE 规范自带的 `Last-Event-ID` 语义一直没用上
   （[ADR-0004](adr/0004-sse-instead-of-websocket.md) 已指出这一点）。
@@ -1078,9 +1083,243 @@ Phase 2 要还的历史欠账（此前各任务明确标注为 "Phase 2" 的）�
   `scripts/`、`docs/`。
 - 备注（收尾 Phase 2 的一部分）：本任务完成后，`docs/02-roadmap.md` 的 Phase 2
   状态改为已完成，并把"Phase 2 的退出标准逐条对照表"补进 `docs/devlog.md`。
+- **实施结果（2026-10-02）**——完整经过见 `docs/devlog.md` 的「TASK-017 实施记录」：
+  - 新增 `RoomService.GetRoomSnapshotsSince`（含 `SnapshotWindowStatus`）、
+    `BattleRoom::SnapshotsAfter` / `MaxSnapshotFrame`、`RoomManager::GetSnapshotsSince`。
+  - Gateway 侧：`RoomClient::GetSnapshotsSince`（接口 + brpc 实现）、
+    SSE 事件的 `id:` 行、`Last-Event-ID` 解析、订阅建立时的补发与
+    `stream.reset`；新增 `SubscribeReport` 让补发结果可被查询与断言。
+  - 前端：`parseSseBlock` 解析 `id:`，`streamRoom` 发送 `Last-Event-ID`，
+    重连时带上最后收到的帧号，并处理新事件 `stream.reset`。
+  - **任务单里两处相互矛盾的地方已由项目所有者裁决（2026-10-02）**：失败场景写
+    "`Last-Event-ID` 缺失或非法 → 不补发，直接按当前状态推（等同今天的行为，不报错）"，
+    而范围第 4 条又写"（或 id 非法/缺失）→ 发一个 `stream.reset`"。
+    裁决结果：**按失败场景那一条实现**——头缺失（第一次订阅）不补发、也不发
+    `stream.reset`，由第一次 Tick 正常推当前状态；头存在但**非法**仍发
+    `stream.reset`（`reason = id_malformed`），因为那是客户端的 bug，静默当成
+    首次订阅会让它以为自己拿到了连续的事件。
+    代码上就是 `StreamHub::BackfillSubscription` 里"头缺失"提前返回的那个分支，
+    相关用例改为 `FreshSubscriptionWithoutLastEventIdGetsNormalStatePush`。
+  - 验收状态（2026-10-02）：**已在 WSL 全绿通过，并合并到 `main`（PR #15，
+    merge commit `a61495a7`）**。项目所有者执行的验收命令见
+    `docs/devlog.md` 的「TASK-017 实施记录」。
+  - 交付过程的教训（已写入 devlog，值得留在这里）：本任务最初在
+    `D:\CLion\realtime-game-backend`（迁移前的备份副本，git 记录停在 TASK-007
+    且无编译器）上实现，因此一度无法提交与推送；期间还误把"TASK-016 的全绿"
+    当成本任务的验收结果。**根因是没有先核对"我改的地方是不是正式仓库"**——
+    `docs/06-operations.md` 第 31-33 行已写明正式仓库只有
+    `~/workspace/realtime-game-backend`。最终用"从远端克隆 + 归一化行尾 +
+    `git diff` 生成 patch + WSL 侧 `git apply`"的方式搬运，
+    比逐文件 rsync 更安全（不受 mtime 与 DrvFs 权限位影响）。
 
 
-## TASK-012：范围裁剪——把非目标写进文档
+## Phase 3 任务拆分（2026-10-02 项目所有者确认，5 个任务）
+
+Phase 2 已全部完成并合并（TASK-013 ~ TASK-017，`main` 含至 PR #15）。Phase 3 的
+范围与退出标准见 `docs/02-roadmap.md` 第 6 节。
+
+拆分原则与前两个阶段一致：**每个任务都要有可独立运行的验收命令，且不引入下一个
+任务的组件。** 与前两阶段的差别是：本阶段的任务**交付物是"可验证的事实"而不是
+功能**——判定标准是"能不能定位问题、能不能复现数字"，而不是"接口能不能调通"。
+
+| 顺序 | 编号 | 任务 | 依赖 |
+|---|---|---|---|
+| 1 | TASK-018 | 结构化日志与请求 ID 贯通 | 无 |
+| 2 | TASK-019 | 指标暴露（`/metrics`） | 无（可与 018 并行） |
+| 3 | TASK-020 | Prometheus + Grafana 接入 | TASK-019 |
+| 4 | TASK-021 | 关键路径 trace id 贯通 | TASK-018 |
+| 5 | TASK-022 | 容量基线与首份报告 | TASK-020 |
+
+**已确认的三项决策（2026-10-02，项目所有者）**：
+
+1. **监控组件单独一份 `deploy/compose/docker-compose.observability.yml`**，
+   不放进日常的 `docker-compose.yml`——否则每次开发与每次 `verify-all.sh`
+   都要多起两个容器。日常启动流程（`dev-up.sh`）保持只起 Redis + MySQL。
+2. **链路追踪先做 trace id 贯通，不引入 OTLP collector**：五条关键路径共用同一个
+   id 写进结构化日志即可满足"任一错误可以定位到服务、请求、会话或房间"。
+   真正的 span 导出留到 Phase 5 前再评估（需要额外的 C++ 依赖与 collector）。
+3. **任务单一次写完，逐个开工**：TASK-018 确认后即可开始；
+   TASK-019 及之后在开工前由项目所有者逐个确认（避免把"计划"写成"承诺"）。
+
+### TASK-018：结构化日志与请求 ID 贯通
+
+- 状态：**已完成并实测通过**（2026-10-03）。
+  完整经过与实测数字见 `docs/devlog.md` 的「TASK-018 实施记录」。
+- 已完成：
+  - `include/common/logging.hpp` + `src/common/logging.cpp`（单行 `key=value`、
+    恒定字段、值转义、服务名）。
+  - `request_id` 经 proto 既有字段贯通 Gateway → Match → Room；
+    `RoomClient` 六个方法增加 `request_id` 形参，替换掉实现里自拼的伪 id。
+  - **30 处 `std::fprintf(stderr, ...)` 全部改造完毕**（`logging.hpp` 里仅剩
+    注释中的历史引用）。已接入的关键路径包括：`match_enqueued`、
+    `match_enqueue_ok` / `match_enqueue_failed` / `subscribe_ready` /
+    `subscribe_rejected`、`room_created` / `room_joined` / `presence_reported`、
+    `room_restored` / `room_snapshot_rejected` / `result_persist_failed`、
+    `queue_snapshot_*`、`create_room_call_failed` / `create_room_rejected`、
+    `mysql_*`、`service_start_failed` 等。
+  - `scripts/verify-observability.sh --logs`（新增）与
+    `tests/unit/common/logging_test.cpp`（16 个用例）。
+  - **既有验收脚本同步更新**：`verify-persistence.sh` 里 5 处断言由"匹配中文日志
+    文本"改为"匹配结构化事件名"（`event=room_restored` 等）。这一点是必须的：
+    改日志格式等于改服务输出，脚本不同步就会出现假失败。
+  - 实测：构建 0 error / 0 warning；`ctest` 253/253；格式检查 77 文件通过；
+    `verify-observability.sh --logs` 退出码 0（**三层贯通**）；
+    `verify-all.sh` **7/7 通过**（204 秒）。
+- 剩余（可选的后续改进，不属于本任务验收范围）：
+  - 登录、结果查询等路径尚未补结构化日志（目前只覆盖关键路径）。
+  - `verify-all.sh` 尚未把 `verify-observability.sh` 纳入常规门禁。
+- 依赖：无
+- 背景问题：Phase 2 排查问题时最耗时的一环是**把一次请求在三份 stderr 日志里
+  对上**。现状是 30 处 `std::fprintf(stderr, "[service] ...")`（`[gateway]` /
+  `[room]` / `[match]` / `[mysql]`），人眼可读但机器不可解析，且只有部分行带
+  `match_id` / `room_id`。Phase 3 的退出标准第一条是"任一错误可以定位到服务、
+  请求、会话或房间"——现在做不到，因为**没有任何一个 id 是三份日志共有的**。
+- 本次目标：让每一条日志自带服务名与关联 id，并且同一次请求在三个服务里的
+  日志可以用同一个 id 串起来。
+- 范围：
+  - `include/common/logging.hpp` + `src/common/logging.cpp`：一个极薄的
+    结构化日志函数（`key=value` 文本、单行、带服务名与时间戳）。
+    **不引入第三方日志库**（spdlog 等属于新增依赖，且 brpc/glog 已经在产物里，
+    再多一套只会增加迁移面）。
+  - 三个服务入口各初始化一次服务名（`service=gateway|match|room`）。
+  - 把既有 30 处 `fprintf(stderr, ...)` 逐步改为结构化输出，**不改变日志内容
+    与语义**，只改变形态（这是可回归的：同一条失败路径仍然看得见同样的字段）。
+  - `request_id` 贯通：Gateway 的 HTTP 入口已有 `request_id`；Gateway→Match、
+    Gateway→Room、Match→Room 的 brpc 调用把它带过去（proto 里已有
+    `request_id` 字段，无需改契约）；Room 的 ticker 线程没有请求上下文，
+    用 `room_id` 与 `match_id` 关联即可。
+  - `scripts/verify-observability.sh`（新增，本任务只做日志一节）：
+    制造一条已知错误（例如带无效 room_id 订阅），断言该错误在所有相关服务的
+    日志里都能按同一个 request_id 找到。
+- 非范围：
+  - 不改任何接口契约、不加 proto 字段（`request_id` 已存在）。
+  - 不做日志聚合/采集（Loki/ELK 均不在 Phase 3 范围）。
+  - 不动 brpc 自身的日志配置（`-logtostderr` 等启动参数保持现状）。
+  - 不做指标（TASK-019）与 trace（TASK-021）。
+- 相关 ADR：无新增。日志格式属实现细节，不改服务边界与数据所有权。
+- 涉及目录：`include/common/`、`src/common/`、`src/gateway/`、`src/match/`、
+  `src/room/`、`tests/unit/`、`scripts/`、`CMakeLists.txt`、`docs/`。
+- 接口变化：无（日志不是契约）。数据变化：无。
+- 失败场景：
+  - 日志函数本身失败（例如写 stderr 出错）→ 不抛异常、不影响业务路径，
+    与今天的 `fprintf` 行为一致。
+  - `request_id` 为空（老客户端不带）→ 用 `-` 占位，**不编造一个 id**。
+  - 单行过长 → 不截断业务字段（宁可行长，也不丢排障信息）。
+- 验收命令（在 WSL 中执行）：
+  ```bash
+  cmake --preset brpc-debug && cmake --build --preset brpc-debug
+  ctest --test-dir build/brpc-debug --output-on-failure
+  bash scripts/verify-observability.sh --logs
+  bash scripts/verify-all.sh            # 回归：既有 7 个脚本不受影响
+  ```
+- 测试要求：单元测试覆盖结构化输出的转义与空字段占位（含值里带空格、
+  引号、换行的情况）；端到端覆盖"一条错误可以按 request_id 串起三个服务"。
+- 回退方式：`git revert` 本任务提交。日志改动不影响任何行为路径，
+  去掉后退回分散的 `fprintf`。
+- 负责人：执行者（写入权）— 本轮由当前会话代理承担，项目所有者审阅与验收。
+
+### TASK-019：指标暴露（`/metrics`）
+
+- 状态：待确认（开工前由项目所有者确认）
+- 依赖：无（可与 TASK-018 并行）
+- 背景问题：`docs/04-quality-and-observability.md` 第 4 节列了 8 类指标的清单，
+  但至今**一个都没有暴露**。`StreamHub` 已经有可断言的计数器
+  （`BackfilledFrameCount` / `ResetEventCount`），却没有出口；其余指标
+  （连接数、QPS、延迟、错误率、房间数）连计数都没有。
+- 本次目标：三个服务各暴露一个 Prometheus 文本格式的 `/metrics` 端点，
+  指标项与第 4 节清单对齐。
+- 范围：
+  - `include/common/metrics.hpp` + `src/common/metrics.cpp`：计数器/直方图的
+    最小实现 + 文本暴露（**不引入 prometheus-cpp**：它会带来新依赖，
+    而文本格式本身就是协议，几十行可覆盖本项目需要的指标类型）。
+  - Gateway：HTTP 请求数（按路径与状态码）、SSE 连接数、推送补发帧数与
+    `stream.reset` 次数（按原因）、brpc 调用数与失败数。
+  - Match：队列长度、入队/配对/取消计数、快照写入成功/失败数。
+  - Room：房间数（按阶段）、帧推进计数、断线判负计数、结果落库重试计数、
+    快照写入成功/失败数。
+  - `brpc` 的 `/metrics` 与内置 `/status` 的关系写清楚（不要两个入口语义重叠）。
+  - `scripts/verify-observability.sh --metrics`：断言三个端点可访问、
+    指标可解析、且**关键计数确实随一次真实对局增长**（不能只断言"端点 200"）。
+- 非范围：
+  - 不引入 Prometheus 服务端与 Grafana（TASK-020）。
+  - 不做标签基数控制之外的优化（Phase 3 只记录瓶颈，不立即优化）。
+  - 不暴露任何敏感信息（Token、密码不得成为标签）。
+- 相关 ADR：无新增（ADR-0001 已包含 Prometheus 作为技术方向）。
+- 涉及目录：`include/common/`、`src/common/`、三个服务目录、`tests/unit/`、
+  `scripts/`、`CMakeLists.txt`、`docs/`。
+- 接口变化：新增三个 `/metrics` HTTP 端点（只读、无鉴权，仅监听本机）。
+- 数据变化：无。
+- 失败场景：`/metrics` 不可用时不影响业务端点；指标未注册时输出空集而不是报错；
+  高基数标签（例如把 `room_id` 当标签）必须避免。
+- 验收命令：`bash scripts/verify-observability.sh --metrics` + 既有全套回归。
+- 测试要求：单元测试覆盖文本格式与计数语义；端到端断言计数与真实事件一一对应。
+- 回退方式：`git revert`；指标是旁路，去掉后退回无指标状态。
+
+### TASK-020：Prometheus + Grafana 接入
+
+- 状态：待确认
+- 依赖：TASK-019
+- 背景问题：有指标端点但没有人采集、没有面板，等于"数据可查"这条退出标准
+  仍然没有兑现。
+- 本次目标：一条命令拉起采集与面板，并且**面板上的数字能与验收脚本对得上**。
+- 范围：`deploy/compose/docker-compose.observability.yml`（独立文件）、
+  Prometheus 抓取配置（三个服务的 `/metrics`）、Grafana 数据源与首块面板
+  （连接数、QPS、延迟、错误率、房间数）、`scripts/observability-up.sh` /
+  `-down.sh`、`scripts/verify-observability.sh --scrape`。
+- 非范围：不做告警规则与 Alertmanager（没有值班对象，属过度设计）；
+  不把监控栈接进 `dev-up.sh`；不做长期存储与远程写。
+- 失败场景（**本任务最需要先验证的**）：镜像拉不动是已知风险（文档记录过
+  GitHub 被限速、需走加速通道）。因此**第一步是限时拉取实测**，
+  而不是先写配置——这与 Backlog 里"应用服务容器化"那条的教训一致。
+  端口冲突、宿主机内存不足（Docker Desktop 仅 11 GiB）同样要预检。
+- 验收命令：`bash scripts/observability-up.sh && bash scripts/verify-observability.sh --scrape`。
+- 回退方式：`git revert` + `observability-down.sh`；不影响业务 compose。
+
+### TASK-021：关键路径 trace id 贯通
+
+- 状态：待确认
+- 依赖：TASK-018
+- 背景问题：日志有 id 了，但"一次登录/匹配/进房/重连/结算"跨三个服务的完整
+  路径仍然要人脑拼。
+- 本次目标：五条关键路径的每一个环节都带上同一个 trace id，并且能在日志里
+  按它取出一条完整的调用序。
+- 范围：Gateway 在入口生成 trace id（复用/兼容 `request_id`）、经 brpc 传递
+  （**不新增 proto 字段**：用已有的 `request_id` 字段承载，避免契约变更）、
+  Room 的内部线程用 room_id 关联；`scripts/verify-observability.sh --trace`
+  按 trace id 断言"五个服务内环节齐全且顺序单调"。
+- 非范围：不引入 OpenTelemetry SDK 与 OTLP collector（已确认）；
+  不做采样策略与 span 可视化；不改 proto。
+- 失败场景：id 在跨进程边界丢失（实测踩过同类问题：brpc 不会把 HTTP 头映射进
+  protobuf 字段，必须显式读取）→ 由验收脚本逐跳断言覆盖。
+- 验收命令：`bash scripts/verify-observability.sh --trace`。
+- 回退方式：`git revert`。
+
+### TASK-022：容量基线与首份报告
+
+- 状态：待确认（**开工前必须先确认测试环境与压测方式**，见下）
+- 依赖：TASK-020
+- 背景问题：`CLAUDE.md` 第 6 条要求"引入复杂度必须有容量证据"，而 Phase 2 的
+  三条已知限制（ticker 线程写快照、队列快照在入队请求路径、presence 不落库）
+  都因为"没有证据"被推迟。没有容量基线，Phase 4 的故障注入也无从判断
+  "这个延迟算不算异常"。
+- 本次目标：建立 1 / 10 / 50 / 100 / 500 / 1000 连接档位的可复现压测，
+  产出首份容量报告与至少一个明确瓶颈结论。
+- 范围：`scripts/bench.sh`（起服务、按档位施加负载、采集指标、落原始数据）、
+  `docs/benchmarks/` 首份报告（环境、版本、命令、原始结果、瓶颈结论）、
+  与 `docs/04-quality-and-observability.md` 的 SLO 一节对齐。
+- 非范围：不为了数字好看做优化（Phase 3 的纪律是"只记录瓶颈"）；
+  不做多实例与集群压测（ADR-0003 非目标）。
+- **开工前必须确认的两点**：
+  1. **压测客户端形态**：本仓库没有独立的压测工具。选项是
+     (a) 用 `wrk`/`hey` 之类现成 HTTP 工具（需安装），
+     (b) 写一个 C++/Python 的最小客户端（可复现但要多写代码），
+     (c) 复用 `web/` 的多标签页（不可控，不建议）。本机没有免密 sudo，
+     安装工具受限，这一点会直接改变任务边界。
+  2. **1000 连接的可行性**：Docker Desktop 只有 11 GiB，三个服务 + 监控栈
+     同机运行，1000 并发 SSE 长连接是否可达需要先做一次限时探测。
+- 验收命令：`bash scripts/bench.sh --level 100`（单档位可独立运行）+ 报告。
+- 回退方式：`git revert`；报告是文档，压测脚本是旁路。
+
 
 > **编号说明**：本任务在编号上排在 Phase 1 计划之后，但**实际执行时间早于
 > TASK-008 起的所有待办任务**。原因是它不实现任何功能，只是把已经确认的范围

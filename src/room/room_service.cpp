@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/logging.hpp"
+
 namespace rgbt::room {
 namespace {
 
@@ -136,6 +138,12 @@ void RoomServiceImpl::CreateRoom(google::protobuf::RpcController* /*controller*/
 
     switch (outcome) {
         case CreateOutcome::kOk:
+            // TASK-018：房间创建是"匹配成功"落到 Room 的那一步，带上 Match 传来的
+            // request_id，三个服务的日志才能用同一个键串起来。
+            rgbt::common::LogInfo("room_created", request->request_id(),
+                                  {{"room", room_id},
+                                   {"match_id", request->match_id()},
+                                   {"players", std::to_string(player_ids.size())}});
             response->set_room_id(room_id);
             FillSnapshot(snapshot, response->mutable_room());
             return;
@@ -175,6 +183,8 @@ void RoomServiceImpl::JoinRoom(google::protobuf::RpcController* /*controller*/,
 
     switch (*outcome) {
         case JoinOutcome::kOk:
+            rgbt::common::LogInfo("room_joined", request->request_id(),
+                                  {{"room", request->room_id()}, {"player", request->player_id()}});
             FillSnapshot(snapshot, response->mutable_room());
             return;
         case JoinOutcome::kNotAMember:
@@ -325,6 +335,13 @@ void RoomServiceImpl::SetPlayerPresence(google::protobuf::RpcController* /*contr
 
     switch (*outcome) {
         case PresenceOutcome::kOk:
+            // TASK-018：presence 上报是"客户端的推送连接建立/断开"落到 Room 的那一步。
+            // 带上 Gateway 订阅时的 request_id，于是"谁在什么时候连上/断开"这条链路
+            // 在 Gateway 与 Room 两侧可用同一个键对上。
+            rgbt::common::LogInfo("presence_reported", request->request_id(),
+                                  {{"room", request->room_id()},
+                                   {"player", request->player_id()},
+                                   {"online", request->connected() ? "true" : "false"}});
             FillSnapshot(snapshot, response->mutable_room());
             return;
         case PresenceOutcome::kNotAMember:

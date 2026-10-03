@@ -153,11 +153,11 @@ BrpcRoomClient::BrpcRoomClient(RoomClientOptions options)
 BrpcRoomClient::~BrpcRoomClient() = default;
 
 RoomCallStatus BrpcRoomClient::Join(const std::string& room_id, const std::string& player_id,
-                                    RoomSnapshot* out_snapshot) {
+                                    const std::string& request_id, RoomSnapshot* out_snapshot) {
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::JoinRoomRequest request;
-    request.set_request_id(room_id + ":" + player_id);
+    request.set_request_id(request_id);
     request.set_room_id(room_id);
     request.set_player_id(player_id);
     rgbt::room::v1::JoinRoomResponse response;
@@ -177,13 +177,14 @@ RoomCallStatus BrpcRoomClient::Join(const std::string& room_id, const std::strin
 
 RoomCallStatus BrpcRoomClient::SubmitAttack(const std::string& room_id,
                                             const std::string& player_id,
+                                            const std::string& request_id,
                                             RoomSnapshot* out_snapshot) {
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::SubmitInputRequest request;
-    // request_id 用「房间:玩家」而不是随机串：本接口不要求幂等键（同一帧的重复
-    // 攻击会被服务端合并），用它只是为了在跨服务日志里能直接关联到人和房间。
-    request.set_request_id(room_id + ":" + player_id);
+    // request_id 来自调用方（Gateway 的 HTTP 入口），因此同一次用户操作在
+    // Gateway 与 Room 的日志里有同一个关联键（TASK-018）。
+    request.set_request_id(request_id);
     request.set_room_id(room_id);
     request.set_player_id(player_id);
     request.mutable_input()->set_kind(rgbt::room::v1::PlayerInput::KIND_ATTACK);
@@ -203,13 +204,12 @@ RoomCallStatus BrpcRoomClient::SubmitAttack(const std::string& room_id,
 }
 
 RoomCallStatus BrpcRoomClient::SetPresence(const std::string& room_id, const std::string& player_id,
-                                           bool online, RoomSnapshot* out_snapshot) {
+                                           bool online, const std::string& request_id,
+                                           RoomSnapshot* out_snapshot) {
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::SetPlayerPresenceRequest request;
-    // request_id 用「房间:玩家:状态」：本接口不要求幂等键（重复上报无副作用），
-    // 它只用于让跨服务日志能直接关联到人、房间与这次变化。
-    request.set_request_id(room_id + ":" + player_id + (online ? ":online" : ":offline"));
+    request.set_request_id(request_id);
     request.set_room_id(room_id);
     request.set_player_id(player_id);
     request.set_connected(online);
@@ -228,11 +228,12 @@ RoomCallStatus BrpcRoomClient::SetPresence(const std::string& room_id, const std
     return ToCallStatus(response.error().code());
 }
 
-RoomCallStatus BrpcRoomClient::GetState(const std::string& room_id, RoomSnapshot* out_snapshot) {
+RoomCallStatus BrpcRoomClient::GetState(const std::string& room_id, const std::string& request_id,
+                                        RoomSnapshot* out_snapshot) {
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::GetRoomStateRequest request;
-    request.set_request_id(room_id);
+    request.set_request_id(request_id);
     request.set_room_id(room_id);
     rgbt::room::v1::GetRoomStateResponse response;
 
@@ -249,11 +250,12 @@ RoomCallStatus BrpcRoomClient::GetState(const std::string& room_id, RoomSnapshot
     return ToCallStatus(response.error().code());
 }
 
-RoomCallStatus BrpcRoomClient::GetResult(const std::string& match_id, MatchResultView* out_view) {
+RoomCallStatus BrpcRoomClient::GetResult(const std::string& match_id, const std::string& request_id,
+                                         MatchResultView* out_view) {
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::GetMatchResultRequest request;
-    request.set_request_id(match_id);
+    request.set_request_id(request_id);
     request.set_match_id(match_id);
     rgbt::room::v1::GetMatchResultResponse response;
 
@@ -289,12 +291,12 @@ RoomCallStatus BrpcRoomClient::GetResult(const std::string& match_id, MatchResul
 
 RoomCallStatus BrpcRoomClient::GetSnapshotsSince(const std::string& room_id,
                                                  std::int64_t since_frame,
+                                                 const std::string& request_id,
                                                  SnapshotRange* out_range) {
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::GetRoomSnapshotsSinceRequest request;
-    // request_id 用「房间:帧号」：排障时一眼能看出这次补发是从哪一帧开始的。
-    request.set_request_id(room_id + ":since:" + std::to_string(since_frame));
+    request.set_request_id(request_id);
     request.set_room_id(room_id);
     request.set_since_frame(since_frame);
     rgbt::room::v1::GetRoomSnapshotsSinceResponse response;

@@ -70,13 +70,16 @@ private:
 /// 可控的房间客户端。只实现 StreamHub 用到的 GetState，其余方法给出固定结果。
 class FakeRoomClient final : public RoomClient {
 public:
-    RoomCallStatus Join(const std::string&, const std::string&, RoomSnapshot*) override {
+    RoomCallStatus Join(const std::string&, const std::string&, const std::string&,
+                        RoomSnapshot*) override {
         return RoomCallStatus::kOk;
     }
-    RoomCallStatus SubmitAttack(const std::string&, const std::string&, RoomSnapshot*) override {
+    RoomCallStatus SubmitAttack(const std::string&, const std::string&, const std::string&,
+                                RoomSnapshot*) override {
         return RoomCallStatus::kOk;
     }
-    RoomCallStatus GetState(const std::string& room_id, RoomSnapshot* out_snapshot) override {
+    RoomCallStatus GetState(const std::string& room_id, const std::string& /*request_id*/,
+                            RoomSnapshot* out_snapshot) override {
         ++get_state_calls;
         const auto it = rooms.find(room_id);
         if (it == rooms.end()) {
@@ -85,12 +88,14 @@ public:
         *out_snapshot = it->second;
         return RoomCallStatus::kOk;
     }
-    RoomCallStatus GetResult(const std::string&, rgbt::gateway::MatchResultView*) override {
+    RoomCallStatus GetResult(const std::string&, const std::string&,
+                             rgbt::gateway::MatchResultView*) override {
         return RoomCallStatus::kNotFound;
     }
     /// TASK-017：补发查询。返回预置的 SnapshotRange，方便逐个构造
     /// 「窗口内 / 窗口外 / id 超前」三种情况。
     RoomCallStatus GetSnapshotsSince(const std::string& room_id, std::int64_t since_frame,
+                                     const std::string& /*request_id*/,
                                      rgbt::gateway::SnapshotRange* out_range) override {
         ++get_snapshots_calls;
         last_since_frame = since_frame;
@@ -107,7 +112,8 @@ public:
     /// TASK-016：记录每次连接状态上报，供用例断言
     /// 「订阅建立 → 上报 online；订阅移除 → 上报 offline」。
     RoomCallStatus SetPresence(const std::string& room_id, const std::string& player_id,
-                               bool online, RoomSnapshot*) override {
+                               bool online, const std::string& /*request_id*/,
+                               RoomSnapshot*) override {
         presence_calls.push_back(PresenceCall{room_id, player_id, online});
         if (fail_set_presence) {
             return RoomCallStatus::kUnavailable;

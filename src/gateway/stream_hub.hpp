@@ -78,6 +78,13 @@ struct SubscribeOptions {
 
     /// `Last-Event-ID` 请求头存在但无法解析成帧号。
     bool last_event_id_malformed = false;
+
+    /// 建立这条订阅的 HTTP 请求的 request_id（TASK-018）。
+    ///
+    /// 存在订阅记录里，让"这条连接引发的所有 Room 调用"（上报 presence、查询
+    /// 房间状态、补发历史）都带同一个关联键——否则订阅链路在跨服务日志里又会
+    /// 断掉，而那正是本任务要消除的情况。
+    std::string request_id;
 };
 
 /// 订阅的登记结果（TASK-017）。
@@ -196,6 +203,8 @@ private:
         std::uint64_t id = 0;
         std::string player_id;
         std::string room_id;
+        /// 见 SubscribeOptions::request_id：这条订阅的关联键。
+        std::string request_id;
         std::shared_ptr<EventSink> sink;
         std::int64_t last_heartbeat_ms = 0;
         /// session.ready 是否已发送。放在 Tick 里发而不是 Subscribe 里发：
@@ -226,6 +235,8 @@ private:
         std::uint64_t id = 0;
         std::shared_ptr<EventSink> sink;
         std::string room_id;
+        /// 这条订阅的关联键（见 SubscribeOptions::request_id）。
+        std::string request_id;
         /// 解析出来的 `Last-Event-ID`；为空表示请求头缺失。
         std::optional<std::int64_t> since_frame;
         /// 请求头存在但解析失败。与"缺失"分开：前者是客户端有问题，
@@ -255,7 +266,8 @@ private:
 
     /// 处理一个房间：轮询一次，变化时推给该房间的全部订阅者。
     void TickRoom(const std::string& room_id, const std::vector<SinkRef>& sinks,
-                  std::int64_t now_ms, std::vector<std::uint64_t>* failed);
+                  const std::string& request_id, std::int64_t now_ms,
+                  std::vector<std::uint64_t>* failed);
 
     /// @brief 处理一个订阅的补发（TASK-017）。**不得持锁调用**。
     ///
@@ -275,7 +287,8 @@ private:
 
     /// 把"某个玩家的推送连接是否在线"上报给 Room（TASK-016）。**不得持锁调用**。
     /// 失败只记日志、不重试：这是尽力而为的事实同步，下一次连接变化会覆盖它。
-    void ReportPresence(const std::string& room_id, const std::string& player_id, bool online);
+    void ReportPresence(const std::string& room_id, const std::string& player_id, bool online,
+                        const std::string& request_id);
 
     /// 由房间状态生成"是否需要推送"的比较签名。
     ///

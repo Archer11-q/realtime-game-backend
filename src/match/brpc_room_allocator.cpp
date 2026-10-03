@@ -7,6 +7,7 @@
 #include <string>
 #include <utility>
 
+#include "common/logging.hpp"
 #include "room.pb.h"
 
 namespace rgbt::match {
@@ -58,13 +59,13 @@ std::string BrpcRoomAllocator::Allocate(std::string_view match_id,
     if (controller.Failed()) {
         // 传输失败或对端未启动。返回空串让调用方把玩家放回队列，
         // 而不是在这里重试——重试会延长持锁之外的处理时间，也会掩盖故障。
-        std::fprintf(stderr, "[match] 调用 Room 创建房间失败：match_id=%s err=%s\n",
-                     request.match_id().c_str(), controller.ErrorText().c_str());
+        rgbt::common::LogError("create_room_call_failed", std::string(match_id),
+                               {{"err", controller.ErrorText()}});
         return {};
     }
     if (response.error().code() != rgbt::room::v1::ROOM_ERROR_CODE_UNSPECIFIED) {
-        std::fprintf(stderr, "[match] Room 拒绝创建房间：match_id=%s reason=%s\n",
-                     request.match_id().c_str(), response.error().reason().c_str());
+        rgbt::common::LogError("create_room_rejected", std::string(match_id),
+                               {{"reason", response.error().reason()}});
         return {};
     }
     return response.room_id();
