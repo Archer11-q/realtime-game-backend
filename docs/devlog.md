@@ -2584,6 +2584,81 @@ bash scripts/verify-all.sh                   # 8/8 通过，206 秒
 - `verify.sh` 与 `verify-all.sh` 的旧文档注释里仍写着"7 个脚本"，本次已更新为 8 个。
 - 任务单里提到的 brpc 调用数与失败数、以及 Match/Room 的快照写入成功失败数
   **未实现**：这三个计数需要改动客户端实现与快照写入路径，属下一轮范围。
+## TASK-020 Prometheus + Grafana 接入（2026-10-03）
+
+### 完成
+
+- `deploy/compose/docker-compose.observability.yml`（独立文件，不并入业务依赖）。
+- `deploy/observability/prometheus/prometheus.yml`：抓三个服务的 `/metrics`，
+  外加 Prometheus 自抓（用于区分"服务挂了"与"采集坏了"）。
+- `deploy/observability/grafana/`：数据源 + 8 块面板，全部 provisioning 定义。
+- `scripts/observability-up.sh` / `-down.sh`。
+- `scripts/verify-observability.sh --scrape`（20 条断言）。
+- `scripts/verify-all.sh`：按脚本传参数。
+
+### 决策
+
+1. **监控栈独立成 compose 文件**：业务依赖是"跑服务必需"，监控栈是"看服务用"。
+   混在一起会让只想跑测试的人被迫等两个几百 MB 的容器。
+2. **端口只绑 127.0.0.1**：Prometheus 的查询接口没有任何鉴权。
+   Grafana 用匿名**只读**角色，兼顾"打开就能看"与"不会被误改"。
+3. **面板用 provisioning 而不是界面上手点**：手点的配置只存在于数据卷里，
+   `down -v` 之后就没了，而"面板数字可复现"是任务要求。
+4. **基线/判据必须能被数据证实**：见下面第 5 条，这一条是本任务最大的教训。
+
+### 踩到并修掉的问题
+
+1. **卷路径的基准搞错**：compose 的相对路径相对**本文件所在目录**
+   （`deploy/compose/`），写成 `./observability/...` 会解析到不存在的路径，
+   报错是 `mount ... not a directory`，完全看不出根因。
+2. **单文件 bind mount 在 Docker Desktop + WSL 上失败**：挂载宿主的**普通文件**会报
+   同样的 `not a directory`；挂**目录**可行（业务 compose 挂 `../../migrations`
+   就是目录，一直正常）。改为挂 Prometheus 配置目录。
+3. **`--config.expand-env` 不是 Prometheus 的标志**（实测 `unknown long flag`）。
+   v3.1.0 不支持在配置里展开 `${VAR}`（`expand-external-labels` 只管 external
+   labels）。改为写字面量端口。
+4. **`cmd; if [ $? -eq 0 ]` 误判**：`if` 里取到的不是 cmd 的状态，实测把成功的
+   compose up 报成失败。改为显式接收退出码。
+5. **面板口径判据不成立**：原来用"端点与 Prometheus 的瞬时值之差 ≤ 30 帧"证明一致。
+   这是错的——Prometheus 只在抓取时刻取新值，最多滞后一个 `scrape_interval`（5 秒），
+   而帧推进约 20 帧/秒，正常滞后就有约 100 帧（实测 1322 vs 1206 被判成不一致）。
+   改为两条能被数据证实的判据：Prometheus 的值**在增长**（证明持续入库，比"相等"
+   更强，排除了"抓一次然后僵住"），且落在端点的单调区间内。
+
+### 网络路径（决定抓取配置怎么写）
+
+服务在宿主机（WSL 发行版）、Prometheus 在容器里。实测（2026-10-03）：
+
+| 路径 | 结果 |
+|---|---|
+| `172.17.0.1`（默认 bridge 网关） | 不通 |
+| 发行版 eth0 地址 | 通，但每次重启会变，不能写进静态配置 |
+| `192.168.65.254`（Docker Desktop VM 网关） | 通，但属实现细节 |
+| `host.docker.internal` + `extra_hosts: host-gateway` | **采用**，实测 up=1 |
+| `--network host` | 不通（Docker Desktop 的 host 是它的 VM，不是 WSL 发行版） |
+
+### 验证
+
+```bash
+cmake --build --preset brpc-debug              # 0 error / 0 warning
+ctest --test-dir build/brpc-debug              # 269/269
+bash scripts/check-format.sh                   # 通过（82 文件）
+bash scripts/observability-up.sh               # 退出码 0
+bash scripts/verify-observability.sh --scrape   # 20 条断言 0 失败
+bash scripts/verify-all.sh                     # 8/8 通过，210 秒
+```
+
+`--scrape` 的关键实测：3 个 rgbt target 全部 up；帧推进在 Prometheus 里持续增长
+（1007 -> 1207）且落在端点区间 [1100, 1261] 内；6 个关键指标都查得到时间序列；
+Grafana 可访问且面板已 provisioning 加载。
+
+### 已知限制（如实记录，不用假数据填充）
+
+**延迟面板当前是空的**：`rgbt_http_request_seconds` 的指标名与 `Observe` 方法都已实现，
+但 Gateway 里**没有任何 Observe 调用点**（核实方式：全仓库搜索 `Observe(`，
+只有定义、没有调用）。因此 P50/P95/P99 没有数据。面板描述里已标注这一点。
+接上它需要给 HTTP 处理器加计时，属下一步工作。
+
 ## CI 格式门禁的版本漂移（2026-10-03）
 
 **现象**：PR #16 与 #17 的三个预设（debug / release / asan）**全部失败**，且都发生在

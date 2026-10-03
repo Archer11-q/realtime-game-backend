@@ -1277,7 +1277,11 @@ Phase 2 已全部完成并合并（TASK-013 ~ TASK-017，`main` 含至 PR #15）
 
 ### TASK-020：Prometheus + Grafana 接入
 
-- 状态：待确认
+- 状态：**已完成**（2026-10-03）。compose、抓取配置、数据源与 8 块面板、
+  启停脚本、`verify-observability.sh --scrape`（20 条断言）均已落地并实测通过。
+  完整经过（含 5 个踩坑）与实测数字见 `docs/devlog.md` 的
+  「TASK-020 Prometheus + Grafana 接入」。
+  已知限制：延迟面板暂无数据（HTTP 耗时直方图尚未接入，见该节说明）。
 - 依赖：TASK-019
 - 背景问题：有指标端点但没有人采集、没有面板，等于"数据可查"这条退出标准
   仍然没有兑现。

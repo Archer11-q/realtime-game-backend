@@ -1,0 +1,221 @@
+{
+  "uid": "rgbt-overview",
+  "title": "Realtime Game Backend — 总览",
+  "description": "TASK-020 的首块面板。五组数字对应 docs/04-quality-and-observability.md 第 4 节的清单：连接数、QPS、延迟、错误率、房间数。面板上的数字必须能与 scripts/verify-observability.sh --metrics 的断言对得上。",
+  "tags": ["rgbt", "phase-3"],
+  "timezone": "browser",
+  "editable": false,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "QPS（按映射路径）",
+      "description": "rgbt_http_requests_total 的每秒速率。分母用 $__rate_interval 让窗口随缩放自适应，避免放大时间范围后曲线被抹平。",
+      "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+          "expr": "sum by (path) (rate(rgbt_http_requests_total{service=\"gateway\"}[$__rate_interval]))",
+          "legendFormat": "{{path}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "错误率（4xx/5xx 占比）",
+      "description": "错误数 / 总请求数。用状态码前缀分组而不是逐个状态码，是为了让曲线回答『有没有出错』而不是『错在哪一类』——后者可下钻到 QPS 面板。",
+      "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+          "expr": "sum(rate(rgbt_http_requests_total{service=\"gateway\",status=~\"4..|5..\"}[$__rate_interval])) / clamp_min(sum(rate(rgbt_http_requests_total{service=\"gateway\"}[$__rate_interval])), 0.001)",
+          "legendFormat": "错误占比"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "HTTP 延迟（P50 / P95 / P99）",
+      "description": "来自 rgbt_http_request_seconds 的直方图。本项目当前**尚未接入该直方图**（TASK-019 的指标清单里只有计数与耗时两项中的计数），因此这条曲线在有数据之前会是空的——面板与指标必须一致，不能为了让面板好看而假装有数据。",
+      "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(rgbt_http_request_seconds_bucket{service=\"gateway\"}[$__rate_interval])))",
+          "legendFormat": "P50"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(rgbt_http_request_seconds_bucket{service=\"gateway\"}[$__rate_interval])))",
+          "legendFormat": "P95"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rgbt_http_request_seconds_bucket{service=\"gateway\"}[$__rate_interval])))",
+          "legendFormat": "P99"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "SSE 连接数",
+      "description": "rgbt_sse_connections 是瞬时 gauge，用 max 而不是 sum：它只有一个实例，sum 会在多实例部署时掩盖单点问题（本项目不做多实例，但查询写法应当先正确）。",
+      "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+          "expr": "max(rgbt_sse_connections{service=\"gateway\"})",
+          "legendFormat": "SSE 连接"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "房间数（按阶段）",
+      "description": "rgbt_rooms 的六个阶段。同一指标名不同标签是不同序列，因此用 sum by (phase) 而不是直接取第一条。",
+      "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+          "expr": "sum by (phase) (rgbt_rooms{service=\"room\"})",
+          "legendFormat": "{{phase}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "匹配队列长度与配对速率",
+      "description": "左轴是队列长度（gauge），配对速率是 rgbt_match_events_total{event=\"paired\"} 的每秒速率。放在一起才能看出『队列在涨但没人配对』这类问题。",
+      "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+          "expr": "max(rgbt_match_queue_length{service=\"match\"})",
+          "legendFormat": "队列长度"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+          "expr": "sum(rate(rgbt_match_events_total{service=\"match\",event=\"paired\"}[$__rate_interval]))",
+          "legendFormat": "配对速率"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "服务间 brpc 调用（按 target / outcome）",
+      "description": "失败率是排障最依赖的数字，因此单独一条曲线。outcome 只有 ok/failed 两种取值，不做更细的错误分类——那要看日志。",
+      "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+          "expr": "sum by (target, outcome) (rate(rgbt_rpc_calls_total{service=\"gateway\"}[$__rate_interval]))",
+          "legendFormat": "{{target}} / {{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "采集健康（Prometheus 自抓）",
+      "description": "up == 0 表示抓不到目标。没有这块面板时，『指标突然变少』会同时有『服务挂了』与『采集坏了』两种解释，而它们要查的地方完全不同。",
+      "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rgbt-prometheus" },
+          "expr": "up",
+          "legendFormat": "{{job}}"
+        }
+      ]
+    }
+  ]
+}

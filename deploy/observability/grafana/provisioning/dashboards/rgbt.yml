@@ -1,0 +1,19 @@
+# Grafana 面板的加载配置（TASK-020）
+#
+# 指向容器内被只读挂载的 /var/lib/grafana/dashboards，文件名以 `rgbt-` 开头的
+# JSON 会被自动载入。放在仓库里（而不是只在数据卷里）才能随代码评审与回滚。
+
+apiVersion: 1
+
+providers:
+  - name: rgbt
+    orgId: 1
+    folder: "Realtime Game Backend"
+    type: file
+    disableDeletion: true
+    # 面板 JSON 改动后 10 秒内自动重载，方便调整时来回看。
+    updateIntervalSeconds: 10
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
