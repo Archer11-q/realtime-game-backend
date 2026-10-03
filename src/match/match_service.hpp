@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 
+#include "common/metrics.hpp"
 #include "match.pb.h"
 #include "match_queue.hpp"
 
@@ -45,6 +46,13 @@ public:
     /// @brief 队列是否可用。当前队列在进程内存中，只要对象存在就是可用。
     [[nodiscard]] bool Healthy() const { return queue_ != nullptr; }
 
+    /// TASK-019：只读的指标取值口，供单元测试断言"记账真的发生了"。
+    /// 测试不解析文本导出——那会把格式与语义耦合在一起。
+    [[nodiscard]] std::uint64_t EnqueuedCount() const { return event_enqueued_.Value(); }
+    [[nodiscard]] std::uint64_t RejectedCount() const { return event_rejected_.Value(); }
+    [[nodiscard]] std::uint64_t PairedCount() const { return event_paired_.Value(); }
+    [[nodiscard]] std::uint64_t CanceledCount() const { return event_canceled_.Value(); }
+
 private:
     /// 写统一错误体。返回值恒为 false，便于在调用点直接 return。
     static bool FillError(rgbt::match::v1::MatchError* error, rgbt::match::v1::MatchErrorCode code,
@@ -53,6 +61,16 @@ private:
 
     /// 把队列快照写入 proto 响应。
     static void FillStatus(const MatchStatusSnapshot& snapshot, rgbt::match::v1::MatchStatus* out);
+
+    // TASK-019：事件计数。记账放在**服务层**而不是 MatchQueue 里：
+    // 四种入队结果在这里是一个统一的 `outcome` 变量，一处插入就能覆盖全部分支；
+    // 而队列内部的返回点分散在多条路径上（实测：分散到 4 处以上，且形式不统一），
+    // 漏掉任何一处都不会报错，只会让计数偏低。服务层是这次调用的唯一出口。
+    rgbt::common::CounterHandle event_enqueued_;
+    rgbt::common::CounterHandle event_rejected_;
+    rgbt::common::CounterHandle event_paired_;
+    rgbt::common::CounterHandle event_canceled_;
+    bool metrics_ready_ = false;
 
     MatchQueue* queue_;
     std::function<std::int64_t()> clock_;

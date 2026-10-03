@@ -259,6 +259,7 @@ private:
 
     RoomAllocator* allocator_;
     MatchQueueStore* store_;
+
     std::function<std::string()> match_id_factory_;
     std::int64_t match_timeout_ms_;
     std::int64_t result_ttl_ms_;
