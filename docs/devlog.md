@@ -2157,6 +2157,361 @@ TASK-008 起 `connected` 字段只表示"是否已加入房间"，**网络断开
 - 按第 9 节的分支粒度，本任务是 `feat/phase-2` 上的**单个提交**；
   合并回 `main` 用 `git merge --no-ff`，**不 squash**。
 
+## TASK-017 实施记录（2026-10-02）
+
+### 完成
+
+- `api/proto/room.proto`：新增 `GetRoomSnapshotsSince` 与 `SnapshotWindowStatus`
+  （`SNAPSHOTS_READY` / `SNAPSHOTS_INCOMPLETE` / `SNAPSHOTS_AHEAD`）。
+  **刻意不用 `RoomErrorCode` 表达"补不齐"**：那是两个维度——"调用成不成功"与
+  "成功的前提下缺的帧补得齐吗"。混进可重试错误会让调用方去重试一个
+  重试一万次也一样的结果（那段历史已经不在内存里了）。
+- `src/room/`：`BattleRoom::SnapshotsAfter` / `MaxSnapshotFrame`、
+  `RoomManager::GetSnapshotsSince`（含 `SnapshotRangeOutcome`）、
+  `RoomServiceImpl::GetRoomSnapshotsSince`。
+- `src/gateway/`：
+  - `RoomClient::GetSnapshotsSince`（接口 + `BrpcRoomClient` 实现）；
+  - SSE 事件的 `id:` 行（`room.state` / `room.finished` / `stream.reset`）；
+  - `stream.reset` 事件与 4 种原因（见 05-api-and-data 第 2 节）；
+  - `Last-Event-ID` 解析（在服务层，因为只有那里读得到 HTTP 头）；
+  - 订阅建立时的补发：`StreamHub::Tick` 阶段一收集、阶段二在锁外写、
+    阶段四提交结果；`SubscribeReport(id)` 让补发结果可被查询与断言；
+  - 两个可断言的计数：`BackfilledFrameCount()` 与 `ResetEventCount(reason)`。
+- `web/`：`parseSseBlock` 解析 `id:`；`streamRoom` 发送 `Last-Event-ID`；
+  `useGameSession` 在每次重连尝试时读取当前 `lastSequence` 并带上；
+  处理新事件 `stream.reset`（用**同一段**状态落地逻辑，不新增"部分更新"路径）。
+- 测试：Room 侧 5 个（`SnapshotsAfter` 顺序/去重/边界、`MaxSnapshotFrame` 不受重复
+  条数影响、窗口受容量限制）、`RoomManager` 侧 5 个（窗口内/房间不存在/id 超前/
+  窗口外/空缓冲）、Gateway 侧 11 个（首次订阅**不发** reset、补发顺序与 id、
+  不重复推送最新状态、窗口外 reset、id 超前、非法 id、id 相同、补发失败保持连接、
+  补发写失败清理订阅、终态补发关流、补发只做一次）、前端 9 个
+  （`id:` 解析 6 个 + `Last-Event-ID` 请求头 3 个）。
+
+### 决策
+
+1. **补发只承诺内存环形缓冲的大小（128 帧 ≈ 12.8 秒），窗口外明确 `stream.reset`。**
+   理由：要承诺更长就必须做持久化重放，而领域事件是
+   [ADR-0003](adr/0003-scope-reduction.md) 的非目标；而"承诺补发最近 N 秒"
+   在没有持久化时是无法兑现的。宽限期内对局**暂停推进**（TASK-016），
+   因此断线 30 秒期间帧号根本不前进，缺口天然是 0 帧——这个窗口真正覆盖的是
+   "客户端在断开之前就已经落后"与"多标签页互相追赶"。
+   **若哪天把"暂停推进"改成"继续推进"，这个窗口立刻不够用**，必须一并重新评估。
+2. **`id` 用帧号，不用自增序号。** 帧号在房间内单调递增、与快照天然对齐、重启后
+   仍可比大小；自增序号做不到最后一点，且要额外维护"序号 → 状态"的映射。
+3. **`Last-Event-ID` 缺失不发 `stream.reset`（项目所有者 2026-10-02 裁决）。**
+   任务单的失败场景（"缺失或非法 → 不补发，直接按当前状态推，等同今天的行为，
+   不报错"）与范围第 4 条（"（或 id 非法/缺失）→ 发一个 `stream.reset`"）
+   **相互矛盾**。第一版按后者实现（多一个 reason `no_last_event_id`），
+   审阅时项目所有者要求**按最小变动**改为前者，即：
+   * 头**缺失**（第一次订阅）→ 不补发、不发 reset，由第一次 Tick 正常推当前状态；
+   * 头**非法** → 仍发 `stream.reset`（`reason = id_malformed`）。
+   这个区分是有意义的，不是两种写法的等价替换：头缺失是正常路径（新客户端本来
+   就没有任何帧号），头存在却解析不出来是客户端的 bug——静默当成首次订阅会让它
+   以为自己拿到了连续的事件。改动只有 `StreamHub::BackfillSubscription` 里
+   "头缺失"提前返回的一个分支，`no_last_event_id` 这个 reason 随之删除。
+4. **补发在 `Tick` 里做，不在 `Subscribe` 里做。** `Subscribe` 跑在 brpc 的请求
+   处理线程上，此刻响应还没提交，写出去的内容要等 `done` 之后才会以 chunked 发出，
+   与后续 Tick 的写入顺序无法保证。放在 Tick 里之后顺序是确定的：
+   **补发（或 `stream.reset`）→ `session.ready` → 下一轮开始的实时推送**。
+5. **补发结果按订阅记在订阅记录里，由 `SubscribeReport` 查询。**
+   补发发生在 `Subscribe` 之后的某一次 Tick 里，返回值不可能包含它；
+   而"补发失败/窗口外"必须在服务端留下痕迹，否则客户端只会看到帧号跳了一下，
+   自己无从判断是否漏帧。
+6. **不把 `SnapshotRange` 放进成员变量。** 虽然 `Tick` 目前只有一个线程，
+   但把"只在本次调用内有意义"的中间结果放进成员，会让后续任何并行化都变成
+   难查的数据竞争。
+
+### 验证
+
+**状态：PR #15 实际上没有合并本任务的实现。** `main` 上 `a61495a` 相对第一父提交
+`e67e733` **只改了 `docs/TASKS.md`（42+/9-）**；全仓库检索 `BackfillSubscription`
+在所有 ref 上零结果。实现已由 **PR #16**（分支 `feat/phase-3`，提交 `81ca2cf`）
+补回，并在 WSL 正式仓库里实测通过。
+
+**这一节此前三次写错，按时间顺序记下——它们不是同一类错误**：
+
+1. 曾写"项目所有者已确认那次全绿运行的构建包含本次改动"——**不成立**。
+   当时 WSL 仓库 HEAD 仍是 TASK-016（`335f149`），四个 TASK-017 标志物
+   （`GetRoomSnapshotsSince` / `SnapshotsAfter` / `SubscribeReport` / 新增用例）
+   计数全为 0，那次运行跑的是 TASK-016 的代码。
+2. 根因是**没有核对"我改的地方是不是正式仓库"**：本轮实现最初落在
+   `D:\CLion\realtime-game-backend`，而它按 `docs/06-operations.md` 第 31-33 行
+   只是迁移前的备份副本（git 记录停在 TASK-007、无编译器、`.git` 不可写），
+   正式源码与 Git 仓库只有 `~/workspace/realtime-game-backend`。
+3. 之后我依据 GitHub API 得出"PR #15 已合并 TASK-017"并把状态改成"已完成"——
+   **同样不成立**。合并确实发生过，但进去的只有文档；是靠核对 `main` 上
+   `room.proto` 的**实际内容**（336 行、无 `GetRoomSnapshotsSince`）才发现的。
+   **教训：判断某个功能有没有进 `main`，要读 `main` 里文件的实际内容，
+   不能只看 PR 的 merged 状态。**
+
+**补回后在本机 WSL 的实测（2026-10-03）**：
+
+```bash
+cmake --preset brpc-debug && cmake --build --preset brpc-debug   # RC=0
+# 0 error / 0 warning（-Werror 生效）
+ctest --test-dir build/brpc-debug                                 # 237/237 通过
+bash scripts/check-format.sh                                      # 通过（74 个文件）
+```
+
+测试数从 TASK-016 的 216 升到 237（本任务新增 21 个）。**补回过程中暴露并修掉
+三个真实缺陷**——它们此前从未被编译过，因此从未被发现：
+
+1. 窗口起点算式 `oldest = latest - (latest - MaxSnapshotFrame()) + 1` 只在缓冲
+   **已满**时碰巧成立；缓冲没满时算出"窗口为空"，把能补齐的请求判成
+   `kIncomplete`。改为直接取缓冲里实际存在的最小帧号（新增
+   `BattleRoom::SnapshotFrameRange`）。
+2. `kAhead` 判据用 `>=`，把"客户端与服务端停在同一帧"（刚进房的常态）误判为超前
+   并回 `stream.reset`。改为严格 `>`。
+3. 头缺失的订阅被送进补发路径，导致 `session.ready` 永不发出——10 个既有
+   TASK-009/016 用例同时失败。改为在 Tick 收集阶段就排除，让它走 TASK-016 的
+   正常路径（不补发、不发 reset，由第一次 Tick 推当前状态）。
+
+**尚未运行**：无——端到端已在启动 Docker Desktop 后补跑完成，见下节。
+
+**端到端与全套回归的实测（2026-10-03，WSL，Docker Engine 29.4.3）**：
+
+```bash
+cmake --preset brpc-debug && cmake --build --preset brpc-debug   # RC=0，0 error / 0 warning
+ctest --test-dir build/brpc-debug                                 # 237/237 通过
+bash scripts/check-format.sh                                      # 通过（74 个文件）
+bash scripts/verify-reconnect.sh                                  # 退出码 0
+bash scripts/verify-all.sh                                        # 7/7 通过，合计 194 秒
+```
+
+`verify-reconnect.sh` 第 7 节（TASK-017 的端到端验收）实测数字：
+
+- 断开期间对局继续推进：**frame 20 → 40**（缺口 20 帧）。
+- 以 `Last-Event-ID: 20` 重连后，补发**从 21 开始**、**覆盖到 40**，
+  即缺口 20 帧被完整补齐，且**没有发 `stream.reset`**（窗口内不需要全量刷新）。
+- 补发之后实时推送接上：**frame 53 → 73**。
+- `id` 超前（999999）→ 发 `stream.reset`，`reason = id_ahead`，载荷带完整状态。
+- `Last-Event-ID: not-a-number` → `stream.reset`，`reason = id_malformed`。
+- 不带该头 → **不发** `stream.reset`，直接推当前状态（裁决后的行为）。
+
+`verify-all.sh` 各脚本耗时：verify 27s、verify-login 27s、verify-match 31s、
+verify-room 32s、verify-stream 10s、verify-web 19s、verify-persistence 48s。
+
+**补跑期间又抓到一个前端类型错误**：`web/src/api/stream.test.ts` 的 fetch 桩里
+形参 `url` 未使用，被 `noUnusedParameters` 拦下（`vue-tsc --noEmit` 失败 →
+`npm run build` 也失败）。改为 `_url` 并通过。**教训：前端有 `noUnusedParameters`，
+新写的测试桩形参必须带下划线或真的用上。**
+
+**搬运方式（补回时采用，比逐文件 rsync 更安全，建议沿用）**：
+
+```bash
+# 在 Windows/可联网一侧：克隆远端分支，用 LF 归一化后的新文件覆盖，再生成 patch
+git clone --depth 1 --branch feat/phase-2 <repo> /tmp/clone
+#   （把文件按 .gitattributes 的 eol=lf 归一化后写入 clone）
+git -C /tmp/clone diff --binary --output=task017.patch     # 不要用 shell 重定向：
+                                                          # PowerShell 会写成 UTF-16，
+                                                          # git apply 报 "No valid patches in input"
+git -C /tmp/clone apply --check task017.patch  # 对纯净克隆自检，确认可干净应用
+# 在 WSL：一次 git apply
+cd ~/workspace/realtime-game-backend && git apply /mnt/d/.../task017.patch
+```
+
+它避开了 Backlog 记录的两个坑：**不依赖时间戳**（不用 rsync 的 mtime 判定，
+所以没有"Ninja 不重建 → 新旧目标混链"）、**不触碰权限位**（patch 只改内容与行，
+不写文件模式，所以不会像 DrvFs 那样把 154 个文件改成 755）。
+
+验收命令（在 WSL 中执行，全部通过）：
+
+```bash
+cmake --preset brpc-debug && cmake --build --preset brpc-debug --clean-first
+ctest --test-dir build/brpc-debug --output-on-failure
+bash scripts/check-format.sh
+bash scripts/verify-reconnect.sh    # 含 TASK-016 与 TASK-017 两段
+bash scripts/verify-stream.sh       # 回归：SSE 推送链路
+bash scripts/verify-web.sh          # 回归：前端（含新增的 Last-Event-ID 请求头）
+bash scripts/verify-all.sh          # 全套
+```
+
+**未回填的原始数字**：`ctest` 的具体计数、`verify-all.sh` 的通过项与耗时、
+`verify-persistence.sh` 的恢复点帧号。结论是"全绿"（项目所有者报告），
+数字尚未粘贴回仓库，**因此不填猜测值**。
+
+> 2026-10-03 更新：上句针对 PR #15 那次运行。**PR #16 的补跑已给出实测数字**
+> （见上一节），本段保留是为了留下"当时确实没有数字"这一事实。
+
+**尚未回填的原始数字**（不是"没跑"，是"结果没有回到仓库"）：
+`ctest` 的具体计数、`verify-all.sh` 的通过项与耗时、以及
+`verify-persistence.sh` 的恢复点帧号（TASK-014 曾记录为 30/30/29 帧）。
+需要时由项目所有者把输出粘回本节即可；在此之前汇总表里不填猜测值。
+
+补发这一段若要单独取数，用 `--keep` 保留进程后看 Gateway 日志：
+
+```bash
+bash scripts/verify-reconnect.sh --keep
+grep -n '已补发\|stream.reset\|订阅已建立' /tmp/reconnect-gateway.out | tail -20
+```
+
+### 推送连续性与恢复时间汇总
+
+这张表是 Phase 2 退出标准里"恢复时间有测量结果和限制说明"的落点。
+TASK-013 ~ TASK-016 的偏差数字来自各任务实施记录里已经实测过的结果，此处汇总。
+TASK-017 的三行随 PR #15（`a61495a7`）合并时全绿通过；**具体的帧数与耗时数字
+尚未回填**，因此"本次验收结果"一列只写结论、不写猜测值。
+
+| 场景 | 恢复手段 | 数据丢失上界 | 本次验收结果 | 来源 |
+|---|---|---|---|---|
+| Room 进程重启 | 启动时从 `rooms` 表恢复未结束房间 | 一个快照间隔 = 1 秒 = 10 帧（最多一次攻击 = 满血 10%） | 通过；恢复动作是启动同步路径（日志 `已恢复房间` 的时间戳可读） | TASK-014 |
+| Room 重启的实测偏差 | 同上 | —— | 3 次实测丢失 **0 / 0 / 1 帧**（上界 10 帧） | TASK-014 实施记录 |
+| Match 进程重启 | 启动时从 Redis `LIST` 快照重建队列并重算超时 | 队列快照允许丢（写失败不重试）；丢的是排队位置，玩家重新入队即可 | 通过（启动同步路径） | TASK-015 |
+| Redis 不可用 | 降级为纯内存，匹配照常 | 无（队列权威状态在内存） | 通过（不恢复，直接降级） | TASK-015 |
+| 客户端断线 | 30 秒宽限期内重连，对局**暂停推进**因此接得上 | **0 帧**（暂停期间帧号不前进） | 通过；重连时延由客户端退避决定：1/2/4/5/5 秒，累计 17 秒内 | TASK-016 |
+| 断线超期未归 | 判断线方负并写 `match_results` | 无（产生胜负，不是恢复） | 通过；固定 30 秒（`kReconnectGraceMs`） | TASK-016 |
+| Gateway 重启 | 客户端重连重建订阅 + 按 `Last-Event-ID` 补发窗口内的帧 | 超出 128 帧（≈12.8 秒）窗口的部分不可补，明确回 `stream.reset` | **通过**；实测缺口 20 帧（frame 20→40）被完整补齐（id 21→40），未发 reset | TASK-017 / PR #16 |
+| 首次订阅（无 `Last-Event-ID`） | 不补发，直接推当前状态 | 无（客户端本来就没有状态） | **通过**；且断言**不发** `stream.reset` | TASK-017 / PR #16 |
+| 补发窗口外 / id 超前 / id 非法 | `stream.reset` + 当前完整状态 | 中间缺失的帧**不可恢复**（如实告知，不假装补上） | **通过**；`id_ahead` 与 `id_malformed` 分别被单独识别 | TASK-017 / PR #16 |
+
+### 未做 / 遗留
+
+- **`ParseLastEventId` 没有单元测试**：它直接读 `brpc::Controller` 的 HTTP 头，
+  要有意义地覆盖它就得在单测里伪造 brpc 的 HTTP 上下文。真实链路（curl 发头 →
+  brpc → Gateway → 补发）由 `verify-reconnect.sh` 第 7 节覆盖，因此这里不引入
+  伪造层。代价是"解析函数的边界条件"靠代码审阅与端到端脚本把关。
+- **补发不跨进程重启**：Gateway / Room 重启后旧缓冲没了，超出窗口一律
+  `stream.reset`。要跨重启补发需要持久化事件重放（ADR-0003 非目标）。
+- **前端没有组件级测试**：`useGameSession` 里"重连时带上 `lastSequence`"这一行
+  没有自动化覆盖（项目无组件测试环境）。已覆盖的是 `streamRoom` 是否发出了头
+  与 `parseSseBlock` 是否解析出 `id`。
+- **`verify-stream.sh` 与 `verify-web.sh` 的回归**：随 PR #15 的验收一并通过
+  （项目所有者报告全绿）。`verify-stream.sh` 的既有断言不依赖新增的
+  `stream.reset`（它是另一种事件类型，不会混进 `room.state` 的序列抽取）。
+
+### 下一步
+
+- 本任务已完成并合并（PR #15，`a61495a7`），Phase 2 闭环。
+- 遗留：把验收的原始数字（`ctest` 计数、`verify-all.sh` 耗时、
+  `verify-persistence.sh` 恢复帧号）粘贴回「推送连续性与恢复时间汇总」。
+- **把"跨 Windows / WSL 的同步方式"固化进 `docs/06-operations.md`**：
+  本轮证明"克隆远端 + LF 归一化 + 生成 patch + WSL 侧 `git apply`"比 rsync 安全
+  （不受 mtime 与 DrvFs 权限位影响）。Backlog 里那条"同步工具应受版本控制"
+  现在有了具体做法，Phase 3 起可以顺手落地。
+- Phase 3 的任务拆分见 `docs/02-roadmap.md` 第 6 节的「Phase 3 拆分草案」，
+  待项目所有者确认后开工。
+
+## TASK-018 实施记录（2026-10-03）
+
+### 完成
+
+- `include/common/logging.hpp` + `src/common/logging.cpp`：结构化日志模块。
+  单行 `key=value`，恒定字段 `ts/service/level/event/trace` 顺序固定，值按需加引号
+  并转义空格、引号、换行与控制字符。**不引入 spdlog**：glog 已在产物里（brpc 依赖）
+  但它面向自由文本，本模块只需要"格式化 + 互斥 + 写 stderr"。
+- 三个服务入口 `SetServiceName(...)`；`request_id` 经 proto 的既有字段贯通
+  Gateway → Match → Room。
+- `RoomClient` 六个方法增加 `request_id` 形参：此前 brpc 实现自己拼
+  `room_id:player_id` 这类伪 id，Gateway 从 HTTP 拿到的 request_id 到不了 Room。
+- `StreamEvents` 的 request_id 现在也读 query string——GET 没有请求体，而
+  **brpc 不会把 query 映射进 protobuf 字段**（与 token/room_id 同一个坑）。
+  订阅记录保存该 id，presence 上报、轮询、补发的 Room 调用全部复用它。
+- 已接入结构化日志的路径：`match_enqueued`（Match）；`match_enqueue_ok` /
+  `match_enqueue_failed` / `subscribe_ready` / `subscribe_rejected`（Gateway）；
+  `room_created` / `room_joined` / `presence_reported`（Room）。
+- `scripts/verify-observability.sh`（新增）：三服务日志格式与 service 字段、
+  结构化行不被断行、同 request_id 跨服务可定位、订阅成功与拒绝两条路径可按 id
+  追溯。**用双客户端配局**，因为单人配不成局、Room 侧不会产生任何日志。
+- `tests/unit/common/logging_test.cpp`：16 个用例。测试自带**独立实现**的解析器
+  （不调用产品代码的解析函数——产品代码只负责产生），这样"格式化结果能否被解析回
+  同样字段"才是真验证。
+
+### 决策
+
+1. **只负责产生日志，不提供解析函数。** 解析的消费者只有测试与验收脚本：
+   前者自带解析器更有价值（顺带校验格式自洽），后者用 shell 更直接。
+   放进产品代码会让模块承担两个方向的责任，而没有运行时消费者需要它。
+2. **值转义而不是"直接塞进去"。** 字段值大量来自配置、数据库错误信息与
+   MySQL/Redis 原始报文，带空格/引号/换行很常见；少一次转义就会让**一条坏字段
+   把整行日志变成不可解析的两行**，而那恰好发生在最需要日志的时候。
+3. **`trace=` 只在 id 非空时输出**，而不是写 `trace=-`：没有 id 与"id 是空串"
+   是两件事，后者不该在日志里伪装成一个值。
+4. **把"要不要补发"的判断从 `BackfillSubscription` 前移到 Tick 的收集阶段**
+   （见下节"发现的问题"第 3 条），并给 Room 不可用保留 `backfill_pending`。
+
+### 验证
+
+**WSL 实测（2026-10-03）**：
+
+```bash
+cmake --preset brpc-debug && cmake --build --preset brpc-debug   # 0 error / 0 warning
+ctest --test-dir build/brpc-debug                                 # 253/253（TASK-017 为 237，新增 16）
+bash scripts/check-format.sh                                      # 通过（77 文件）
+bash scripts/verify-observability.sh --logs                       # 退出码 0
+bash scripts/verify-all.sh                                        # 7/7 通过，204 秒
+```
+
+`verify-observability.sh --logs` 的关键实测：
+
+- gateway 6 条 / match 2 条 / room 2 条结构化日志，**全部带正确的 `service=`**；
+- 同一 request_id 在 Gateway 与 Match 两侧都能查到（`match_enqueue_ok` /
+  `match_enqueued`）；
+- 双客户端配局后 Room 产出 `room_created` 并带 trace；
+- **同一条订阅的 request_id 在 Gateway 与 Room 两侧都能定位**（`subscribe_ready`
+  与 `presence_reported`）——三层贯通；
+- 订阅被拒时留下 `subscribe_rejected`，且可按传入的 request_id 定位。
+
+### 剩余范围（已完成的部分）
+
+**30 处 `fprintf` 已全部改造完毕**（`logging.hpp` 里仅剩注释中的历史引用）。
+补完的日志点：`room_manager`（恢复/拒绝/落库失败）、`match_queue`（快照读写的
+四条失败路径）、`stream_hub`（presence 上报失败、`stream.reset` 发出、补发不可用、
+补发完成）、三个 `*_main`（注册/启动失败）、`redis_match_queue_store`（编码失败）、
+`brpc_room_allocator`（建房调用失败/被拒）、`mysql_connection`（连接失败/断线重连）、
+`mysql_room_snapshot_writer`（快照写失败）、`mysql_player_reader`（档案查询失败）。
+
+**改日志格式必须同步改验收脚本**——这次实测踩到：`verify-persistence.sh` 有 5 处
+断言是"匹配中文日志文本"（`已恢复房间`、`队列快照读取失败`…），日志改成结构化之后
+全部假失败（`verify-all.sh` 里 6/7 通过）。已把这 5 处改为匹配**结构化事件名**
+（`event=room_restored` 等）。另外恢复点取值也从 `room_id=… frame=N` 改成按字段取，
+且要注意字段顺序变了（结构化记录里 `frame` 在 `room` **之后**，旧的 printf 恰好相反）。
+
+**仍然可选的后续改进**（不属于 TASK-018 的验收范围）：
+
+- 登录、结果查询等路径尚未补结构化日志（当前覆盖的是关键路径）。
+- `verify-all.sh` 尚未把 `verify-observability.sh` 纳入常规门禁。
+
+## CI 格式门禁的版本漂移（2026-10-03）
+
+**现象**：PR #16 与 #17 的三个预设（debug / release / asan）**全部失败**，且都发生在
+18~32 秒——不是测试失败，而是卡在格式检查：
+
+```text
+debug  格式检查  格式不合规: src/gateway/stream_hub.cpp
+```
+
+**根因是版本漂移，不是代码有问题**：
+
+| 环境 | clang-format 版本 | 来源 |
+|---|---|---|
+| CI（ubuntu-24.04） | **18.0**（`1:18.0-59~exp2`） | `apt-get install clang-format` |
+| 开发环境（WSL Ubuntu 26.04） | **21.1.x** | 发行版源 |
+
+clang-format 的默认换行与对齐策略跨主版本会变，同一个文件在 18 下判"不合规"、
+在 21 下判"合规"是常态。于是**格式门禁无法在本地复现**——这比不做检查更糟：
+它让人怀疑门禁本身而不是代码。此前一直绿，是因为那时 CI 装的也是 18 而代码恰好是
+18 的排版；本次改动引入的新代码按 21 排版，才把差异暴露出来。
+
+**修复**：
+
+- `.github/workflows/ci.yml`：改为从 apt.llvm.org 安装 `clang-format-21`，
+  并把 `clang-format` 软链到它；「显示工具版本」一步也打印其版本。
+- `scripts/check-format.sh`：新增**主版本校验**（要求 21.x），不符时明确报错并给出
+  修复方式；通过时打印实际版本。**版本要求写在脚本里而不是只写在 CI 配置里**，
+  两边读同一处，改一处即可。
+
+**验证**（CI 实测日志，不是推断）：
+
+```text
+显示工具版本  Ubuntu clang-format version 21.1.8 (++20251221032922+2078da43e25a-...)
+格式检查     格式检查通过，共检查 74 个文件（clang-format 21.x）。
+```
+
+两个 PR 的三个预设随即全部转为 pass。
+
+**教训**：工具链版本属于"必须固定的事实"，与依赖版本同级。凡是"本地绿、CI 红"，
+先查版本而不是先改代码——这次若反过来去迁就 18 的排版，会把整个代码库的格式倒退回
+旧版风格，而根因（门禁不可复现）依然存在。
 ## 分支粒度纠正记录（2026-10-02）
 
 **问题**：本轮我按 Phase 1 的「一任务一分支」建了
@@ -2191,6 +2546,35 @@ TASK-008 起 `connected` 字段只表示"是否已加入房间"，**网络断开
 **教训**：流程类约定和代码一样属于"必须查证的事实"。以后涉及分支、提交、合并、
 发布这类流程动作前，先读 `03-development-workflow.md` 对应章节，
 而不是沿用上一个阶段的习惯。
+
+## Phase 2 退出标准对照表（2026-10-02）
+
+Phase 2 的退出标准写在 [docs/02-roadmap.md](02-roadmap.md) 第 5 节。这张表逐条
+回答"凭什么认为达成了"——**每一行都必须落到一条实际跑过的命令或一段代码上**，
+不能只写"已实现"。
+
+| # | 退出标准（roadmap 第 5 节原文） | 凭什么认为达成 | 验收方式 | 任务 |
+|---|---|---|---|---|
+| 1 | 服务重启后已确认的玩家和对局结果不丢失 | `rooms` 表按 1 秒间隔写快照，Room 启动时**在开始接受请求之前**从最近快照恢复；`match_results` 以 `match_id` 为主键同步幂等写入，重启不影响已落库的行 | `verify-persistence.sh` 第 7 节（含 `kill -9` Room 后重启仍能打完）；`ctest` 的 `RoomManagerTest.Restore*` 与 `BattleRoomTest` | TASK-013 / 014 |
+| 2 | 宽限期内重连可以恢复房间 | 断线由 Gateway 的写失败感知并上报 `SetPlayerPresence`；Room 在 30 秒宽限期内**暂停推进**（帧号与血量冻结），重连后精确接着打 | `verify-reconnect.sh` 第 4 节；`BattleRoomTest.DisconnectPausesTheMatch` / `ReconnectResumesWithoutLosingProgress` | TASK-016 |
+| 3 | 重复写入不产生重复对局结果 | `match_results.match_id` 是主键，`MysqlMatchResultWriter` 用幂等 upsert；Room 侧 `FINISHING` 无限重试但同一 `match_id` 只有一行 | `ctest` 的 `RoomManagerTest.RepeatedFinishDoesNotWriteTwice`；`verify-reconnect.sh` 第 5 节查库 | TASK-008 / 013 |
+| 4 | 恢复时间有测量结果和限制说明 | 见本文件「推送连续性与恢复时间汇总」：每个场景都有恢复手段、**数据丢失上界**与本次验收结果；TASK-014 的偏差有实测帧号（0/0/1 帧），TASK-017 的补发窗口有明确上界（128 帧）与窗口外的显式降级 | 该表本身 + `verify-persistence.sh` / `verify-reconnect.sh` | TASK-013 ~ 017 |
+
+**本阶段明确未达成的部分**（写在这里，避免"全绿"被理解成一切都做到了）：
+
+- 表中第 1、4 行的**原始数字**（`ctest` 计数、`verify-all.sh` 耗时、本次
+  `verify-persistence.sh` 的恢复点帧号）尚未回填到仓库。结论是项目所有者报告的
+  "全绿"，数字待补——**不填猜测值**。
+- Phase 2 期间新增的三条已知限制**没有解决，也明确不在本阶段解决**：
+  1. 快照写入在 Room 的 ticker 线程上，MySQL 不可用时推进变成突发式
+     （见 `docs/01-architecture.md` 第 5 节）；
+  2. 匹配队列的快照写入在入队请求路径上，Redis 挂起时会多等一个超时
+     （见 `docs/TASKS.md` 的 Backlog）；
+  3. presence 与宽限计时不落库，Room 重启会把双方当作在线（TASK-016 决策）。
+  三条都记在 Backlog 或架构文档的已知限制里，各自需要**容量证据**才能动。
+
+**结论**：四条退出标准都有对应的实测命令与代码依据；减去上面列出的待回填数字，
+Phase 2 可判定为完成。
 
 ## 日志模板
 
