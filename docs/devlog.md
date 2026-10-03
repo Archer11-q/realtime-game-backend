@@ -2391,6 +2391,76 @@ TASK-017 的三行随 PR #15（`a61495a7`）合并时全绿通过；**具体的�
 - Phase 3 的任务拆分见 `docs/02-roadmap.md` 第 6 节的「Phase 3 拆分草案」，
   待项目所有者确认后开工。
 
+## TASK-018 实施记录（2026-10-03）
+
+### 完成
+
+- `include/common/logging.hpp` + `src/common/logging.cpp`：结构化日志模块。
+  单行 `key=value`，恒定字段 `ts/service/level/event/trace` 顺序固定，值按需加引号
+  并转义空格、引号、换行与控制字符。**不引入 spdlog**：glog 已在产物里（brpc 依赖）
+  但它面向自由文本，本模块只需要"格式化 + 互斥 + 写 stderr"。
+- 三个服务入口 `SetServiceName(...)`；`request_id` 经 proto 的既有字段贯通
+  Gateway → Match → Room。
+- `RoomClient` 六个方法增加 `request_id` 形参：此前 brpc 实现自己拼
+  `room_id:player_id` 这类伪 id，Gateway 从 HTTP 拿到的 request_id 到不了 Room。
+- `StreamEvents` 的 request_id 现在也读 query string——GET 没有请求体，而
+  **brpc 不会把 query 映射进 protobuf 字段**（与 token/room_id 同一个坑）。
+  订阅记录保存该 id，presence 上报、轮询、补发的 Room 调用全部复用它。
+- 已接入结构化日志的路径：`match_enqueued`（Match）；`match_enqueue_ok` /
+  `match_enqueue_failed` / `subscribe_ready` / `subscribe_rejected`（Gateway）；
+  `room_created` / `room_joined` / `presence_reported`（Room）。
+- `scripts/verify-observability.sh`（新增）：三服务日志格式与 service 字段、
+  结构化行不被断行、同 request_id 跨服务可定位、订阅成功与拒绝两条路径可按 id
+  追溯。**用双客户端配局**，因为单人配不成局、Room 侧不会产生任何日志。
+- `tests/unit/common/logging_test.cpp`：16 个用例。测试自带**独立实现**的解析器
+  （不调用产品代码的解析函数——产品代码只负责产生），这样"格式化结果能否被解析回
+  同样字段"才是真验证。
+
+### 决策
+
+1. **只负责产生日志，不提供解析函数。** 解析的消费者只有测试与验收脚本：
+   前者自带解析器更有价值（顺带校验格式自洽），后者用 shell 更直接。
+   放进产品代码会让模块承担两个方向的责任，而没有运行时消费者需要它。
+2. **值转义而不是"直接塞进去"。** 字段值大量来自配置、数据库错误信息与
+   MySQL/Redis 原始报文，带空格/引号/换行很常见；少一次转义就会让**一条坏字段
+   把整行日志变成不可解析的两行**，而那恰好发生在最需要日志的时候。
+3. **`trace=` 只在 id 非空时输出**，而不是写 `trace=-`：没有 id 与"id 是空串"
+   是两件事，后者不该在日志里伪装成一个值。
+4. **把"要不要补发"的判断从 `BackfillSubscription` 前移到 Tick 的收集阶段**
+   （见下节"发现的问题"第 3 条），并给 Room 不可用保留 `backfill_pending`。
+
+### 验证
+
+**WSL 实测（2026-10-03）**：
+
+```bash
+cmake --preset brpc-debug && cmake --build --preset brpc-debug   # 0 error / 0 warning
+ctest --test-dir build/brpc-debug                                 # 253/253（TASK-017 为 237，新增 16）
+bash scripts/check-format.sh                                      # 通过（77 文件）
+bash scripts/verify-observability.sh --logs                       # 退出码 0
+```
+
+`verify-observability.sh --logs` 的关键实测：
+
+- gateway 6 条 / match 2 条 / room 2 条结构化日志，**全部带正确的 `service=`**；
+- 同一 request_id 在 Gateway 与 Match 两侧都能查到（`match_enqueue_ok` /
+  `match_enqueued`）；
+- 双客户端配局后 Room 产出 `room_created` 并带 trace；
+- **同一条订阅的 request_id 在 Gateway 与 Room 两侧都能定位**（`subscribe_ready`
+  与 `presence_reported`）——三层贯通；
+- 订阅被拒时留下 `subscribe_rejected`，且可按传入的 request_id 定位。
+
+### 剩余范围（未完成，下一轮收尾）
+
+- **还有 29 处 `std::fprintf(stderr, ...)` 未改造**：`room_manager.cpp`（6）、
+  `match_queue.cpp`（5）、`stream_hub.cpp`（4）、三个 `*_main.cpp`（6）、
+  `redis_match_queue_store.cpp`（2）、`brpc_room_allocator.cpp`（2）、
+  `mysql_connection.cpp`（2）、`mysql_player_room_snapshot_writer.cpp`（1）、
+  `mysql_player_reader.cpp`（1）。这些点有的已经带 `request_id`/`room_id` 上下文，
+  改造属于机械替换，但需要逐个核对字段。
+- 登录、结果查询等路径尚未接入结构化日志；验收脚本对它们只打印提示、不断言失败。
+- `verify-all.sh` 尚未把 `verify-observability.sh` 纳入常规门禁（待本任务完成后一并接）。
+
 ## 分支粒度纠正记录（2026-10-02）
 
 **问题**：本轮我按 Phase 1 的「一任务一分支」建了
