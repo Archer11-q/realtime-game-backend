@@ -186,12 +186,13 @@ int main(int argc, char* argv[]) {
     brpc::ServiceOptions service_options;
     service_options.restful_mappings = mappings;
     if (server.AddService(&service, service_options) != 0) {
-        std::fprintf(stderr, "注册 GatewayService 失败：restful 映射可能不合法\n");
+        rgbt::common::LogError("service_register_failed", {{"detail", "restful 映射可能不合法"}});
         return 1;
     }
 
     if (server.Start(FLAGS_port, &options) != 0) {
-        std::fprintf(stderr, "启动 Gateway 失败，端口 %d 可能已被占用\n", FLAGS_port);
+        rgbt::common::LogError("service_start_failed", {{"port", std::to_string(FLAGS_port)},
+                                                        {"hint", "端口可能已被占用"}});
         return 1;
     }
 

@@ -1143,28 +1143,30 @@ Phase 2 已全部完成并合并（TASK-013 ~ TASK-017，`main` 含至 PR #15）
 
 ### TASK-018：结构化日志与请求 ID 贯通
 
-- 状态：**核心已完成并实测通过，剩余日志点未改造**（2026-10-03）。
+- 状态：**已完成并实测通过**（2026-10-03）。
   完整经过与实测数字见 `docs/devlog.md` 的「TASK-018 实施记录」。
 - 已完成：
   - `include/common/logging.hpp` + `src/common/logging.cpp`（单行 `key=value`、
     恒定字段、值转义、服务名）。
   - `request_id` 经 proto 既有字段贯通 Gateway → Match → Room；
     `RoomClient` 六个方法增加 `request_id` 形参，替换掉实现里自拼的伪 id。
-  - 已接入结构化日志的关键路径 8 条：`match_enqueued`、
+  - **30 处 `std::fprintf(stderr, ...)` 全部改造完毕**（`logging.hpp` 里仅剩
+    注释中的历史引用）。已接入的关键路径包括：`match_enqueued`、
     `match_enqueue_ok` / `match_enqueue_failed` / `subscribe_ready` /
-    `subscribe_rejected`、`room_created` / `room_joined` / `presence_reported`。
+    `subscribe_rejected`、`room_created` / `room_joined` / `presence_reported`、
+    `room_restored` / `room_snapshot_rejected` / `result_persist_failed`、
+    `queue_snapshot_*`、`create_room_call_failed` / `create_room_rejected`、
+    `mysql_*`、`service_start_failed` 等。
   - `scripts/verify-observability.sh --logs`（新增）与
     `tests/unit/common/logging_test.cpp`（16 个用例）。
+  - **既有验收脚本同步更新**：`verify-persistence.sh` 里 5 处断言由"匹配中文日志
+    文本"改为"匹配结构化事件名"（`event=room_restored` 等）。这一点是必须的：
+    改日志格式等于改服务输出，脚本不同步就会出现假失败。
   - 实测：构建 0 error / 0 warning；`ctest` 253/253；格式检查 77 文件通过；
-    `verify-observability.sh --logs` 退出码 0，**同一条订阅的 request_id 在
-    Gateway 与 Room 两侧都能定位（三层贯通）**。
-- 剩余范围（未完成）：
-  - **还有 29 处 `std::fprintf(stderr, ...)` 未改造**（`room_manager.cpp` 6、
-    `match_queue.cpp` 5、`stream_hub.cpp` 4、三个 `*_main.cpp` 6、
-    `redis_match_queue_store.cpp` 2、`brpc_room_allocator.cpp` 2、
-    `mysql_connection.cpp` 2、`mysql_room_snapshot_writer.cpp` 1、
-    `mysql_player_reader.cpp` 1）。属机械替换，但需逐个核对字段。
-  - 登录、结果查询等路径未接入；验收脚本对它们只打印提示、不断言失败。
+    `verify-observability.sh --logs` 退出码 0（**三层贯通**）；
+    `verify-all.sh` **7/7 通过**（204 秒）。
+- 剩余（可选的后续改进，不属于本任务验收范围）：
+  - 登录、结果查询等路径尚未补结构化日志（目前只覆盖关键路径）。
   - `verify-all.sh` 尚未把 `verify-observability.sh` 纳入常规门禁。
 - 依赖：无
 - 背景问题：Phase 2 排查问题时最耗时的一环是**把一次请求在三份 stderr 日志里

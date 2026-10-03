@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <utility>
 
+#include "common/logging.hpp"
+
 namespace rgbt::gateway {
 namespace {
 
@@ -292,9 +294,11 @@ void StreamHub::ReportPresence(const std::string& room_id, const std::string& pl
     if (status != RoomCallStatus::kOk && status != RoomCallStatus::kAlreadyFinished) {
         // 不重试、不阻塞推送：Room 短暂不可用时，客户端的轮询兜底仍然可用；
         // 下一次连接变化（或重连）会重新上报。
-        std::fprintf(stderr,
-                     "[gateway] 上报连接状态失败（不重试）：room_id=%s player_id=%s online=%d\n",
-                     room_id.c_str(), player_id.c_str(), online ? 1 : 0);
+        rgbt::common::LogWarn("presence_report_failed", request_id,
+                              {{"room", room_id},
+                               {"player", player_id},
+                               {"online", online ? "true" : "false"},
+                               {"policy", "不重试（下一次连接变化会覆盖）"}});
     }
 }
 
@@ -536,10 +540,11 @@ StreamHub::BackfillOutcome StreamHub::BackfillSubscription(const BackfillTarget&
     // `payload` 必须是**当前完整状态**：客户端要按它刷新，而不是再发一次查询。
     // 取不到它时不调用本函数（见各分支的 have_current 判断）。
     const auto send_reset = [&](const char* reason, const RoomSnapshot& payload) {
-        std::fprintf(stderr,
-                     "[gateway] 发出 stream.reset：room_id=%s reason=%s window=[%lld,%lld]\n",
-                     target.room_id.c_str(), reason, static_cast<long long>(range.oldest_frame),
-                     static_cast<long long>(range.latest_frame));
+        rgbt::common::LogInfo("stream_reset_sent", target.request_id,
+                              {{"room", target.room_id},
+                               {"reason", reason},
+                               {"window_oldest", std::to_string(range.oldest_frame)},
+                               {"window_latest", std::to_string(range.latest_frame)}});
         outcome.write_failed = !target.sink->Write(SseEvent(
             "stream.reset", StreamResetJson(reason, payload, SystemNowMs()), payload.frame));
         outcome.reset_sent = !outcome.write_failed;
@@ -589,9 +594,10 @@ StreamHub::BackfillOutcome StreamHub::BackfillSubscription(const BackfillTarget&
         // Room 不可用（或房间已回收）：**不补发、不发事件、不关闭连接**。
         // 沿用 TASK-009 的取舍——一次抖动的代价不该是逼客户端重连；
         // 下一轮 Tick 会照常推当前状态（它同样会失败，直到 Room 回来）。
-        std::fprintf(stderr,
-                     "[gateway] 补发失败（Room 不可用，连接保持）：room_id=%s since_frame=%lld\n",
-                     target.room_id.c_str(), static_cast<long long>(since_frame));
+        rgbt::common::LogWarn("backfill_unavailable", target.request_id,
+                              {{"room", target.room_id},
+                               {"since_frame", std::to_string(since_frame)},
+                               {"policy", "保持连接并在下一轮重试"}});
         return outcome;
     }
 
@@ -645,9 +651,10 @@ StreamHub::BackfillOutcome StreamHub::BackfillSubscription(const BackfillTarget&
     outcome.attempted = true;
     outcome.frames = range.snapshots.size();
 
-    std::fprintf(stderr, "[gateway] 已补发 %zu 帧：room_id=%s since_frame=%lld\n",
-                 range.snapshots.size(), target.room_id.c_str(),
-                 static_cast<long long>(since_frame));
+    rgbt::common::LogInfo("backfill_done", target.request_id,
+                          {{"room", target.room_id},
+                           {"frames", std::to_string(range.snapshots.size())},
+                           {"since_frame", std::to_string(since_frame)}});
     return outcome;
 }
 

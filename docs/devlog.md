@@ -2438,6 +2438,7 @@ cmake --preset brpc-debug && cmake --build --preset brpc-debug   # 0 error / 0 w
 ctest --test-dir build/brpc-debug                                 # 253/253（TASK-017 为 237，新增 16）
 bash scripts/check-format.sh                                      # 通过（77 文件）
 bash scripts/verify-observability.sh --logs                       # 退出码 0
+bash scripts/verify-all.sh                                        # 7/7 通过，204 秒
 ```
 
 `verify-observability.sh --logs` 的关键实测：
@@ -2450,16 +2451,25 @@ bash scripts/verify-observability.sh --logs                       # 退出码 0
   与 `presence_reported`）——三层贯通；
 - 订阅被拒时留下 `subscribe_rejected`，且可按传入的 request_id 定位。
 
-### 剩余范围（未完成，下一轮收尾）
+### 剩余范围（已完成的部分）
 
-- **还有 29 处 `std::fprintf(stderr, ...)` 未改造**：`room_manager.cpp`（6）、
-  `match_queue.cpp`（5）、`stream_hub.cpp`（4）、三个 `*_main.cpp`（6）、
-  `redis_match_queue_store.cpp`（2）、`brpc_room_allocator.cpp`（2）、
-  `mysql_connection.cpp`（2）、`mysql_player_room_snapshot_writer.cpp`（1）、
-  `mysql_player_reader.cpp`（1）。这些点有的已经带 `request_id`/`room_id` 上下文，
-  改造属于机械替换，但需要逐个核对字段。
-- 登录、结果查询等路径尚未接入结构化日志；验收脚本对它们只打印提示、不断言失败。
-- `verify-all.sh` 尚未把 `verify-observability.sh` 纳入常规门禁（待本任务完成后一并接）。
+**30 处 `fprintf` 已全部改造完毕**（`logging.hpp` 里仅剩注释中的历史引用）。
+补完的日志点：`room_manager`（恢复/拒绝/落库失败）、`match_queue`（快照读写的
+四条失败路径）、`stream_hub`（presence 上报失败、`stream.reset` 发出、补发不可用、
+补发完成）、三个 `*_main`（注册/启动失败）、`redis_match_queue_store`（编码失败）、
+`brpc_room_allocator`（建房调用失败/被拒）、`mysql_connection`（连接失败/断线重连）、
+`mysql_room_snapshot_writer`（快照写失败）、`mysql_player_reader`（档案查询失败）。
+
+**改日志格式必须同步改验收脚本**——这次实测踩到：`verify-persistence.sh` 有 5 处
+断言是"匹配中文日志文本"（`已恢复房间`、`队列快照读取失败`…），日志改成结构化之后
+全部假失败（`verify-all.sh` 里 6/7 通过）。已把这 5 处改为匹配**结构化事件名**
+（`event=room_restored` 等）。另外恢复点取值也从 `room_id=… frame=N` 改成按字段取，
+且要注意字段顺序变了（结构化记录里 `frame` 在 `room` **之后**，旧的 printf 恰好相反）。
+
+**仍然可选的后续改进**（不属于 TASK-018 的验收范围）：
+
+- 登录、结果查询等路径尚未补结构化日志（当前覆盖的是关键路径）。
+- `verify-all.sh` 尚未把 `verify-observability.sh` 纳入常规门禁。
 
 ## 分支粒度纠正记录（2026-10-02）
 
