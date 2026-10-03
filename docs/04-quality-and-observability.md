@@ -97,6 +97,11 @@
 - 匹配人数、等待时长和匹配成功率。
 - 活跃房间数、房间创建/销毁速率。
 - 重连次数、成功率和 Session 过期数。
+- 推送补发：补发帧数与 `stream.reset` 次数（**按原因分开**，TASK-017）。
+  「窗口外」说明客户端落后得比缓冲还多，「id 超前」说明客户端与服务端对不上，
+  而「首次订阅」是正常路径——合成一个数字就看不出这次 reset 是不是问题。
+  当前实现已经暴露了这两个计数（`StreamHub::BackfilledFrameCount` /
+  `ResetEventCount`），接入 Prometheus 属 Phase 3。
 - Redis/MySQL 调用延迟和失败率。
 - 进程 CPU、内存、FD 和线程数。
 
