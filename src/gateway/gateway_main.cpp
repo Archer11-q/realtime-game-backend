@@ -33,6 +33,7 @@
 #include "brpc_match_client.hpp"
 #include "brpc_room_client.hpp"
 #include "common/logging.hpp"
+#include "common/metrics_service.hpp"
 #include "common/mysql_connection.hpp"
 #include "common/version.hpp"
 #include "database_player_directory.hpp"
@@ -183,11 +184,26 @@ int main(int argc, char* argv[]) {
         // room_id 同样走查询参数（brpc 不支持 {name} 路径参数）。
         "/api/v1/stream => StreamEvents";
 
+    // `/metrics` 由 MetricsService 提供（见下方 AddService）：它不属于 Gateway 的
+    // 业务能力，而是与 brpc 内置的 `/status` 同级的运维接口，因此不混进
+    // GatewayService，而是**单独注册一个服务并单独给一条 restful 映射**。
+    const std::string metrics_mapping = "/metrics => Scrape";
+
     brpc::ServiceOptions service_options;
     service_options.restful_mappings = mappings;
     if (server.AddService(&service, service_options) != 0) {
         rgbt::common::LogError("service_register_failed", {{"detail", "restful 映射可能不合法"}});
         return 1;
+    }
+
+    // TASK-019：`/metrics`。单独一个服务 + 单独一条 restful 映射，理由见
+    // api/proto/metrics.proto 的头部说明。
+    rgbt::common::MetricsServiceImpl metrics_service;
+    brpc::ServiceOptions metrics_options;
+    metrics_options.restful_mappings = metrics_mapping;
+    if (server.AddService(&metrics_service, metrics_options) != 0) {
+        // 指标端点注册失败**不阻止启动**：指标是旁路，业务可用性优先。
+        rgbt::common::LogWarn("metrics_register_failed", {});
     }
 
     if (server.Start(FLAGS_port, &options) != 0) {

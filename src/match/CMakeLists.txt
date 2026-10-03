@@ -56,7 +56,15 @@ rgbt_set_project_warnings(rgbt_match_lib)
 # ---------------------------------------------------------------------------
 
 add_executable(rgbt_match match_main.cpp)
-target_link_libraries(rgbt_match PRIVATE rgbt_match_lib unofficial::brpc::brpc)
+target_link_libraries(
+  rgbt_match
+  PRIVATE
+    rgbt_match_lib
+    # `/metrics` 端点（TASK-019）。三个服务注册同一个实现，因此三个端口都能被
+    # Prometheus 抓到，不需要额外的聚合进程。
+    rgbt_common_metrics_service
+    unofficial::brpc::brpc
+)
 
 # 服务可执行文件也要过 sanitizer，理由见 src/room/CMakeLists.txt 里的说明：
 # 只给 *_lib 加 sanitizer 会让服务二进制链接失败，ASan 实际覆盖不到服务进程。

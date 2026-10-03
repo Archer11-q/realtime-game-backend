@@ -29,6 +29,7 @@
 
 #include "brpc_room_allocator.hpp"
 #include "common/logging.hpp"
+#include "common/metrics_service.hpp"
 #include "common/version.hpp"
 #include "match_queue.hpp"
 #include "match_queue_store.hpp"
@@ -123,6 +124,20 @@ int main(int argc, char* argv[]) {
     if (server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
         rgbt::common::LogError("service_register_failed", {});
         return 1;
+    }
+
+    // TASK-019：`/metrics`。同一个端口上再注册一个服务——brpc 允许这样做，
+    // 因此不需要为指标单开端口。`SERVER_DOESNT_OWN_SERVICE` 表示生命周期由本函数
+    // 的栈对象管理，服务器不负责释放。
+    rgbt::common::MetricsServiceImpl metrics_service;
+    // 必须给它一条 restful 映射：brpc 收到 `GET /metrics` 时是按**路径**在
+    // restful 映射表里找方法的（不是按 service/method 名找）。没有映射时的
+    // 表现是 404 `Fail to find method on '/metrics'`（实测踩到）。
+    brpc::ServiceOptions metrics_options;
+    metrics_options.restful_mappings = "/metrics => Scrape";
+    if (server.AddService(&metrics_service, metrics_options) != 0) {
+        // 指标端点注册失败**不阻止启动**：指标是旁路，业务可用性优先。
+        rgbt::common::LogWarn("metrics_register_failed", {});
     }
 
     if (server.Start(FLAGS_match_port, &options) != 0) {

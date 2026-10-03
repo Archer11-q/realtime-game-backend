@@ -51,7 +51,14 @@ rgbt_set_project_warnings(rgbt_room_lib)
 # ---------------------------------------------------------------------------
 
 add_executable(rgbt_room room_main.cpp)
-target_link_libraries(rgbt_room PRIVATE rgbt_room_lib unofficial::brpc::brpc)
+target_link_libraries(
+  rgbt_room
+  PRIVATE
+    rgbt_room_lib
+    # `/metrics` 端点（TASK-019），理由见 src/match/CMakeLists.txt。
+    rgbt_common_metrics_service
+    unofficial::brpc::brpc
+)
 
 # 服务可执行文件也要过 sanitizer。**这一行是必需的**：TASK-014 之前
 # rgbt_apply_sanitizer 只作用于 *_lib 与测试目标，服务二进制没有链接 ASan 运行时，
