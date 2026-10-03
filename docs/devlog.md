@@ -2266,9 +2266,35 @@ bash scripts/check-format.sh                                      # 通过（74 
    TASK-009/016 用例同时失败。改为在 Tick 收集阶段就排除，让它走 TASK-016 的
    正常路径（不补发、不发 reset，由第一次 Tick 推当前状态）。
 
-**尚未运行**：端到端脚本（`verify-reconnect.sh` 含本任务第 7 节、`verify-all.sh`）。
-原因是本机 Docker Desktop 未启动（无 `docker.sock`，6379/3306 无监听），
-Redis/MySQL 不可用。启动后需补跑并把结果回填到下面的汇总表。
+**尚未运行**：无——端到端已在启动 Docker Desktop 后补跑完成，见下节。
+
+**端到端与全套回归的实测（2026-10-03，WSL，Docker Engine 29.4.3）**：
+
+```bash
+cmake --preset brpc-debug && cmake --build --preset brpc-debug   # RC=0，0 error / 0 warning
+ctest --test-dir build/brpc-debug                                 # 237/237 通过
+bash scripts/check-format.sh                                      # 通过（74 个文件）
+bash scripts/verify-reconnect.sh                                  # 退出码 0
+bash scripts/verify-all.sh                                        # 7/7 通过，合计 194 秒
+```
+
+`verify-reconnect.sh` 第 7 节（TASK-017 的端到端验收）实测数字：
+
+- 断开期间对局继续推进：**frame 20 → 40**（缺口 20 帧）。
+- 以 `Last-Event-ID: 20` 重连后，补发**从 21 开始**、**覆盖到 40**，
+  即缺口 20 帧被完整补齐，且**没有发 `stream.reset`**（窗口内不需要全量刷新）。
+- 补发之后实时推送接上：**frame 53 → 73**。
+- `id` 超前（999999）→ 发 `stream.reset`，`reason = id_ahead`，载荷带完整状态。
+- `Last-Event-ID: not-a-number` → `stream.reset`，`reason = id_malformed`。
+- 不带该头 → **不发** `stream.reset`，直接推当前状态（裁决后的行为）。
+
+`verify-all.sh` 各脚本耗时：verify 27s、verify-login 27s、verify-match 31s、
+verify-room 32s、verify-stream 10s、verify-web 19s、verify-persistence 48s。
+
+**补跑期间又抓到一个前端类型错误**：`web/src/api/stream.test.ts` 的 fetch 桩里
+形参 `url` 未使用，被 `noUnusedParameters` 拦下（`vue-tsc --noEmit` 失败 →
+`npm run build` 也失败）。改为 `_url` 并通过。**教训：前端有 `noUnusedParameters`，
+新写的测试桩形参必须带下划线或真的用上。**
 
 **搬运方式（补回时采用，比逐文件 rsync 更安全，建议沿用）**：
 
@@ -2304,6 +2330,9 @@ bash scripts/verify-all.sh          # 全套
 `verify-persistence.sh` 的恢复点帧号。结论是"全绿"（项目所有者报告），
 数字尚未粘贴回仓库，**因此不填猜测值**。
 
+> 2026-10-03 更新：上句针对 PR #15 那次运行。**PR #16 的补跑已给出实测数字**
+> （见上一节），本段保留是为了留下"当时确实没有数字"这一事实。
+
 **尚未回填的原始数字**（不是"没跑"，是"结果没有回到仓库"）：
 `ctest` 的具体计数、`verify-all.sh` 的通过项与耗时、以及
 `verify-persistence.sh` 的恢复点帧号（TASK-014 曾记录为 30/30/29 帧）。
@@ -2331,9 +2360,9 @@ TASK-017 的三行随 PR #15（`a61495a7`）合并时全绿通过；**具体的�
 | Redis 不可用 | 降级为纯内存，匹配照常 | 无（队列权威状态在内存） | 通过（不恢复，直接降级） | TASK-015 |
 | 客户端断线 | 30 秒宽限期内重连，对局**暂停推进**因此接得上 | **0 帧**（暂停期间帧号不前进） | 通过；重连时延由客户端退避决定：1/2/4/5/5 秒，累计 17 秒内 | TASK-016 |
 | 断线超期未归 | 判断线方负并写 `match_results` | 无（产生胜负，不是恢复） | 通过；固定 30 秒（`kReconnectGraceMs`） | TASK-016 |
-| Gateway 重启 | 客户端重连重建订阅 + 按 `Last-Event-ID` 补发窗口内的帧 | 超出 128 帧（≈12.8 秒）窗口的部分不可补，明确回 `stream.reset` | 通过（`verify-reconnect.sh` 第 7 节） | TASK-017 / PR #15 |
-| 首次订阅（无 `Last-Event-ID`） | 不补发，直接推当前状态 | 无（客户端本来就没有状态） | 通过（且断言**不发** `stream.reset`） | TASK-017 / PR #15 |
-| 补发窗口外 / id 超前 / id 非法 | `stream.reset` + 当前完整状态 | 中间缺失的帧**不可恢复**（如实告知，不假装补上） | 通过 | TASK-017 / PR #15 |
+| Gateway 重启 | 客户端重连重建订阅 + 按 `Last-Event-ID` 补发窗口内的帧 | 超出 128 帧（≈12.8 秒）窗口的部分不可补，明确回 `stream.reset` | **通过**；实测缺口 20 帧（frame 20→40）被完整补齐（id 21→40），未发 reset | TASK-017 / PR #16 |
+| 首次订阅（无 `Last-Event-ID`） | 不补发，直接推当前状态 | 无（客户端本来就没有状态） | **通过**；且断言**不发** `stream.reset` | TASK-017 / PR #16 |
+| 补发窗口外 / id 超前 / id 非法 | `stream.reset` + 当前完整状态 | 中间缺失的帧**不可恢复**（如实告知，不假装补上） | **通过**；`id_ahead` 与 `id_malformed` 分别被单独识别 | TASK-017 / PR #16 |
 
 ### 未做 / 遗留
 

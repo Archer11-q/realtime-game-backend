@@ -127,7 +127,8 @@ function stubFetch(): { headers: Record<string, string> } {
       controller.close()
     },
   })
-  vi.stubGlobal('fetch', (url: string | URL, init?: RequestInit) => {
+  // 参数名加下划线：`noUnusedParameters` 会拦下未使用的形参，而这个桩只关心 headers。
+  vi.stubGlobal('fetch', (_url: string | URL, init?: RequestInit) => {
     const headers = (init?.headers ?? {}) as Record<string, string>
     captured.headers = headers
     return Promise.resolve(
