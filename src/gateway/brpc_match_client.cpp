@@ -3,13 +3,45 @@
 #include <brpc/channel.h>
 #include <brpc/controller.h>
 
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
+#include "common/metrics.hpp"
 #include "match.pb.h"
 
 namespace rgbt::gateway {
 namespace {
+
+/// TASK-019：把一次服务间调用的结果记到指标上。
+///
+/// 为什么包装 `return XxxCallStatus::...` 而不是改每个调用点：这是真正的 RPC 层，
+/// 每个方法都以一个 CallStatus 收敛。包装 return 保证**零遗漏**——漏一个调用点
+/// 不会有任何报错，只会让"错误率"这个指标悄悄偏低，而那正是排障时最依赖的数字。
+///
+/// `ok` 只认 `kOk`：其余取值（含 `kResultPending`、`kNotAMember` 这类业务性拒绝）
+/// 对"服务间调用是否成功"这个问题的答案都是"没成功"。
+void RecordRpcCall(bool ok) {
+    static std::mutex cache_mutex;
+    static std::unordered_map<std::string, rgbt::common::CounterHandle> cache;
+    const std::string key = ok ? "ok" : "failed";
+
+    rgbt::common::CounterHandle handle;
+    {
+        const std::lock_guard<std::mutex> lock(cache_mutex);
+        const auto it = cache.find(key);
+        if (it == cache.end()) {
+            handle = rgbt::common::Metrics().Counter(rgbt::common::kMetricRpcCallsTotal,
+                                                     "Gateway 发起的服务间 RPC 调用数",
+                                                     {{"target", "match"}, {"outcome", key}});
+            cache.emplace(key, handle);
+        } else {
+            handle = it->second;
+        }
+    }
+    handle.Add();
+}
 
 /// 把 Match 的快照转成 Gateway 自己的结构。
 MatchSnapshot ToSnapshot(const rgbt::match::v1::MatchStatus& status) {
@@ -46,13 +78,17 @@ MatchCallStatus ToCallStatus(const rgbt::match::v1::MatchError& error) {
     switch (error.code()) {
         case rgbt::match::v1::MATCH_ERROR_CODE_UNSPECIFIED:
         case rgbt::match::v1::MATCH_ALREADY_QUEUED:
+            RecordRpcCall(true);
             return MatchCallStatus::kOk;
         case rgbt::match::v1::MATCH_INVALID_ARGUMENT:
+            RecordRpcCall(false);
             return MatchCallStatus::kInvalidArgument;
         case rgbt::match::v1::MATCH_QUEUE_FULL:
+            RecordRpcCall(false);
             return MatchCallStatus::kQueueFull;
         case rgbt::match::v1::MATCH_INTERNAL:
         default:
+            RecordRpcCall(false);
             return MatchCallStatus::kInternal;
     }
 }
@@ -100,6 +136,7 @@ MatchCallStatus BrpcMatchClient::Enqueue(const std::string& player_id,
     stub.EnqueueMatch(&controller, &request, &response, nullptr);
 
     if (controller.Failed()) {
+        RecordRpcCall(false);
         return MatchCallStatus::kUnavailable;
     }
     if (out_snapshot != nullptr) {
@@ -121,6 +158,7 @@ MatchCallStatus BrpcMatchClient::GetStatus(const std::string& player_id,
     stub.GetMatchStatus(&controller, &request, &response, nullptr);
 
     if (controller.Failed()) {
+        RecordRpcCall(false);
         return MatchCallStatus::kUnavailable;
     }
     if (out_snapshot != nullptr) {
@@ -143,6 +181,7 @@ MatchCallStatus BrpcMatchClient::Cancel(const std::string& player_id, const std:
     stub.CancelMatch(&controller, &request, &response, nullptr);
 
     if (controller.Failed()) {
+        RecordRpcCall(false);
         return MatchCallStatus::kUnavailable;
     }
     if (out_snapshot != nullptr) {
