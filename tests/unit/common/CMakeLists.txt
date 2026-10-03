@@ -1,6 +1,6 @@
 # common 的单元测试。
 
-add_executable(rgbt_common_tests logging_test.cpp version_test.cpp)
+add_executable(rgbt_common_tests logging_test.cpp metrics_test.cpp version_test.cpp)
 
 target_link_libraries(rgbt_common_tests PRIVATE rgbt_common GTest::gtest_main)
 
