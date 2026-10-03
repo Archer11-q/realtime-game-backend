@@ -6,6 +6,8 @@
 #include <string>
 #include <utility>
 
+#include "common/logging.hpp"
+
 namespace rgbt::match {
 namespace {
 
@@ -52,6 +54,33 @@ bool MatchServiceImpl::FillError(rgbt::match::v1::MatchError* error,
     return false;
 }
 
+namespace {
+
+/// 匹配状态的稳定字符串。取值与 `MatchStateInfo.state`、Gateway 的
+/// `MatchStateName` 一致（TASK-018：日志里也用同一套取值，排障时不必再做一次
+/// 心智映射）。
+///
+/// 注意两点，都是实测踩过的：
+///   * **函数名不能叫 `MatchStateName`**：`room.pb.h`/`match.pb.h` 生成的命名空间里
+///     也有同名候选，未限定的调用会歧义或选错重载；
+///   * **枚举必须用 `MatchStatusSnapshot::State`**：本文件同时 using 了 proto
+///     命名空间，未限定的 `MatchState` 会解析到 `rgbt::match::v1::MatchState`，
+///     于是 `kIdle` 这类枚举值找不到，并触发 `-Werror=switch`。
+const char* MatchStateLabel(MatchStatusSnapshot::State state) {
+    switch (state) {
+        case MatchStatusSnapshot::State::kIdle:
+            return "idle";
+        case MatchStatusSnapshot::State::kQueued:
+            return "queued";
+        case MatchStatusSnapshot::State::kMatched:
+            return "matched";
+        case MatchStatusSnapshot::State::kTimeout:
+            return "timeout";
+    }
+    return "unknown";
+}
+
+}  // namespace
 void MatchServiceImpl::FillStatus(const MatchStatusSnapshot& snapshot,
                                   rgbt::match::v1::MatchStatus* out) {
     if (out == nullptr) {
@@ -80,11 +109,20 @@ void MatchServiceImpl::EnqueueMatch(::google::protobuf::RpcController* /*control
 
     const EnqueueOutcome outcome = queue_->Enqueue(player_id, request_id, now_ms);
     switch (outcome) {
-        case EnqueueOutcome::kQueued:
+        case EnqueueOutcome::kQueued: {
             // 入队成功。注意状态可能是 QUEUED，也可能在同一次调用内就变成 MATCHED
             // （第二个入队的人会立刻配成局），因此这里必须回读真实状态而不是写死。
-            FillStatus(queue_->GetStatus(player_id, now_ms), response->mutable_status());
+            const MatchStatusSnapshot snapshot = queue_->GetStatus(player_id, now_ms);
+            // TASK-018：带上 Gateway 传来的 request_id，于是同一次"点开始匹配"
+            // 在 Gateway 与 Match 的日志里可以用同一个键串起来。
+            rgbt::common::LogInfo("match_enqueued", request_id,
+                                  {{"player", player_id},
+                                   {"state", std::string(MatchStateLabel(snapshot.state))},
+                                   {"queue_size", std::to_string(snapshot.queue_size)},
+                                   {"match_id", snapshot.match_id}});
+            FillStatus(snapshot, response->mutable_status());
             return;
+        }
         case EnqueueOutcome::kAlreadyQueued:
             // 幂等：把当前状态返回给调用方，让它自己判断是等待还是领取结果。
             FillError(response->mutable_error(), MatchErrorCode::MATCH_ALREADY_QUEUED,

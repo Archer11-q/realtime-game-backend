@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/logging.hpp"
+
 namespace rgbt::match {
 namespace {
 
@@ -73,8 +75,8 @@ bool RedisMatchQueueStore::Save(const MatchQueueSnapshot& snapshot) {
         if (EncodeMatchQueueEntry(entry, &line)) {
             lines.push_back(std::move(line));
         } else {
-            std::fprintf(stderr, "[match] 队列快照条目编码失败，已跳过：player_id=%s\n",
-                         entry.player_id.c_str());
+            rgbt::common::LogWarn("queue_snapshot_encode_failed",
+                                  {{"player", entry.player_id}, {"action", "跳过"}});
         }
     }
     for (const MatchQueueEntry& entry : snapshot.matched) {
@@ -82,8 +84,8 @@ bool RedisMatchQueueStore::Save(const MatchQueueSnapshot& snapshot) {
         if (EncodeMatchQueueEntry(entry, &line)) {
             lines.push_back(std::move(line));
         } else {
-            std::fprintf(stderr, "[match] 队列快照条目编码失败，已跳过：match_id=%s\n",
-                         entry.match_id.c_str());
+            rgbt::common::LogWarn("queue_snapshot_encode_failed",
+                                  {{"match_id", entry.match_id}, {"action", "跳过"}});
         }
     }
 

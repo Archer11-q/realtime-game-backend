@@ -79,6 +79,23 @@ RoomSnapshot ToSnapshot(const rgbt::room::v1::RoomSnapshot& source) {
     return snapshot;
 }
 
+/// 快照窗口状态转换（TASK-017）。
+///
+/// 不认识的取值按 `kIncomplete` 处理，而不是 `kReady`：把"看不懂"当成"补得齐"
+/// 会让客户端从一段可能有洞的历史往下接，而它自己无从发现。
+SnapshotWindowStatus ToWindowStatus(rgbt::room::v1::SnapshotWindowStatus status) {
+    switch (status) {
+        case rgbt::room::v1::SNAPSHOTS_READY:
+            return SnapshotWindowStatus::kReady;
+        case rgbt::room::v1::SNAPSHOTS_AHEAD:
+            return SnapshotWindowStatus::kAhead;
+        case rgbt::room::v1::SNAPSHOTS_INCOMPLETE:
+        case rgbt::room::v1::SNAPSHOT_WINDOW_STATUS_UNSPECIFIED:
+        default:
+            return SnapshotWindowStatus::kIncomplete;
+    }
+}
+
 /// 把 Room 的业务错误码转成调用结果。
 ///
 /// 关键区分：传输层失败（controller.Failed()）单独处理为 kUnavailable，
@@ -136,11 +153,11 @@ BrpcRoomClient::BrpcRoomClient(RoomClientOptions options)
 BrpcRoomClient::~BrpcRoomClient() = default;
 
 RoomCallStatus BrpcRoomClient::Join(const std::string& room_id, const std::string& player_id,
-                                    RoomSnapshot* out_snapshot) {
+                                    const std::string& request_id, RoomSnapshot* out_snapshot) {
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::JoinRoomRequest request;
-    request.set_request_id(room_id + ":" + player_id);
+    request.set_request_id(request_id);
     request.set_room_id(room_id);
     request.set_player_id(player_id);
     rgbt::room::v1::JoinRoomResponse response;
@@ -160,13 +177,14 @@ RoomCallStatus BrpcRoomClient::Join(const std::string& room_id, const std::strin
 
 RoomCallStatus BrpcRoomClient::SubmitAttack(const std::string& room_id,
                                             const std::string& player_id,
+                                            const std::string& request_id,
                                             RoomSnapshot* out_snapshot) {
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::SubmitInputRequest request;
-    // request_id 用「房间:玩家」而不是随机串：本接口不要求幂等键（同一帧的重复
-    // 攻击会被服务端合并），用它只是为了在跨服务日志里能直接关联到人和房间。
-    request.set_request_id(room_id + ":" + player_id);
+    // request_id 来自调用方（Gateway 的 HTTP 入口），因此同一次用户操作在
+    // Gateway 与 Room 的日志里有同一个关联键（TASK-018）。
+    request.set_request_id(request_id);
     request.set_room_id(room_id);
     request.set_player_id(player_id);
     request.mutable_input()->set_kind(rgbt::room::v1::PlayerInput::KIND_ATTACK);
@@ -186,13 +204,12 @@ RoomCallStatus BrpcRoomClient::SubmitAttack(const std::string& room_id,
 }
 
 RoomCallStatus BrpcRoomClient::SetPresence(const std::string& room_id, const std::string& player_id,
-                                           bool online, RoomSnapshot* out_snapshot) {
+                                           bool online, const std::string& request_id,
+                                           RoomSnapshot* out_snapshot) {
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::SetPlayerPresenceRequest request;
-    // request_id 用「房间:玩家:状态」：本接口不要求幂等键（重复上报无副作用），
-    // 它只用于让跨服务日志能直接关联到人、房间与这次变化。
-    request.set_request_id(room_id + ":" + player_id + (online ? ":online" : ":offline"));
+    request.set_request_id(request_id);
     request.set_room_id(room_id);
     request.set_player_id(player_id);
     request.set_connected(online);
@@ -211,11 +228,12 @@ RoomCallStatus BrpcRoomClient::SetPresence(const std::string& room_id, const std
     return ToCallStatus(response.error().code());
 }
 
-RoomCallStatus BrpcRoomClient::GetState(const std::string& room_id, RoomSnapshot* out_snapshot) {
+RoomCallStatus BrpcRoomClient::GetState(const std::string& room_id, const std::string& request_id,
+                                        RoomSnapshot* out_snapshot) {
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::GetRoomStateRequest request;
-    request.set_request_id(room_id);
+    request.set_request_id(request_id);
     request.set_room_id(room_id);
     rgbt::room::v1::GetRoomStateResponse response;
 
@@ -232,11 +250,12 @@ RoomCallStatus BrpcRoomClient::GetState(const std::string& room_id, RoomSnapshot
     return ToCallStatus(response.error().code());
 }
 
-RoomCallStatus BrpcRoomClient::GetResult(const std::string& match_id, MatchResultView* out_view) {
+RoomCallStatus BrpcRoomClient::GetResult(const std::string& match_id, const std::string& request_id,
+                                         MatchResultView* out_view) {
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::GetMatchResultRequest request;
-    request.set_request_id(match_id);
+    request.set_request_id(request_id);
     request.set_match_id(match_id);
     rgbt::room::v1::GetMatchResultResponse response;
 
@@ -268,6 +287,45 @@ RoomCallStatus BrpcRoomClient::GetResult(const std::string& match_id, MatchResul
     }
 
     return ToCallStatus(response.error().code());
+}
+
+RoomCallStatus BrpcRoomClient::GetSnapshotsSince(const std::string& room_id,
+                                                 std::int64_t since_frame,
+                                                 const std::string& request_id,
+                                                 SnapshotRange* out_range) {
+    rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
+
+    rgbt::room::v1::GetRoomSnapshotsSinceRequest request;
+    request.set_request_id(request_id);
+    request.set_room_id(room_id);
+    request.set_since_frame(since_frame);
+    rgbt::room::v1::GetRoomSnapshotsSinceResponse response;
+
+    brpc::Controller controller;
+    controller.set_timeout_ms(impl_->options.timeout_ms);
+    stub.GetRoomSnapshotsSince(&controller, &request, &response, nullptr);
+
+    if (controller.Failed()) {
+        return RoomCallStatus::kUnavailable;
+    }
+
+    const RoomCallStatus status = ToCallStatus(response.error().code());
+    if (status != RoomCallStatus::kOk) {
+        // 房间不存在等确定性失败：不填 out_range，避免调用方误用半份数据。
+        return status;
+    }
+
+    if (out_range != nullptr) {
+        *out_range = SnapshotRange{};
+        out_range->status = ToWindowStatus(response.status());
+        out_range->oldest_frame = response.oldest_frame();
+        out_range->latest_frame = response.latest_frame();
+        out_range->snapshots.reserve(static_cast<std::size_t>(response.snapshots_size()));
+        for (const rgbt::room::v1::RoomSnapshot& snapshot : response.snapshots()) {
+            out_range->snapshots.push_back(ToSnapshot(snapshot));
+        }
+    }
+    return RoomCallStatus::kOk;
 }
 
 bool BrpcRoomClient::IsHealthy() {

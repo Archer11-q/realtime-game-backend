@@ -363,6 +363,96 @@ TEST(BattleRoomTest, SnapshotHistoryIsBounded) {
     EXPECT_GT(room.SnapshotHistorySize(), 0U);
 }
 
+// ---------------------------------------------------------------------------
+// 历史快照补发（TASK-017）
+//
+// 这一组锁定的是"Gateway 按 Last-Event-ID 补发"所依赖的两条性质：
+// 帧号严格递增且不重复、以及补发窗口的边界。它们都必须能单独验证——
+// 端到端脚本只能证明"重连后帧号最终对上了"，证明不了"中间没有重复帧"。
+// ---------------------------------------------------------------------------
+
+TEST(BattleRoomTest, SnapshotsAfterReturnsOnlyNewerFramesInOrder) {
+    BattleRoom room = PlayingRoom();
+    AdvanceTo(&room, kT0, kT0 + 5 * kFrameIntervalMs);
+    const std::int64_t current = room.Snapshot().frame;
+    ASSERT_EQ(current, 5);
+
+    const std::vector<RoomSnapshot> snapshots = room.SnapshotsAfter(2);
+    ASSERT_FALSE(snapshots.empty());
+    // 严格递增：这是"客户端可以按序直接写出、不需要再去重"的依据。
+    for (std::size_t i = 1; i < snapshots.size(); ++i) {
+        EXPECT_LT(snapshots[i - 1].frame, snapshots[i].frame);
+    }
+    // 只返回比 2 新的帧，且最后一帧就是当前帧。
+    EXPECT_GT(snapshots.front().frame, 2);
+    EXPECT_EQ(snapshots.back().frame, current);
+}
+
+TEST(BattleRoomTest, SnapshotsAfterDeduplicatesSameFrameEvents) {
+    // 同一帧可能有多条快照：加入房间、断线上报、结束都会立刻写一条。
+    // 补发时**只保留该帧最新的一份**——客户端要的是"这一帧结束时是什么状态"，
+    // 而不是"这一帧曾经变过几次"。若不去重，客户端会看到重复帧号。
+    BattleRoom room = PlayingRoom();
+    AdvanceTo(&room, kT0, kT0 + 3 * kFrameIntervalMs);
+    const std::int64_t current = room.Snapshot().frame;
+
+    // 在**同一帧**内制造两次状态变化，各写一条快照。
+    ASSERT_EQ(room.SetPresence("p-0001", false, kT0 + 3 * kFrameIntervalMs), PresenceOutcome::kOk);
+    ASSERT_EQ(room.SetPresence("p-0002", false, kT0 + 3 * kFrameIntervalMs), PresenceOutcome::kOk);
+    ASSERT_GT(room.SnapshotHistorySize(), static_cast<std::size_t>(current));
+
+    const std::vector<RoomSnapshot> snapshots = room.SnapshotsAfter(0);
+    for (std::size_t i = 1; i < snapshots.size(); ++i) {
+        EXPECT_NE(snapshots[i - 1].frame, snapshots[i].frame);
+    }
+    // 去重保留的是最新一份：当前帧那条里两个玩家都是 offline。
+    ASSERT_FALSE(snapshots.empty());
+    ASSERT_EQ(snapshots.back().frame, current);
+    ASSERT_EQ(snapshots.back().players.size(), 2U);
+    EXPECT_FALSE(snapshots.back().players[0].online);
+    EXPECT_FALSE(snapshots.back().players[1].online);
+}
+
+TEST(BattleRoomTest, SnapshotsAfterCurrentFrameIsEmpty) {
+    // 客户端不比房间落后：没有要补的帧。调用方据此可以只做当前状态的推送。
+    BattleRoom room = PlayingRoom();
+    AdvanceTo(&room, kT0, kT0 + 4 * kFrameIntervalMs);
+    EXPECT_TRUE(room.SnapshotsAfter(room.Snapshot().frame).empty());
+    EXPECT_TRUE(room.SnapshotsAfter(room.Snapshot().frame + 100).empty());
+}
+
+TEST(BattleRoomTest, MaxSnapshotFrameIgnoresDuplicateEntries) {
+    // 窗口起点必须按**帧号**推算，不能按缓冲里的条数：
+    // 同一帧有多条记录时条数大于帧数，用条数算出的窗口会比真实窗口更宽，
+    // 于是"其实补不齐"会被误判成"补得齐"。
+    BattleRoom room = PlayingRoom();
+    AdvanceTo(&room, kT0, kT0 + 3 * kFrameIntervalMs);
+    const std::int64_t current = room.Snapshot().frame;
+    const std::size_t entries = room.SnapshotHistorySize();
+    ASSERT_GT(entries, static_cast<std::size_t>(current));
+
+    EXPECT_EQ(room.MaxSnapshotFrame(), current);
+}
+
+TEST(BattleRoomTest, SnapshotsAfterIsBoundedByHistoryCapacity) {
+    // 超出环形缓冲的帧不可恢复：这是"窗口外要 stream.reset"的事实基础。
+    BattleRoom room = PlayingRoom();
+    std::int64_t now = kT0;
+    for (int i = 0; i < 40; ++i) {
+        now += kFrameIntervalMs * 10;
+        room.Tick(now);
+    }
+    const std::int64_t current = room.Snapshot().frame;
+    ASSERT_GT(current, static_cast<std::int64_t>(kMaxSnapshotHistory));
+
+    // 请求一个远早于缓冲起点的帧：最多只能拿到缓冲区那么大的一段。
+    const std::vector<RoomSnapshot> snapshots = room.SnapshotsAfter(0);
+    EXPECT_LE(snapshots.size(), kMaxSnapshotHistory);
+    ASSERT_FALSE(snapshots.empty());
+    EXPECT_EQ(snapshots.back().frame, current);
+    EXPECT_GT(snapshots.front().frame, 0);
+}
+
 TEST(BattleRoomTest, TickClampsCatchUpFrames) {
     BattleRoom room = PlayingRoom();
 

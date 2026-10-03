@@ -28,6 +28,7 @@
 #include <memory>
 
 #include "brpc_room_allocator.hpp"
+#include "common/logging.hpp"
 #include "common/version.hpp"
 #include "match_queue.hpp"
 #include "match_queue_store.hpp"
@@ -68,6 +69,10 @@ std::int64_t NowMs() {
 
 int main(int argc, char* argv[]) {
     google::ParseCommandLineFlags(&argc, &argv, true);
+
+    // TASK-018：结构化日志的 service 字段。必须在任何日志之前设置，
+    // 否则进程启动阶段（最容易出问题的那一段）的日志会缺服务名。
+    rgbt::common::SetServiceName("match");
 
     // 房间分配：TASK-008 起调用真实的 Room/Battle Service。
     //
@@ -116,12 +121,13 @@ int main(int argc, char* argv[]) {
     options.has_builtin_services = true;
 
     if (server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
-        std::fprintf(stderr, "注册 MatchService 失败\n");
+        rgbt::common::LogError("service_register_failed", {});
         return 1;
     }
 
     if (server.Start(FLAGS_match_port, &options) != 0) {
-        std::fprintf(stderr, "启动 Match 失败，端口 %d 可能已被占用\n", FLAGS_match_port);
+        rgbt::common::LogError("service_start_failed", {{"port", std::to_string(FLAGS_match_port)},
+                                                        {"hint", "端口可能已被占用"}});
         return 1;
     }
 

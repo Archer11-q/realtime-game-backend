@@ -164,6 +164,43 @@ public:
     /// @brief 快照环形缓冲中的历史帧数。仅供 Phase 2 与测试使用。
     [[nodiscard]] std::size_t SnapshotHistorySize() const noexcept { return history_.size(); }
 
+    /// @brief 环形缓冲保留的帧号区间。缓冲为空时两者都是 0（区间为空）。
+    ///
+    /// TASK-017 的窗口判定必须用它，而**不能**用 `SnapshotHistorySize()` 去减：
+    ///   * 数**条数**会低估覆盖范围：同一帧可能有多条记录（加入房间、断线上报、
+    ///     结束都会立刻写一条），条数大于帧数；
+    ///   * 用"最新帧 - 条数 + 1"推算会得出一个比真实窗口**更窄或更宽**的区间，
+    ///     于是把"补得齐"误判成"补不齐"（实测踩到过：缓冲没满时算出窗口为空，
+    ///     任何请求都被判成 kIncomplete）。
+    /// 直接返回缓冲里实际存在的最小/最大帧号，不依赖任何计数假设。
+    struct FrameRange {
+        std::int64_t oldest = 0;
+        std::int64_t newest = 0;
+    };
+    [[nodiscard]] FrameRange SnapshotFrameRange() const noexcept;
+
+    /// @brief 环形缓冲中出现过的**最大帧号**。缓冲为空时返回 0。
+    ///
+    /// 为什么需要它（TASK-017）：判断"请求的帧是否已经滑出窗口"必须知道缓冲
+    /// 覆盖了多少帧，而 `SnapshotHistorySize()` 数的是**条数**——同一帧可能有多条
+    /// 记录（加入房间、断线上报、结束等事件都会立刻写一条），条数会大于帧数。
+    /// 用条数去推算窗口起点会得出一个比真实窗口**更宽**的区间，
+    /// 于是把"其实补不齐"误判成"补得齐"：客户端会拿到一段中间有洞的历史。
+    /// 这里直接用帧号本身，不依赖任何计数假设。
+    [[nodiscard]] std::int64_t MaxSnapshotFrame() const noexcept;
+
+    /// @brief 取出帧号**严格大于** since_frame 的历史快照（TASK-017）。
+    ///
+    /// 保证（由单元测试锁定）：
+    ///   * 返回的帧号**严格递增且不重复**。环形缓冲是"每帧追加一条"写入的
+    ///     （加入房间、断线上报、结束等事件都会立刻写一条），因此同一帧号可能有
+    ///     多条；这里只保留该帧**最新**的一份。对补发来说这才是正确的语义：
+    ///     客户端需要的不是"这一帧曾经是什么"，而是"这一帧结束时是什么"。
+    ///   * 顺序即帧号顺序，调用方可以直接按序写出，不需要再排序。
+    ///   * 只返回缓冲里还在的部分：更早的帧已经不存在了，**不猜测、不编造**。
+    ///     窗口是否完整由调用方用首尾帧号判断（见 RoomManager::GetSnapshotsSince）。
+    [[nodiscard]] std::vector<RoomSnapshot> SnapshotsAfter(std::int64_t since_frame) const;
+
     /// @brief 是否已经可以回收。
     [[nodiscard]] bool IsExpired(std::int64_t now_ms) const;
 

@@ -108,6 +108,30 @@ enum class RoomCallStatus {
     kInternal,
 };
 
+/// 历史快照查询的结果状态（TASK-017）。
+///
+/// 与 `RoomCallStatus` 是两个维度：后者说"这次调用成不成功"，本枚举说
+/// "成功的前提下，缺的帧补得齐吗"。**不能合并**——「Room 不可用」（可重试）与
+/// 「这段历史已经不在内存缓冲里了」（重试一万次也一样）对客户端是完全不同的结论。
+enum class SnapshotWindowStatus {
+    /// 区间被完整覆盖，`snapshots` 里是全部缺失帧（帧号严格递增且不重复）。
+    kReady,
+    /// 需要的起点早于环形缓冲：中间有一段已经不可恢复。
+    kIncomplete,
+    /// 客户端已有的帧号晚于服务端当前帧号（状态不一致）。
+    kAhead,
+};
+
+/// 一段历史快照。
+struct SnapshotRange {
+    SnapshotWindowStatus status = SnapshotWindowStatus::kReady;
+    /// 帧号严格递增且不重复。仅 `kReady` 时保证完整。
+    std::vector<RoomSnapshot> snapshots;
+    /// 环形缓冲当前的帧号区间，用于向客户端解释"为什么补不齐"。缓冲为空时为 0。
+    std::int64_t oldest_frame = 0;
+    std::int64_t latest_frame = 0;
+};
+
 /// Gateway 侧的房间客户端接口。
 class RoomClient {
 public:
@@ -121,20 +145,31 @@ public:
     /// @brief 加入房间。
     /// @param player_id 必须来自会话，不能来自客户端请求体。
     virtual RoomCallStatus Join(const std::string& room_id, const std::string& player_id,
-                                RoomSnapshot* out_snapshot) = 0;
+                                const std::string& request_id, RoomSnapshot* out_snapshot) = 0;
 
     /// @brief 提交一次攻击输入。
     ///
     /// 不带输入类型参数：TASK-008 只有「攻击」一种输入，提前暴露一个只有一个取值的
     /// 枚举参数属于未经验证的抽象。新增输入类型时再扩展本接口。
     virtual RoomCallStatus SubmitAttack(const std::string& room_id, const std::string& player_id,
+                                        const std::string& request_id,
                                         RoomSnapshot* out_snapshot) = 0;
 
     /// @brief 查询房间权威状态快照。
-    virtual RoomCallStatus GetState(const std::string& room_id, RoomSnapshot* out_snapshot) = 0;
+    virtual RoomCallStatus GetState(const std::string& room_id, const std::string& request_id,
+                                    RoomSnapshot* out_snapshot) = 0;
 
     /// @brief 查询对局结果。
-    virtual RoomCallStatus GetResult(const std::string& match_id, MatchResultView* out_view) = 0;
+    virtual RoomCallStatus GetResult(const std::string& match_id, const std::string& request_id,
+                                     MatchResultView* out_view) = 0;
+
+    /// @brief 查询帧号大于 `since_frame` 的历史快照（TASK-017）。
+    ///
+    /// 由 StreamHub 在建立带 `Last-Event-ID` 的订阅时调用，用于补发客户端错过的帧。
+    /// 返回 kOk 表示调用成功；返回其他值时 `out_range` 的内容不可用。
+    virtual RoomCallStatus GetSnapshotsSince(const std::string& room_id, std::int64_t since_frame,
+                                             const std::string& request_id,
+                                             SnapshotRange* out_range) = 0;
 
     /// @brief 上报某个玩家的推送连接状态（TASK-016）。
     ///
@@ -142,7 +177,8 @@ public:
     /// Room 侧对同一状态重复上报无副作用，因此调用方不需要重试或补偿——
     /// 下一次连接状态变化会自然覆盖它。
     virtual RoomCallStatus SetPresence(const std::string& room_id, const std::string& player_id,
-                                       bool online, RoomSnapshot* out_snapshot) = 0;
+                                       bool online, const std::string& request_id,
+                                       RoomSnapshot* out_snapshot) = 0;
 
     /// @brief Room 当前是否可用。用于启动日志，不做真实往返调用。
     [[nodiscard]] virtual bool IsHealthy() = 0;

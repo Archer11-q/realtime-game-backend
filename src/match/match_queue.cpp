@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <utility>
 
+#include "common/logging.hpp"
 #include "common/token.hpp"
 
 namespace rgbt::match {
@@ -42,7 +43,8 @@ MatchRestoreReport MatchQueue::Restore(std::int64_t now_ms) {
         // 空手启动是安全的：排队中的客户端会重新入队。而"以为恢复了其实没有"
         // 会让玩家在队列里等一个永远不会被配上的号。
         report.load_failed = true;
-        std::fprintf(stderr, "[match] 队列快照读取失败：本次启动不恢复任何排队状态\n");
+        rgbt::common::LogWarn("queue_snapshot_load_failed",
+                              {{"consequence", "本次启动不恢复任何排队状态"}});
         return report;
     }
     report.scanned = rows.size();
@@ -53,8 +55,8 @@ MatchRestoreReport MatchQueue::Restore(std::int64_t now_ms) {
     for (const MatchQueueSnapshotRow& row : rows) {
         if (!row.problem.empty()) {
             ++report.dropped;
-            std::fprintf(stderr, "[match] 队列快照条目不可用，已跳过（不静默丢弃）：%s\n",
-                         row.problem.c_str());
+            rgbt::common::LogWarn("queue_snapshot_entry_skipped",
+                                  {{"reason", row.problem}, {"policy", "跳过而不静默丢弃"}});
             continue;
         }
         if (row.entry.kind == SnapshotEntryKind::kQueued) {
@@ -75,8 +77,8 @@ MatchRestoreReport MatchQueue::Restore(std::int64_t now_ms) {
             // 同一玩家出现两次（正常写入不会产生）。保留先出现的那条并计数，
             // 而不是让后者覆盖前者——覆盖会让顺序变得难以解释。
             ++report.dropped;
-            std::fprintf(stderr, "[match] 队列快照里有重复玩家，已跳过后一条：player_id=%s\n",
-                         entry.player_id.c_str());
+            rgbt::common::LogWarn("queue_snapshot_duplicate_player",
+                                  {{"player", entry.player_id}, {"action", "跳过后一条"}});
             continue;
         }
         if (now_ms - entry.queued_at_ms >= match_timeout_ms_) {
@@ -113,8 +115,8 @@ MatchRestoreReport MatchQueue::Restore(std::int64_t now_ms) {
         }
         if (already_seen) {
             ++report.dropped;
-            std::fprintf(stderr, "[match] 队列快照里有重复的匹配结果，已跳过：match_id=%s\n",
-                         entry.match_id.c_str());
+            rgbt::common::LogWarn("queue_snapshot_duplicate_result",
+                                  {{"match_id", entry.match_id}, {"action", "跳过"}});
             continue;
         }
         // 一条 matched 记录服务这一局的所有玩家：entries_ 以 player_id 为键，
@@ -216,10 +218,10 @@ void MatchQueue::PersistSnapshot() {
     if (!store_->Save(snapshot)) {
         // 快照可以丢弃：不重试、不阻塞。Redis 不可用时匹配照常工作，
         // 只是失去"重启可恢复"——这是项目所有者确认过的降级策略。
-        std::fprintf(stderr,
-                     "[match] 队列快照写入失败（可丢弃，不重试，当前降级为纯内存）："
-                     "排队 %zu 条，已配对 %zu 条\n",
-                     snapshot.queued.size(), snapshot.matched.size());
+        rgbt::common::LogWarn("queue_snapshot_write_failed",
+                              {{"queued", std::to_string(snapshot.queued.size())},
+                               {"matched", std::to_string(snapshot.matched.size())},
+                               {"policy", "可丢弃、不重试，当前降级为纯内存"}});
     }
 }
 

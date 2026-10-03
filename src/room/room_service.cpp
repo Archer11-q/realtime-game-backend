@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/logging.hpp"
+
 namespace rgbt::room {
 namespace {
 
@@ -136,6 +138,12 @@ void RoomServiceImpl::CreateRoom(google::protobuf::RpcController* /*controller*/
 
     switch (outcome) {
         case CreateOutcome::kOk:
+            // TASK-018：房间创建是"匹配成功"落到 Room 的那一步，带上 Match 传来的
+            // request_id，三个服务的日志才能用同一个键串起来。
+            rgbt::common::LogInfo("room_created", request->request_id(),
+                                  {{"room", room_id},
+                                   {"match_id", request->match_id()},
+                                   {"players", std::to_string(player_ids.size())}});
             response->set_room_id(room_id);
             FillSnapshot(snapshot, response->mutable_room());
             return;
@@ -175,6 +183,8 @@ void RoomServiceImpl::JoinRoom(google::protobuf::RpcController* /*controller*/,
 
     switch (*outcome) {
         case JoinOutcome::kOk:
+            rgbt::common::LogInfo("room_joined", request->request_id(),
+                                  {{"room", request->room_id()}, {"player", request->player_id()}});
             FillSnapshot(snapshot, response->mutable_room());
             return;
         case JoinOutcome::kNotAMember:
@@ -255,6 +265,53 @@ void RoomServiceImpl::SubmitInput(google::protobuf::RpcController* /*controller*
     }
 }
 
+void RoomServiceImpl::GetRoomSnapshotsSince(
+    google::protobuf::RpcController* /*controller*/,
+    const rgbt::room::v1::GetRoomSnapshotsSinceRequest* request,
+    rgbt::room::v1::GetRoomSnapshotsSinceResponse* response, google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    if (manager_ == nullptr) {
+        SetError(response->mutable_error(), rgbt::room::v1::ROOM_INTERNAL, "room_internal",
+                 "房间管理器未初始化", request->request_id());
+        return;
+    }
+
+    const SnapshotRange range =
+        manager_->GetSnapshotsSince(request->room_id(), request->since_frame(), NowMs());
+
+    response->set_oldest_frame(range.oldest_frame);
+    response->set_latest_frame(range.latest_frame);
+
+    if (range.outcome == SnapshotRangeOutcome::kNotFound) {
+        SetError(response->mutable_error(), rgbt::room::v1::ROOM_NOT_FOUND, "room_not_found",
+                 "房间不存在或已回收", request->request_id());
+        return;
+    }
+
+    // 三种"能查到房间"的情况都返回 200：补不齐不是调用失败，而是一个必须让调用方
+    // 知道的事实。用错误码表达会诱导调用方去重试一个重试一万次也一样的结果。
+    switch (range.outcome) {
+        case SnapshotRangeOutcome::kOk:
+            response->set_status(rgbt::room::v1::SNAPSHOTS_READY);
+            break;
+        case SnapshotRangeOutcome::kIncomplete:
+            response->set_status(rgbt::room::v1::SNAPSHOTS_INCOMPLETE);
+            break;
+        case SnapshotRangeOutcome::kAhead:
+            response->set_status(rgbt::room::v1::SNAPSHOTS_AHEAD);
+            break;
+        case SnapshotRangeOutcome::kNotFound:
+        default:
+            response->set_status(rgbt::room::v1::SNAPSHOT_WINDOW_STATUS_UNSPECIFIED);
+            break;
+    }
+
+    for (const RoomSnapshot& snapshot : range.snapshots) {
+        FillSnapshot(snapshot, response->add_snapshots());
+    }
+}
+
 void RoomServiceImpl::SetPlayerPresence(google::protobuf::RpcController* /*controller*/,
                                         const rgbt::room::v1::SetPlayerPresenceRequest* request,
                                         rgbt::room::v1::SetPlayerPresenceResponse* response,
@@ -278,6 +335,13 @@ void RoomServiceImpl::SetPlayerPresence(google::protobuf::RpcController* /*contr
 
     switch (*outcome) {
         case PresenceOutcome::kOk:
+            // TASK-018：presence 上报是"客户端的推送连接建立/断开"落到 Room 的那一步。
+            // 带上 Gateway 订阅时的 request_id，于是"谁在什么时候连上/断开"这条链路
+            // 在 Gateway 与 Room 两侧可用同一个键对上。
+            rgbt::common::LogInfo("presence_reported", request->request_id(),
+                                  {{"room", request->room_id()},
+                                   {"player", request->player_id()},
+                                   {"online", request->connected() ? "true" : "false"}});
             FillSnapshot(snapshot, response->mutable_room());
             return;
         case PresenceOutcome::kNotAMember:

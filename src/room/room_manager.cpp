@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/logging.hpp"
 #include "common/token.hpp"
 
 namespace rgbt::room {
@@ -42,7 +43,8 @@ RestoreReport RoomManager::Restore(std::int64_t now_ms) {
         // 空手启动是安全的：玩家发现房间没了会重新匹配。
         // 而"以为恢复了其实没有"会让后续每次查询都得到难以解释的结果。
         report.load_failed = true;
-        std::fprintf(stderr, "[room] 房间快照读取失败：本次启动不恢复任何房间\n");
+        rgbt::common::LogWarn("restore_load_failed", {{"consequence", "本次启动不恢复任何房间"},
+                                                      {"reason", "房间快照读取失败"}});
         return report;
     }
     report.scanned = rows.size();
@@ -86,9 +88,10 @@ RestoreReport RoomManager::Restore(std::int64_t now_ms) {
     // 验收脚本（scripts/verify-persistence.sh 第 7 节）靠这一行断言
     // "恢复位置精确等于最后一次快照"，否则那条断言只能退化成"大致对得上"。
     for (const RoomSnapshotRecord& record : restored_records) {
-        std::fprintf(stderr, "[room] 已恢复房间：match_id=%s room_id=%s frame=%lld phase=%s\n",
-                     record.match_id.c_str(), record.room_id.c_str(),
-                     static_cast<long long>(record.frame), ToString(record.phase));
+        rgbt::common::LogInfo("room_restored", record.match_id,
+                              {{"room", record.room_id},
+                               {"frame", std::to_string(record.frame)},
+                               {"phase", ToString(record.phase)}});
     }
 
     // 日志与写回都在锁外：持锁做 I/O 是本项目明确避免的。
@@ -102,15 +105,14 @@ void RoomManager::RejectSnapshots(
         return;
     }
     for (const auto& entry : rejected) {
-        std::fprintf(stderr,
-                     "[room] 房间快照不可用，标记为 ABORTED（不静默丢弃）："
-                     "match_id=%s room_id=%s 原因=%s\n",
-                     entry.first.match_id.c_str(), entry.first.room_id.c_str(),
-                     entry.second.c_str());
+        rgbt::common::LogWarn("room_snapshot_rejected", entry.first.match_id,
+                              {{"room", entry.first.room_id},
+                               {"reason", entry.second},
+                               {"action", "标记为 ABORTED（不静默丢弃）"}});
     }
     if (snapshot_writer_ == nullptr) {
         // 没有写入器：只记日志，**不假装写回去了**。
-        std::fprintf(stderr, "[room] 未配置快照写入器，被拒绝的快照只记日志\n");
+        rgbt::common::LogWarn("snapshot_writer_missing", {{"consequence", "被拒绝的快照只记日志"}});
         return;
     }
 
@@ -124,9 +126,8 @@ void RoomManager::RejectSnapshots(
         // 下次启动又被扫出来、又被拒绝。
         record.snapshot_at_ms = now_ms;
         if (snapshot_writer_->Save(record) != SnapshotWriteStatus::kOk) {
-            std::fprintf(stderr,
-                         "[room] 标记 ABORTED 的写回失败：match_id=%s（下次启动会再次扫到它）\n",
-                         record.match_id.c_str());
+            rgbt::common::LogWarn("reject_writeback_failed", record.match_id,
+                                  {{"consequence", "下次启动会再次扫到它"}});
         }
     }
 }
@@ -308,6 +309,57 @@ ResultOutcome RoomManager::GetResult(const std::string& match_id, std::int64_t n
     }
 }
 
+SnapshotRange RoomManager::GetSnapshotsSince(const std::string& room_id, std::int64_t since_frame,
+                                             std::int64_t now_ms) {
+    SnapshotRange result;
+
+    const std::lock_guard<std::mutex> lock(mutex_);
+    ReapExpiredLocked(now_ms);
+
+    const auto it = rooms_.find(room_id);
+    if (it == rooms_.end()) {
+        result.outcome = SnapshotRangeOutcome::kNotFound;
+        return result;
+    }
+
+    const BattleRoom& room = *it->second;
+    result.snapshots = room.SnapshotsAfter(since_frame);
+    result.latest_frame = room.frame();
+    // 窗口起点直接取缓冲里**实际存在的最小帧号**，不做任何计数推算。
+    //
+    // 这里原先写的是 `oldest = latest - (latest - MaxSnapshotFrame()) + 1`，等价于
+    // `MaxSnapshotFrame() + 1`。那个式子在**缓冲已满**时才碰巧成立；缓冲没满时
+    // `MaxSnapshotFrame() == latest`，于是算出"窗口为空"，把任何能补齐的请求都判成
+    // kIncomplete（单元测试直接抓到）。条数、容量、最新帧三者都不能单独推出窗口起点，
+    // 因为同一帧可能有多条记录（加入房间、断线上报、结束都会立刻写一条）。
+    const BattleRoom::FrameRange window = room.SnapshotFrameRange();
+    result.oldest_frame = window.oldest;
+
+    if (since_frame > room.frame()) {
+        // 客户端声称的帧**晚于**服务端当前帧。帧号由服务端单调递增，因此这只可能
+        // 是客户端状态与服务端不一致，不能按"没有缺失"处理——那会让它永远停在
+        // 一个服务端认为"已经最新"、实际对不上的状态上。
+        //
+        // 判据必须是 `>` 而不是 `>=`：相等表示"客户端与服务端停在同一帧"（对局刚
+        // 建好、或双方都还没推进时的常态），那是**完全一致**，不是超前。
+        // 写成 `>=` 会把"刚进房、谁都还没动"的首次订阅判成 kAhead 并回 stream.reset
+        // （单元测试 SnapshotsSinceZeroOnEmptyBufferIsReady 抓到）。
+        result.outcome = SnapshotRangeOutcome::kAhead;
+        return result;
+    }
+
+    const std::int64_t first_needed = since_frame + 1;
+    if (first_needed < result.oldest_frame) {
+        // 需要的起点早于缓冲里实际保留的最早一帧：中间那段已经不在内存里了。
+        // 仍返回已取到的部分（调用方可以据此判断缺口），但状态如实标为"不完整"。
+        result.outcome = SnapshotRangeOutcome::kIncomplete;
+        return result;
+    }
+
+    result.outcome = SnapshotRangeOutcome::kOk;
+    return result;
+}
+
 void RoomManager::Tick(std::int64_t now_ms) {
     std::vector<std::string> to_persist;
     std::vector<RoomSnapshotRecord> snapshots;
@@ -380,8 +432,8 @@ void RoomManager::Tick(std::int64_t now_ms) {
         } else {
             // 不编造成功：房间停在 FINISHING，下一次 Tick 继续重试。
             // 这条日志是「存储一直不可用」的唯一早期信号。
-            std::fprintf(stderr, "[room] 对局结果写入失败，将在 %lld ms 后重试：match_id=%s\n",
-                         static_cast<long long>(kResultRetryIntervalMs), record.match_id.c_str());
+            rgbt::common::LogWarn("result_persist_failed", record.match_id,
+                                  {{"retry_after_ms", std::to_string(kResultRetryIntervalMs)}});
             it->second->MarkResultFailed(now_ms);
         }
     }

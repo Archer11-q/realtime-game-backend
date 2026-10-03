@@ -1,5 +1,7 @@
 #include "common/mysql_connection.hpp"
 
+#include "common/logging.hpp"
+
 // mysql.h 内部已经包含 mariadb_stmt.h（预处理语句与 MYSQL_BIND 的定义都在那里），
 // 因此这里只包含 mysql.h；重复包含会触发类型重定义错误。
 //
@@ -137,8 +139,9 @@ bool MysqlConnection::EnsureConnected() {
         // 只记录服务端返回的说明，不拼接密码或查询参数，避免敏感信息进日志。
         last_error_ = "connect failed: ";
         last_error_ += mysql_error(connection_);
-        std::fprintf(stderr, "[mysql] %s:%d %s\n", options_.host.c_str(), options_.port,
-                     last_error_.c_str());
+        rgbt::common::LogWarn("mysql_connect_failed", {{"host", options_.host},
+                                                       {"port", std::to_string(options_.port)},
+                                                       {"err", last_error_}});
         Disconnect();
         return false;
     }
@@ -339,7 +342,7 @@ bool MysqlConnection::QueryLocked(const std::string& sql, const std::vector<std:
         // 为什么需要这一步：mysql_ping 在服务端刚恢复时可能返回成功（TCP 可建立），
         // 真正失效要等到第一条语句才暴露。若不在此重试，服务将长期返回 503，
         // 无法在依赖恢复后自愈。
-        std::fprintf(stderr, "[mysql] connection lost, reconnecting and retrying once\n");
+        rgbt::common::LogWarn("mysql_connection_lost", {{"action", "重连并重试一次"}});
         Disconnect();
         bool retry_result = false;
         if (QueryOnce(sql, params, out_rows, &retry_result)) {

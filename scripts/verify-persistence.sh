@@ -513,9 +513,14 @@ else
     fi
 
     # 恢复位置应当**精确等于最后一次快照**，而不是别的什么中间值。
-    # 判据取自 Room 启动日志里的恢复点（`已恢复房间：... frame=N`），因为外部查询
-    # 拿不到这个数字——见上面「进度丢失量」的说明。
-    restored_frame=$(grep -o "room_id=$room3 frame=[0-9]*" /tmp/room.out | tail -1 | grep -o '[0-9]*$')
+    # 判据取自 Room 启动日志里的恢复点。TASK-018 起日志是结构化的
+    # `event=room_restored ... frame=N room=<id>`，因此按字段取值而不是按中文串。
+    # 注意字段顺序：TASK-018 的记录是 `event=... trace=... room=... frame=...`，
+    # 即 frame 在 room **之后**（旧格式恰好相反）。因此这里先按整行匹配，
+    # 再把 frame 的值单独取出来。用 [[:space:]] 限定边界，避免匹配到
+    # `since_frame=` 这类同后缀字段。
+    restored_frame=$(grep -E "event=room_restored .*room=$room3( |$)" /tmp/room.out | tail -1 |
+      grep -oE ' frame=[0-9]+' | tail -1 | cut -d= -f2)
     if [ -n "$restored_frame" ] && [ "$restored_frame" = "$frame_snapshot" ]; then
       ok "恢复点精确等于最后一次快照帧（$frame_snapshot）"
     else
@@ -591,10 +596,10 @@ wait "$room_pid" 2>/dev/null
 room_pid=""
 if start_room; then
   ok "Room 已重启"
-  if grep -q 'room_id=r-finishing-014 frame=600' /tmp/room.out; then
+  if grep -q 'event=room_restored .*frame=600' /tmp/room.out; then
     ok "FINISHING 房间被恢复，且恢复点就是快照帧 600（没有被当成已结束而丢弃）"
   else
-    fail "FINISHING 房间未被恢复：$(grep -o 'room_id=r-finishing-014 frame=[0-9]*' /tmp/room.out | tail -1)"
+    fail "FINISHING 房间未被恢复：$(grep -o 'event=room_restored .*frame=[0-9]*' /tmp/room.out | tail -1)"
   fi
 
   recovered=0
@@ -644,7 +649,7 @@ room_pid=""
 if start_room; then
   ok "Room 已重启"
   # 启动日志必须说明拒绝了什么、为什么——这是"不静默丢弃"的可观测证据。
-  if grep -q '房间快照不可用，标记为 ABORTED' /tmp/room.out; then
+  if grep -q 'event=room_snapshot_rejected' /tmp/room.out; then
     ok "启动日志记录了拒绝原因"
   else
     fail "启动日志没有记录拒绝原因"
@@ -854,7 +859,7 @@ match_pid=""
 dead_redis_port=6399
 if start_match "$dead_redis_port"; then
   ok "Match 已重启并指向不可用的快照存储（端口 $dead_redis_port，故意不监听）"
-  if grep -q '队列快照读取失败' /tmp/match.out; then
+  if grep -q 'event=queue_snapshot_load_failed' /tmp/match.out; then
     ok "启动时如实报告快照读取失败（不假装恢复了一个空队列）"
   else
     fail "启动日志没有报告快照读取失败"
@@ -873,7 +878,7 @@ if start_match "$dead_redis_port"; then
   else
     fail "快照存储不可用时匹配失败：state=[$(json_path match.state)]"
   fi
-  if grep -q '队列快照写入失败' /tmp/match.out; then
+  if grep -q 'event=queue_snapshot_write_failed' /tmp/match.out; then
     ok "日志明确记录了降级（队列快照写入失败，可丢弃）"
   else
     fail "没有记录降级：快照写失败却静默无日志"

@@ -108,6 +108,7 @@ Gateway -> 浏览器：GET /api/v1/stream?room_id=...   text/event-stream 长连
 事件的线上格式（`data` 是**单行** JSON，即下面的信封）：
 
 ```text
+id: 12
 event: room.state
 data: {"version":1,"type":"room.state","sequence":12,"timestamp_ms":0,"payload":{}}
 
@@ -115,6 +116,10 @@ data: {"version":1,"type":"room.state","sequence":12,"timestamp_ms":0,"payload":
 
 心跳以 SSE 注释行发送（`: ping`），客户端会忽略它，但它让长连接不被中间层回收。
 **心跳不能做成事件**，否则会污染事件流、让客户端的类型分发多一种无意义的分支。
+
+`id:` 行（TASK-017）只出现在 `room.state` / `room.finished` / `stream.reset` 上，
+内容是**房间帧号**。`session.ready` 与心跳不带 `id:`：给它们填一个编号，会让客户端的
+`Last-Event-ID` 指向一个并不存在的帧。详细语义见下面的「推送连续性与补发」。
 
 信封字段：
 
@@ -138,12 +143,51 @@ data: {"version":1,"type":"room.state","sequence":12,"timestamp_ms":0,"payload":
   直接用房间帧号，天然单调递增。
 - 服务端必须校验消息大小、字段类型和当前连接状态。
 
-推送事件类型（TASK-009 已实现的部分）：
+推送事件类型（TASK-009 已实现的部分，TASK-017 追加 `stream.reset`）：
 
 - `session.ready` —— 订阅建立后的第一个事件，带上订阅者与房间
 - `room.state` —— 房间权威状态快照。**判据是"状态变化"而不是"帧号变化"**：
   宽限期内对局暂停推进、帧号不变，但"对方断线了/回来了"必须推出去（TASK-016）
 - `room.finished` —— 对局结束（含平局、`aborted` 与断线判负），推送后服务端关闭连接
+- `stream.reset` —— **服务端无法补发缺的帧**，要求客户端按载荷里的完整状态全量刷新
+  （TASK-017）。载荷是 `{"reason":"<稳定标识>","room":{...}}`，`reason` 取值：
+
+  | reason | 含义 | 客户端应做什么 |
+  |---|---|---|
+  | `id_malformed` | 请求里带了 `Last-Event-ID`，但不是合法的非负整数 | 按载荷里的 `room` 刷新；服务端侧说明客户端实现有问题 |
+  | `id_out_of_window` | 请求的帧早于房间内存缓冲的最早一帧，中间那段**已不可恢复** | 同上，**不要**试图从旧帧往后接 |
+  | `id_ahead` | 请求的帧晚于服务端当前帧（状态不一致） | 同上 |
+  | `id_current` | 请求的帧就是当前帧，没有缺失帧 | 同上（服务端给一次明确确认） |
+
+  **没有 `Last-Event-ID` 时不发 `stream.reset`**（2026-10-02 项目所有者确认）：
+  第一次订阅不属于任何"补不上"的情况，按既有行为由第一次 Tick 正常推当前状态即可，
+  少一种客户端必须处理的事件。因此"头缺失"与"头非法"是**两件事**：
+  前者是正常路径，后者是客户端的 bug，必须被指出而不是静默当成首次订阅。
+
+### 推送连续性与补发（TASK-017）
+
+客户端重连时把最后一次收到的 `id:`（房间帧号）放在 **`Last-Event-ID` 请求头**里，
+Gateway 据此向 Room 补发缺失的帧：
+
+```text
+客户端重连：GET /api/v1/stream?room_id=...    Last-Event-ID: 12
+  -> Gateway 解析该头（brpc 不会把 HTTP 头映射进任何字段，必须自己读）
+  -> Room.GetRoomSnapshotsSince(room_id, since_frame=12)
+  -> 窗口内：按帧号递增补发 room.state（每个事件带 id），之后进入实时推送
+  -> 窗口外 / id 超前 / 无法解析 / 头缺失：发一条 stream.reset + 当前完整状态
+```
+
+**窗口有多大，以及为什么是这个大小**：Room 只保留内存里的环形缓冲
+（`kMaxSnapshotHistory = 128` 帧 ≈ 12.8 秒）。**不承诺超出它的补发**——那需要真正的
+持久化重放，而本项目没有领域事件（[ADR-0003](adr/0003-scope-reduction.md) 非目标）。
+之所以 128 帧够用：宽限期内对局**暂停推进**（TASK-016），断线 30 秒期间帧号根本不前进，
+因此"断线多久就要补多少帧"这个前提不成立。这个窗口真正覆盖的是客户端在断开**之前**
+就已经落后（网络慢、渲染卡顿）以及多标签页互相追赶这两类情况。
+详见 [01-architecture.md](01-architecture.md) 第 5 节的「推送连续性边界」。
+
+**为什么不重放全部历史**：客户端要的是"回到当前"而不是"看完这一局的每一帧"。
+补发区间由请求的帧号决定，超出缓冲的部分明确报 `stream.reset`。
+这一点与 `rooms` 表的语义一致：只保留最新一份快照，没有消费者要的历史查询不在范围内。
 
 **断线语义（TASK-016）**：订阅的建立与断开都会被 Gateway 上报给 Room
 （`SetPlayerPresence`，见下节）。断开后该玩家进入 **30 秒宽限期**，期内对局暂停推进；
@@ -170,7 +214,19 @@ data: {"version":1,"type":"room.state","sequence":12,"timestamp_ms":0,"payload":
 
 - `GatewayService`
 - `MatchService`（已实现，TASK-007，契约见 `api/proto/match.proto`）
-- `RoomService`（已实现，TASK-008；TASK-016 新增 `SetPlayerPresence`，契约见 `api/proto/room.proto`）
+- `RoomService`（已实现，TASK-008；TASK-016 新增 `SetPlayerPresence`，
+  TASK-017 新增 `GetRoomSnapshotsSince`，契约见 `api/proto/room.proto`）
+
+`RoomService.GetRoomSnapshotsSince`（TASK-017）是补发链路的服务间接口：
+
+- **为什么由 Gateway 调**：`Last-Event-ID` 是 HTTP 头，只有 Gateway 读得到；
+  而房间历史帧属于 Room 的权威状态。Gateway 只做搬运，不缓存帧。
+- **不用错误码表达"补不齐"**：`SnapshotWindowStatus` 与 `RoomErrorCode` 是两个维度。
+  `ROOM_NOT_FOUND` 是"这次调用失败了"，`SNAPSHOTS_INCOMPLETE` 是"调用成功，
+  但那段历史已经不在内存里了"。后者重试一万次也一样，因此**不能**混进可重试错误。
+- 返回的快照保证**帧号严格递增且不重复**：同一帧在缓冲里可能有多条记录
+  （加入房间、断线上报、结束都会立刻写一条），只返回该帧最新的一份。
+  这样 Gateway 可以按序直接写出，不需要再去重或排序。
 
 `RoomService.SetPlayerPresence`（TASK-016）是本项目第四个跨服务事实来源：
 

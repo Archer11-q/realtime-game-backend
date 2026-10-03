@@ -18,10 +18,18 @@ import { ApiFailure, NetworkFailure } from './client'
 import type { ApiError } from './types'
 
 export interface StreamEvent {
-  /** SSE 的 `event:` 字段。Gateway 发送 session.ready / room.state / room.finished。 */
+  /** SSE 的 `event:` 字段。Gateway 发送 session.ready / room.state / room.finished / stream.reset。 */
   event: string
   /** SSE 的 `data:` 字段。多行时按规范用 \n 连接。 */
   data: string
+  /**
+   * SSE 的 `id:` 字段（TASK-017）。是房间帧号的十进制文本。
+   *
+   * 只有 room.state / room.finished / stream.reset 带它；session.ready 与心跳没有。
+   * 本模块只负责把它解析出来：**发送 `Last-Event-ID` 由上层决定**，
+   * 因为"我最后收到的帧号是多少"只有上层（会话状态）知道。
+   */
+  id?: number
 }
 
 /**
@@ -33,6 +41,7 @@ export interface StreamEvent {
 export function parseSseBlock(block: string): StreamEvent | null {
   let event = 'message'
   const data: string[] = []
+  let id: number | undefined
 
   for (const rawLine of block.split('\n')) {
     const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
@@ -54,13 +63,21 @@ export function parseSseBlock(block: string): StreamEvent | null {
       event = value
     } else if (field === 'data') {
       data.push(value)
+    } else if (field === 'id') {
+      // 帧号是十进制整数。解析不出来就当作"没有 id"——服务端不会发非数字 id，
+      // 真出现了也只能说明这条事件不值得被回传成 Last-Event-ID。
+      const parsed = Number.parseInt(value, 10)
+      if (Number.isFinite(parsed) && parsed >= 0) {
+        id = parsed
+      }
     }
   }
 
   if (data.length === 0) {
     return null
   }
-  return { event, data: data.join('\n') }
+  const joined = data.join('\n')
+  return id === undefined ? { event, data: joined } : { event, data: joined, id }
 }
 
 /** 把 SSE 事件的 data 解析成信封对象。解析失败返回 null，不抛异常。 */
@@ -77,6 +94,12 @@ export interface StreamOptions {
   token: string
   signal: AbortSignal
   onEvent: (event: StreamEvent) => void
+  /**
+   * 上一次已经收到的最后一帧（TASK-017）。有值时作为 `Last-Event-ID` 发出去，
+   * 服务端据此补发断线期间错过的帧；没有值（首次订阅）时不带这个头，
+   * 服务端会回一条 `stream.reset` 附当前完整状态。
+   */
+  lastEventId?: number
 }
 
 /**
@@ -87,13 +110,20 @@ export interface StreamOptions {
 export async function streamRoom(options: StreamOptions): Promise<void> {
   const url = `/api/v1/stream?room_id=${encodeURIComponent(options.roomId)}`
 
+  const headers: Record<string, string> = {
+    Accept: 'text/event-stream',
+    Authorization: `Bearer ${options.token}`,
+  }
+  // 用标准的 Last-Event-ID 头，而不是自定义查询参数：这是 SSE 规范定义的字段，
+  // 反向代理与其他 SSE 实现都认识它，也让"重连续传"这件事在抓包时一眼可见。
+  if (options.lastEventId !== undefined && options.lastEventId >= 0) {
+    headers['Last-Event-ID'] = String(options.lastEventId)
+  }
+
   let response: Response
   try {
     response = await fetch(url, {
-      headers: {
-        Accept: 'text/event-stream',
-        Authorization: `Bearer ${options.token}`,
-      },
+      headers,
       signal: options.signal,
     })
   } catch (cause) {

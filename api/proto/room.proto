@@ -289,6 +289,65 @@ message GetMatchResultResponse {
 }
 
 // ---------------------------------------------------------------------------
+// 查询房间快照历史（TASK-017）
+// ---------------------------------------------------------------------------
+//
+// 用途：Gateway 建立 SSE 订阅时若带上了 `Last-Event-ID`，就用本接口把客户端
+// 错过的帧补发出去。为什么由 Gateway 补发而不是 Room 主动推：Room 是纯 brpc
+// server，没有推送能力；推送链路的形态见
+// docs/adr/0004-sse-instead-of-websocket.md。
+//
+// **本接口不承诺超出内存环形缓冲的历史**。缓冲只有 kMaxSnapshotHistory 帧
+// （128 帧 ≈ 12.8 秒），更早的帧已经不存在了，因此调用方必须能处理
+// `SNAPSHOTS_INCOMPLETE`——对客户端表现为一个明确的「需要全量刷新」，
+// 而不是假装补上了。
+
+// 快照窗口的判定结果。
+//
+// 为什么不用错误码表达（TASK-017）：这四种情况**都不是错误**，接口调用成功、
+// 房间也还在，区别只在于「能不能把缺的帧补齐」。用 RoomErrorCode 表达会让调用方在
+// "业务失败"与"补不齐"之间做出错误的重试决策——后者重试一万次也一样，
+// 因为那段历史已经不在内存缓冲里了。
+enum SnapshotWindowStatus {
+  SNAPSHOT_WINDOW_STATUS_UNSPECIFIED = 0;
+
+  // 请求区间被完整覆盖，`snapshots` 里是全部缺失帧（帧号严格递增）。
+  SNAPSHOTS_READY = 1;
+
+  // 请求的帧号早于环形缓冲中最早的一帧：中间有一段**已经不可恢复**。
+  // 调用方应要求客户端全量刷新，而不是从这里的 snapshots 接着往下走。
+  SNAPSHOTS_INCOMPLETE = 2;
+
+  // 请求的帧号晚于房间当前帧号。正常流程下不会出现（帧号单调递增），
+  // 出现即说明客户端状态与服务端不一致，同样应全量刷新。
+  SNAPSHOTS_AHEAD = 3;
+}
+
+message GetRoomSnapshotsSinceRequest {
+  string request_id = 1;
+  string room_id = 2;
+
+  // 客户端已有的最新帧号（来自 SSE 的 `Last-Event-ID`）。
+  // 返回**帧号严格大于**它的快照。取负值等价于 0。
+  int64 since_frame = 3;
+}
+
+message GetRoomSnapshotsSinceResponse {
+  RoomError error = 1;
+
+  SnapshotWindowStatus status = 2;
+
+  // 帧号严格大于 since_frame 的快照，按帧号**递增且不重复**。
+  // 同一帧号在缓冲里可能有多条（同一帧的状态多次变化），这里只返回该帧最新的一份。
+  repeated RoomSnapshot snapshots = 3;
+
+  // 环形缓冲当前的帧号区间，便于调用方解释"为什么补不齐"。
+  // 缓冲为空时为 0。
+  int64 oldest_frame = 4;
+  int64 latest_frame = 5;
+}
+
+// ---------------------------------------------------------------------------
 // 上报玩家连接状态（TASK-016）
 // ---------------------------------------------------------------------------
 
@@ -330,6 +389,10 @@ service RoomService {
 
   // 查询对局结果。结果尚未落库时返回 RESULT_PENDING，而不是空结果。
   rpc GetMatchResult(GetMatchResultRequest) returns (GetMatchResultResponse);
+
+  // 查询帧号大于给定值的历史快照，供 Gateway 在 SSE 重连时补发（TASK-017）。
+  // 超出内存环形缓冲的部分不可恢复，用 status = SNAPSHOTS_INCOMPLETE 如实告知。
+  rpc GetRoomSnapshotsSince(GetRoomSnapshotsSinceRequest) returns (GetRoomSnapshotsSinceResponse);
 
   // 上报玩家的推送连接状态（TASK-016）。幂等：重复上报同一状态无副作用。
   rpc SetPlayerPresence(SetPlayerPresenceRequest) returns (SetPlayerPresenceResponse);

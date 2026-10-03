@@ -202,7 +202,7 @@ public:
     int result_calls = 0;
 
     RoomCallStatus Join(const std::string& room_id, const std::string& player_id,
-                        RoomSnapshot* out_snapshot) override {
+                        const std::string& /*request_id*/, RoomSnapshot* out_snapshot) override {
         ++join_calls;
         last_room_id = room_id;
         last_player_id = player_id;
@@ -213,6 +213,7 @@ public:
     }
 
     RoomCallStatus SubmitAttack(const std::string& room_id, const std::string& player_id,
+                                const std::string& /*request_id*/,
                                 RoomSnapshot* out_snapshot) override {
         ++submit_calls;
         last_room_id = room_id;
@@ -223,7 +224,8 @@ public:
         return next_status;
     }
 
-    RoomCallStatus GetState(const std::string& room_id, RoomSnapshot* out_snapshot) override {
+    RoomCallStatus GetState(const std::string& room_id, const std::string& /*request_id*/,
+                            RoomSnapshot* out_snapshot) override {
         ++state_calls;
         last_room_id = room_id;
         if (out_snapshot != nullptr) {
@@ -232,7 +234,8 @@ public:
         return next_status;
     }
 
-    RoomCallStatus GetResult(const std::string& match_id, MatchResultView* out_view) override {
+    RoomCallStatus GetResult(const std::string& match_id, const std::string& /*request_id*/,
+                             MatchResultView* out_view) override {
         ++result_calls;
         last_match_id = match_id;
         if (out_view != nullptr) {
@@ -241,10 +244,17 @@ public:
         return next_status;
     }
 
+    /// TASK-017：本用例集不验证补发（那是 stream_hub_test 的职责），
+    /// 因此只做最小实现，但**必须实现**——抽象接口不会给默认行为。
+    RoomCallStatus GetSnapshotsSince(const std::string&, std::int64_t, const std::string&,
+                                     rgbt::gateway::SnapshotRange*) override {
+        return RoomCallStatus::kOk;
+    }
+
     /// TASK-016：本用例集不验证 presence 上报（那是 stream_hub_test 的职责），
     /// 因此这里只做最小实现，但**必须实现**——抽象接口不会给默认行为，
     /// 这正是"新增 RPC 会强迫所有调用方表态"的体现。
-    RoomCallStatus SetPresence(const std::string&, const std::string&, bool,
+    RoomCallStatus SetPresence(const std::string&, const std::string&, bool, const std::string&,
                                RoomSnapshot*) override {
         return RoomCallStatus::kOk;
     }

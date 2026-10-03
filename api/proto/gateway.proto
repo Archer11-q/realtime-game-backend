@@ -344,8 +344,22 @@ message GetMatchResultResponse {
 //
 // 事件类型（承载在 SSE 的 event 字段上）：
 //   session.ready   订阅建立后的第一个事件
-//   room.state      房间权威状态快照，仅在该房间帧号变化时推送
+//   room.state      房间权威状态快照，仅在该房间**状态**变化时推送
+//                   （不只是帧号：宽限期内帧号不变但"对方断线了"必须推出去）
 //   room.finished   对局结束，推送后连接被关闭
+//   stream.reset    TASK-017：服务端无法补发缺的帧，要求客户端按载荷里的
+//                   完整状态全量刷新。载荷是 {"reason":..., "room":{...}}
+//
+// TASK-017 的两条约定：
+//   * `room.state` / `room.finished` / `stream.reset` 都带 SSE 的 `id:` 字段，
+//     内容是房间帧号。客户端重连时把它作为 `Last-Event-ID` 请求头回传，
+//     服务端据此补发错过的帧；`session.ready` 与心跳不带 id。
+//   * 请求头**非法**、早于房间的快照窗口、或晚于当前帧 → 不回补发，改发
+//     `stream.reset` 并附当前完整状态。**不假装补上了**：窗口只有内存环形缓冲
+//     那么大（128 帧 ≈ 12.8 秒），承诺更长就等于撒谎。
+//     请求头**缺失**（第一次订阅）不在此列：那是正常路径，服务端照常推当前状态，
+//     不发 reset（2026-10-02 项目所有者确认）。
+//
 // 载荷是 docs/05-api-and-data.md 第 2 节的版本化 JSON 信封
 // （version / type / sequence / timestamp_ms / payload）。
 

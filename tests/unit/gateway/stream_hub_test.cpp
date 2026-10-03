@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -69,13 +70,16 @@ private:
 /// 可控的房间客户端。只实现 StreamHub 用到的 GetState，其余方法给出固定结果。
 class FakeRoomClient final : public RoomClient {
 public:
-    RoomCallStatus Join(const std::string&, const std::string&, RoomSnapshot*) override {
+    RoomCallStatus Join(const std::string&, const std::string&, const std::string&,
+                        RoomSnapshot*) override {
         return RoomCallStatus::kOk;
     }
-    RoomCallStatus SubmitAttack(const std::string&, const std::string&, RoomSnapshot*) override {
+    RoomCallStatus SubmitAttack(const std::string&, const std::string&, const std::string&,
+                                RoomSnapshot*) override {
         return RoomCallStatus::kOk;
     }
-    RoomCallStatus GetState(const std::string& room_id, RoomSnapshot* out_snapshot) override {
+    RoomCallStatus GetState(const std::string& room_id, const std::string& /*request_id*/,
+                            RoomSnapshot* out_snapshot) override {
         ++get_state_calls;
         const auto it = rooms.find(room_id);
         if (it == rooms.end()) {
@@ -84,13 +88,32 @@ public:
         *out_snapshot = it->second;
         return RoomCallStatus::kOk;
     }
-    RoomCallStatus GetResult(const std::string&, rgbt::gateway::MatchResultView*) override {
+    RoomCallStatus GetResult(const std::string&, const std::string&,
+                             rgbt::gateway::MatchResultView*) override {
         return RoomCallStatus::kNotFound;
+    }
+    /// TASK-017：补发查询。返回预置的 SnapshotRange，方便逐个构造
+    /// 「窗口内 / 窗口外 / id 超前」三种情况。
+    RoomCallStatus GetSnapshotsSince(const std::string& room_id, std::int64_t since_frame,
+                                     const std::string& /*request_id*/,
+                                     rgbt::gateway::SnapshotRange* out_range) override {
+        ++get_snapshots_calls;
+        last_since_frame = since_frame;
+
+        if (fail_snapshots) {
+            return RoomCallStatus::kUnavailable;
+        }
+        if (ranges.find(room_id) == ranges.end()) {
+            return RoomCallStatus::kNotFound;
+        }
+        *out_range = ranges[room_id];
+        return RoomCallStatus::kOk;
     }
     /// TASK-016：记录每次连接状态上报，供用例断言
     /// 「订阅建立 → 上报 online；订阅移除 → 上报 offline」。
     RoomCallStatus SetPresence(const std::string& room_id, const std::string& player_id,
-                               bool online, RoomSnapshot*) override {
+                               bool online, const std::string& /*request_id*/,
+                               RoomSnapshot*) override {
         presence_calls.push_back(PresenceCall{room_id, player_id, online});
         if (fail_set_presence) {
             return RoomCallStatus::kUnavailable;
@@ -106,7 +129,12 @@ public:
     };
 
     std::unordered_map<std::string, RoomSnapshot> rooms;
+    /// TASK-017：room_id -> 补发查询的返回结果。
+    std::unordered_map<std::string, rgbt::gateway::SnapshotRange> ranges;
     int get_state_calls = 0;
+    int get_snapshots_calls = 0;
+    std::int64_t last_since_frame = -1;
+    bool fail_snapshots = false;
     std::vector<PresenceCall> presence_calls;
     bool fail_set_presence = false;
 };
@@ -135,8 +163,76 @@ Subscribed Subscribe(StreamHub* hub, const std::string& player_id, const std::st
     Subscribed result;
     result.sink = sink.get();
     result.log = log;
-    result.id = hub->Subscribe(player_id, room_id, std::move(sink));
+    result.id = hub->Subscribe(player_id, room_id, std::move(sink)).id;
     return result;
+}
+
+/// 带 `Last-Event-ID` 的订阅（TASK-017）。返回值里的 id 可能为 0，
+/// 用 `SubscribeReport` 查询补发结果。
+Subscribed SubscribeSince(StreamHub* hub, const std::string& player_id, const std::string& room_id,
+                          std::int64_t since_frame) {
+    auto log = std::make_shared<SinkLog>();
+    auto sink = std::make_unique<FakeSink>(log);
+    Subscribed result;
+    result.sink = sink.get();
+    result.log = log;
+    rgbt::gateway::SubscribeOptions options;
+    options.last_event_id = since_frame;
+    result.id = hub->Subscribe(player_id, room_id, std::move(sink), options).id;
+    return result;
+}
+
+/// 带一个**非法**的 `Last-Event-ID` 订阅（请求头存在但解析失败）。
+Subscribed SubscribeMalformed(StreamHub* hub, const std::string& player_id,
+                              const std::string& room_id) {
+    auto log = std::make_shared<SinkLog>();
+    auto sink = std::make_unique<FakeSink>(log);
+    Subscribed result;
+    result.sink = sink.get();
+    result.log = log;
+    rgbt::gateway::SubscribeOptions options;
+    options.last_event_id_malformed = true;
+    result.id = hub->Subscribe(player_id, room_id, std::move(sink), options).id;
+    return result;
+}
+
+/// 造一段补发结果：帧号 [from, to] 的连续快照，状态为 READY。
+rgbt::gateway::SnapshotRange RangeOf(const std::string& room_id, std::int64_t from,
+                                     std::int64_t to) {
+    rgbt::gateway::SnapshotRange range;
+    range.status = rgbt::gateway::SnapshotWindowStatus::kReady;
+    range.oldest_frame = from;
+    range.latest_frame = to;
+    for (std::int64_t frame = from; frame <= to; ++frame) {
+        range.snapshots.push_back(PlayingRoom(room_id, frame));
+    }
+    return range;
+}
+
+/// 第 n 次写入（按下标）里包含的帧号序列。用于断言补发顺序。
+std::vector<std::int64_t> SequenceOfWrites(const std::shared_ptr<SinkLog>& log) {
+    std::vector<std::int64_t> frames;
+    for (const std::string& write : log->writes) {
+        const std::size_t at = write.find("\"sequence\":");
+        if (at == std::string::npos) {
+            continue;
+        }
+        frames.push_back(std::stoll(write.substr(at + 11)));
+    }
+    return frames;
+}
+
+/// 取出所有写入里的 SSE `id: <n>` 行。补发的每个事件都必须带 id。
+std::vector<std::int64_t> IdsOfWrites(const std::shared_ptr<SinkLog>& log) {
+    std::vector<std::int64_t> ids;
+    for (const std::string& write : log->writes) {
+        if (write.rfind("id: ", 0) != 0) {
+            continue;
+        }
+        const std::size_t end = write.find('\n');
+        ids.push_back(std::stoll(write.substr(4, end - 4)));
+    }
+    return ids;
 }
 
 bool Contains(const std::shared_ptr<SinkLog>& log, const std::string& needle) {
@@ -460,4 +556,277 @@ TEST(StreamHubTest, AbortedRoomAlsoEndsTheStream) {
     EXPECT_TRUE(Contains(sub.log, "event: room.finished"));
     EXPECT_TRUE(Contains(sub.log, "\"state\":\"aborted\""));
     EXPECT_EQ(hub.ConnectionCount(), 0U);
+}
+
+// ---------------------------------------------------------------------------
+// 推送连续性与补发（TASK-017）
+//
+// 这一组覆盖的是"重连时缺的帧怎么办"：补发顺序、去重、id 字段、窗口外与
+// 非法 id 的处置。它们全都**无法靠端到端脚本观察**——端到端只能看到
+// "重连之后帧号最终对上了"，看不出中间有没有重复帧、有没有该发 reset 却静默跳过。
+// ---------------------------------------------------------------------------
+
+TEST(StreamHubTest, FreshSubscriptionWithoutLastEventIdGetsNormalStatePush) {
+    // 没有 Last-Event-ID = 第一次订阅。按任务单的失败场景：**不补发、也不发
+    // stream.reset**，由第一次 Tick 正常推当前状态（等同 TASK-016 的行为）。
+    // 这与"头存在但非法"（下面那条用例）刻意不同：那是客户端的 bug，必须被指出。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 7);
+    StreamHub hub(&room);
+
+    const Subscribed sub = Subscribe(&hub, "p-0001", "r-1");
+    hub.Tick(kT0);
+
+    EXPECT_FALSE(Contains(sub.log, "event: stream.reset"));
+    EXPECT_EQ(hub.ResetEventCount("no_last_event_id"), 0U);
+    // 状态照常送达，客户端第一帧就有画面。
+    EXPECT_TRUE(Contains(sub.log, "event: room.state"));
+    EXPECT_TRUE(Contains(sub.log, "\"sequence\":7"));
+    // 新路径下不需要为"头缺失"去查历史区间：没有帧号，问了也没有意义。
+    EXPECT_EQ(room.get_snapshots_calls, 0);
+    EXPECT_EQ(hub.BackfilledFrameCount(), 0U);
+    EXPECT_TRUE(Contains(sub.log, "event: session.ready"));
+}
+
+TEST(StreamHubTest, BackfillsMissingFramesInOrderWithIds) {
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 5);
+    room.ranges["r-1"] = RangeOf("r-1", 3, 5);  // 客户端停在第 2 帧
+    StreamHub hub(&room);
+
+    const Subscribed sub = SubscribeSince(&hub, "p-0001", "r-1", 2);
+    hub.Tick(kT0);
+
+    // 帧号递增、不重复。
+    const std::vector<std::int64_t> frames = SequenceOfWrites(sub.log);
+    ASSERT_EQ(frames.size(), 3U);
+    EXPECT_EQ(frames[0], 3);
+    EXPECT_EQ(frames[1], 4);
+    EXPECT_EQ(frames[2], 5);
+
+    // 每个补发的事件都带 SSE 的 id（客户端据此判断连续性）。
+    const std::vector<std::int64_t> ids = IdsOfWrites(sub.log);
+    ASSERT_EQ(ids.size(), 3U);
+    EXPECT_EQ(ids[0], 3);
+    EXPECT_EQ(ids[1], 4);
+    EXPECT_EQ(ids[2], 5);
+
+    EXPECT_EQ(room.last_since_frame, 2);
+    EXPECT_EQ(hub.BackfilledFrameCount(), 3U);
+
+    const rgbt::gateway::SubscriptionReport report = hub.SubscribeReport(sub.id);
+    EXPECT_TRUE(report.backfill_done);
+    EXPECT_EQ(report.backfilled_frames, 3U);
+    EXPECT_FALSE(report.reset_sent);
+}
+
+TEST(StreamHubTest, BackfillDoesNotDuplicateTheLatestState) {
+    // 补发的最后一帧会把自己登记为"已推送状态"，因此同一轮/下一轮的实时推送
+    // 不会再把同一份状态写一遍。否则客户端会看到重复帧号，
+    // 而这恰恰是"补发"最容易引入的缺陷。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 5);
+    room.ranges["r-1"] = RangeOf("r-1", 3, 5);
+    StreamHub hub(&room);
+
+    const Subscribed sub = SubscribeSince(&hub, "p-0001", "r-1", 2);
+    hub.Tick(kT0);
+    const std::size_t after_backfill = sub.log->writes.size();
+
+    hub.Tick(kT0 + 100);
+    // 房间状态没变：不能有任何新的 room.state。
+    for (std::size_t i = after_backfill; i < sub.log->writes.size(); ++i) {
+        EXPECT_EQ(sub.log->writes[i].find("event: room.state"), std::string::npos);
+    }
+
+    // 房间推进后照常推送新帧。
+    room.rooms["r-1"] = PlayingRoom("r-1", 6);
+    hub.Tick(kT0 + 200);
+    EXPECT_TRUE(Contains(sub.log, "\"sequence\":6"));
+}
+
+TEST(StreamHubTest, OutOfWindowBackfillSendsResetInsteadOfPartialHistory) {
+    // 窗口外：缺的那段已经不在内存缓冲里了。必须明确告知"需要全量刷新"，
+    // **不能**把半段历史发出去假装补上了——客户端会以为自己连续。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 9);
+    rgbt::gateway::SnapshotRange stale;
+    stale.status = rgbt::gateway::SnapshotWindowStatus::kIncomplete;
+    stale.oldest_frame = 5;
+    stale.latest_frame = 9;
+    stale.snapshots = RangeOf("r-1", 7, 9).snapshots;
+    room.ranges["r-1"] = stale;
+    StreamHub hub(&room);
+
+    const Subscribed sub = SubscribeSince(&hub, "p-0001", "r-1", 1);
+    hub.Tick(kT0);
+
+    EXPECT_TRUE(Contains(sub.log, "event: stream.reset"));
+    EXPECT_TRUE(Contains(sub.log, "\"reason\":\"id_out_of_window\""));
+    // 载荷里必须带当前完整状态，客户端不必再发一次查询。
+    EXPECT_TRUE(Contains(sub.log, "\"sequence\":9"));
+    // 残缺的历史一帧都不发：这一轮只写 reset，下一轮写 session.ready + 当前状态。
+    // 判据用"没有 room.state"而不是写次数——写次数会把 session.ready 的时机
+    // 绑死在断言里，而那属于 Tick 的调度细节，不是本用例要锁定的语义。
+    for (const std::string& write : sub.log->writes) {
+        EXPECT_EQ(write.find("event: room.state"), std::string::npos)
+            << "窗口外不应补发任何残缺的中间帧：" << write;
+    }
+    EXPECT_EQ(hub.ResetEventCount("id_out_of_window"), 1U);
+    EXPECT_EQ(hub.BackfilledFrameCount(), 0U);
+}
+
+TEST(StreamHubTest, ClientAheadOfServerIsReportedAsIdAhead) {
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 3);
+    rgbt::gateway::SnapshotRange ahead;
+    ahead.status = rgbt::gateway::SnapshotWindowStatus::kAhead;
+    ahead.oldest_frame = 1;
+    ahead.latest_frame = 3;
+    room.ranges["r-1"] = ahead;
+    StreamHub hub(&room);
+
+    const Subscribed sub = SubscribeSince(&hub, "p-0001", "r-1", 99);
+    hub.Tick(kT0);
+
+    EXPECT_TRUE(Contains(sub.log, "\"reason\":\"id_ahead\""));
+    EXPECT_EQ(hub.ResetEventCount("id_ahead"), 1U);
+}
+
+TEST(StreamHubTest, MalformedLastEventIdSendsResetWithItsOwnReason) {
+    // 请求头存在但解析失败：这是客户端的 bug，不是"第一次订阅"。
+    // 两者要能被分开观察到，否则排障时无法判断是谁的问题。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 2);
+    StreamHub hub(&room);
+
+    const Subscribed sub = SubscribeMalformed(&hub, "p-0001", "r-1");
+    hub.Tick(kT0);
+
+    EXPECT_TRUE(Contains(sub.log, "\"reason\":\"id_malformed\""));
+    EXPECT_EQ(hub.ResetEventCount("id_malformed"), 1U);
+    EXPECT_EQ(room.get_snapshots_calls, 0);  // 连帧号都没有，不该去查历史
+}
+
+TEST(StreamHubTest, ClientAlreadyCurrentGetsResetWithIdCurrent) {
+    // 窗口内但没有缺失帧（刚断开又立刻重连）。仍然明确回一条 reset：
+    // 客户端的 Last-Event-ID 说明它"以为"自己有某一帧，服务端要给出确认。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 4);
+    room.ranges["r-1"] = RangeOf("r-1", 4, 3);  // 空区间，状态 READY
+    StreamHub hub(&room);
+
+    const Subscribed sub = SubscribeSince(&hub, "p-0001", "r-1", 4);
+    hub.Tick(kT0);
+
+    EXPECT_TRUE(Contains(sub.log, "\"reason\":\"id_current\""));
+    EXPECT_EQ(hub.ResetEventCount("id_current"), 1U);
+    EXPECT_EQ(hub.BackfilledFrameCount(), 0U);
+}
+
+TEST(StreamHubTest, BackfillFailureKeepsSubscriptionOpen) {
+    // 补发过程中 Room 不可用：不补发、不发事件、**不关闭连接**。
+    // 沿用 TASK-009 的取舍——一次抖动不该逼客户端重连（客户端重连还会触发
+    // 一次新的宽限期上报，代价比等待大得多）。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 5);
+    room.ranges["r-1"] = RangeOf("r-1", 3, 5);  // 客户端停在第 2 帧
+    room.fail_snapshots = true;
+    StreamHub hub(&room);
+
+    const Subscribed sub = SubscribeSince(&hub, "p-0001", "r-1", 2);
+    hub.Tick(kT0);
+
+    EXPECT_EQ(hub.ConnectionCount(), 1U);
+    EXPECT_FALSE(sub.log->closed);
+    EXPECT_FALSE(Contains(sub.log, "event: stream.reset"));
+    // 没补发成：这一轮不该有 room.state（既没有补发的帧，实时推送也让位给补发）。
+    EXPECT_FALSE(Contains(sub.log, "event: room.state"));
+    // 补发请求**没有被丢掉**：记在订阅上等下一轮重试。
+    const rgbt::gateway::SubscriptionReport held = hub.SubscribeReport(sub.id);
+    EXPECT_FALSE(held.backfill_done);
+
+    // Room 恢复后的下一轮：补发照常完成（这一轮仍然只做补发，不掺实时推送）。
+    room.fail_snapshots = false;
+    hub.Tick(kT0 + 100);
+
+    EXPECT_TRUE(Contains(sub.log, "event: room.state"));
+    EXPECT_EQ(hub.SubscribeReport(sub.id).backfill_done, true);
+
+    // 三帧补齐，一帧不多不少（帧号 3/4/5，客户端停在第 2 帧）。
+    EXPECT_EQ(hub.SubscribeReport(sub.id).backfilled_frames, 3U);
+    // 补发的每一帧都带 SSE 的 id，客户端据此判断连续性。
+    EXPECT_TRUE(Contains(sub.log, "id: 3\nevent: room.state"));
+    EXPECT_TRUE(Contains(sub.log, "id: 4\nevent: room.state"));
+    EXPECT_TRUE(Contains(sub.log, "id: 5\nevent: room.state"));
+
+    // 补发完成后的下一轮发出 session.ready（它由阶段一收集、补发让位一轮，
+    // 因此排在补发之后；这条顺序本身是契约的一部分）。
+    hub.Tick(kT0 + 200);
+    EXPECT_TRUE(Contains(sub.log, "event: session.ready"));
+
+    // 状态没变：此后实时推送保持安静，补发不会把同一状态再写一遍。
+    const std::size_t quiet_baseline = sub.log->writes.size();
+    hub.Tick(kT0 + 300);
+    EXPECT_EQ(sub.log->writes.size(), quiet_baseline);
+}
+
+TEST(StreamHubTest, BackfillWriteFailureRemovesSubscription) {
+    // 补发时写失败 = 连接已断，与实时推送走同一条清理路径。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 5);
+    room.ranges["r-1"] = RangeOf("r-1", 3, 5);
+    StreamHub hub(&room);
+
+    const Subscribed sub = SubscribeSince(&hub, "p-0001", "r-1", 2);
+    ASSERT_NE(sub.sink, nullptr);
+    sub.sink->fail = true;
+    hub.Tick(kT0);
+
+    EXPECT_EQ(hub.ConnectionCount(), 0U);
+    EXPECT_TRUE(sub.log->closed);
+}
+
+TEST(StreamHubTest, BackfilledFinishedRoomClosesTheStream) {
+    // 补发区间里包含终态：客户端应当收到 room.finished，并且流被关闭——
+    // 否则一条已经打完的房间会留下永远不结束的订阅。
+    FakeRoomClient room;
+    RoomSnapshot finished = PlayingRoom("r-1", 5);
+    finished.state = RoomState::kFinished;
+    finished.winner_id = "p-0001";
+    finished.finish_reason = "hp_zero";
+    room.rooms["r-1"] = finished;
+    room.ranges["r-1"] = RangeOf("r-1", 4, 4);
+    room.ranges["r-1"].snapshots.push_back(finished);
+    StreamHub hub(&room);
+
+    const Subscribed sub = SubscribeSince(&hub, "p-0001", "r-1", 3);
+    hub.Tick(kT0);
+
+    EXPECT_TRUE(Contains(sub.log, "event: room.finished"));
+    EXPECT_TRUE(Contains(sub.log, "\"winner_id\":\"p-0001\""));
+
+    // 下一轮：终态必须仍然被送达一次（last_pushed_state_ 里不留终态），
+    // 然后关闭流。
+    hub.Tick(kT0 + 100);
+    EXPECT_TRUE(Contains(sub.log, "event: room.finished"));
+    EXPECT_EQ(hub.ConnectionCount(), 0U);
+}
+
+TEST(StreamHubTest, BackfillRunsOnlyOncePerSubscription) {
+    // 补发是"建立订阅"这一步的事，不能每轮都查一次历史——那会把一次重连
+    // 变成持续的历史查询负载。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 5);
+    room.ranges["r-1"] = RangeOf("r-1", 4, 5);
+    StreamHub hub(&room);
+
+    SubscribeSince(&hub, "p-0001", "r-1", 3);
+    hub.Tick(kT0);
+    EXPECT_EQ(room.get_snapshots_calls, 1);
+
+    for (int i = 1; i <= 5; ++i) {
+        hub.Tick(kT0 + 100 * i);
+    }
+    EXPECT_EQ(room.get_snapshots_calls, 1);
 }
