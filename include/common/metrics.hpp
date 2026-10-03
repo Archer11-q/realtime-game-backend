@@ -97,7 +97,8 @@ public:
     /// 都记得调用，那恰恰最容易漏。
     ///
     /// @param read 采集时调用，返回当前值。**不应阻塞**（会在采集线程上执行）。
-    void Gauge(std::string_view name, std::string_view help, std::function<std::uint64_t()> read);
+    void Gauge(std::string_view name, std::string_view help, std::function<std::uint64_t()> read,
+               std::initializer_list<MetricLabel> labels = {});
 
     /// @brief 记录一次观测到直方图里。单位由调用方保证（惯例是秒）。
     void Observe(std::string_view name, std::string_view help, double value);
@@ -136,6 +137,7 @@ private:
     struct GaugeEntry {
         std::string name;
         std::string help;
+        std::vector<MetricLabel> labels;
         std::function<std::uint64_t()> read;
     };
 

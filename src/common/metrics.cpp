@@ -74,6 +74,19 @@ std::string EscapeLabelValue(const std::string& value) {
     return out;
 }
 
+/// 标签集合逐字段比较。`MetricLabel` 是聚合体，没有 `operator==`；
+/// 而 gauge 的去重要求"名字与标签都相同"，所以这里显式比。
+bool LabelsEqual(const std::vector<MetricLabel>& left, const std::vector<MetricLabel>& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (left[i].key != right[i].key || left[i].value != right[i].value) {
+            return false;
+        }
+    }
+    return true;
+}
 /// 渲染标签集合：`{k="v",k2="v2"}`；无标签时返回空串。
 std::string RenderLabels(const std::vector<MetricLabel>& labels) {
     if (labels.empty()) {
@@ -144,16 +157,21 @@ CounterHandle MetricsRegistry::Counter(std::string_view name, std::string_view h
 }
 
 void MetricsRegistry::Gauge(std::string_view name, std::string_view help,
-                            std::function<std::uint64_t()> read) {
+                            std::function<std::uint64_t()> read,
+                            std::initializer_list<MetricLabel> labels) {
+    std::vector<MetricLabel> label_list(labels.begin(), labels.end());
     const std::lock_guard<std::mutex> lock(mutex_);
     for (const GaugeEntry& entry : gauges_) {
-        if (entry.name == name) {
-            return;  // 同名重复登记：保留第一次，避免回调被调用两次
+        // **名字与标签都相同**才算重复。只比名字会让同名不同标签的 gauge 被
+        // 去重成一条（六个阶段的房间数只导出第一条，且不报任何错）。
+        if (entry.name == name && LabelsEqual(entry.labels, label_list)) {
+            return;  // 重复登记：保留第一次，避免回调被登记两次
         }
     }
     GaugeEntry entry;
     entry.name = std::string(name);
     entry.help = std::string(help);
+    entry.labels = std::move(label_list);
     entry.read = std::move(read);
     gauges_.push_back(std::move(entry));
 }
@@ -206,6 +224,7 @@ std::string MetricsRegistry::TextExposure() {
     struct GaugeSample {
         std::string name;
         std::string help;
+        std::vector<MetricLabel> labels;
         std::function<std::uint64_t()> read;
     };
     struct HistogramSample {
@@ -228,7 +247,7 @@ std::string MetricsRegistry::TextExposure() {
                                              CounterHandle(&cell->value).Value()});
         }
         for (const GaugeEntry& entry : gauges_) {
-            gauges.push_back(GaugeSample{entry.name, entry.help, entry.read});
+            gauges.push_back(GaugeSample{entry.name, entry.help, entry.labels, entry.read});
         }
         for (const Histogram& histogram : histograms_) {
             histograms.push_back(HistogramSample{histogram.name, histogram.help, histogram.bounds,
@@ -247,7 +266,10 @@ std::string MetricsRegistry::TextExposure() {
                   return RenderLabels(left.labels) < RenderLabels(right.labels);
               });
     std::sort(gauges.begin(), gauges.end(), [](const GaugeSample& left, const GaugeSample& right) {
-        return left.name < right.name;
+        if (left.name != right.name) {
+            return left.name < right.name;
+        }
+        return RenderLabels(left.labels) < RenderLabels(right.labels);
     });
     std::sort(histograms.begin(), histograms.end(),
               [](const HistogramSample& left, const HistogramSample& right) {
@@ -272,7 +294,7 @@ std::string MetricsRegistry::TextExposure() {
             last_name = sample.name;
         }
         const std::uint64_t value = sample.read ? sample.read() : 0;
-        out << sample.name << ' ' << value << '\n';
+        out << sample.name << RenderLabels(sample.labels) << ' ' << value << '\n';
     }
     for (const HistogramSample& sample : histograms) {
         out << "# HELP " << sample.name << ' ' << sample.help << '\n';

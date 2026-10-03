@@ -111,7 +111,35 @@ std::optional<InputKind> ToInputKind(rgbt::room::v1::PlayerInput::Kind kind) {
 }  // namespace
 
 RoomServiceImpl::RoomServiceImpl(RoomManager* manager, std::function<std::int64_t()> clock)
-    : manager_(manager), clock_(clock ? std::move(clock) : SystemNowMs) {}
+    : manager_(manager), clock_(clock ? std::move(clock) : SystemNowMs) {
+    // TASK-019：房间数按阶段暴露成 gauge。**每个阶段都要登记**（即使当前为 0）：
+    // 否则"这个阶段还没有房间"在面板上会表现为"这条曲线不存在"，看的人无法区分
+    // "没有"与"查询失败"。
+    //
+    // 名称相同、标签不同的 gauge 各自是一条序列，因此 Gauge 必须支持标签
+    // （见 metrics.hpp）。按名字去重会让六个阶段只导出第一条，而且不报任何错。
+    for (const RoomPhase phase : kAllRoomPhases) {
+        rgbt::common::Metrics().Gauge(
+            rgbt::common::kMetricRooms, "Room 当前房间数，按生命周期阶段分组",
+            [this, phase]() -> std::uint64_t {
+                return manager_ == nullptr
+                           ? 0
+                           : static_cast<std::uint64_t>(manager_->PhaseCounts().At(phase));
+            },
+            {{"phase", rgbt::room::ToString(phase)}});
+    }
+
+    // 帧推进用"所有房间当前帧号之和"：它天然单调不减，且不需要在 BattleRoom::Tick
+    // 的热路径上再插一次写入（理由见 room_manager.hpp 的 TotalFramesAdvanced 注释）。
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricRoomFramesAdvancedTotal, "Room 累计推进的帧数（所有房间帧号之和）",
+        [this]() -> std::uint64_t {
+            return manager_ == nullptr
+                       ? 0
+                       : static_cast<std::uint64_t>(manager_->TotalFramesAdvanced());
+        });
+    metrics_ready_ = true;
+}
 
 std::int64_t RoomServiceImpl::NowMs() const {
     return clock_ ? clock_() : SystemNowMs();

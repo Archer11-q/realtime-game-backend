@@ -134,6 +134,30 @@ TEST(MetricsTest, GaugeReadsValueAtScrapeTime) {
     EXPECT_NE(registry.TextExposure().find("rgbt_test_gauge 11"), std::string::npos);
 }
 
+TEST(MetricsTest, GaugeWithDifferentLabelsAreSeparateSeries) {
+    // **这条用例是补上来的**：Gauge 最初不支持标签，`Gauge()` 按名字去重，
+    // 于是"六个阶段的房间数"只会导出第一条 —— 而且不报任何错，面板上只是少五条
+    // 曲线。这类静默丢指标比报错更难发现，必须由测试锁住。
+    MetricsRegistry registry;
+    registry.Gauge("rgbt_test_rooms", "按阶段", []() { return 2U; }, {{"phase", "playing"}});
+    registry.Gauge("rgbt_test_rooms", "按阶段", []() { return 5U; }, {{"phase", "waiting"}});
+    EXPECT_EQ(registry.MetricCount(), 2U);
+
+    const std::string text = registry.TextExposure();
+    EXPECT_NE(text.find("rgbt_test_rooms{phase=\"playing\"} 2"), std::string::npos) << text;
+    EXPECT_NE(text.find("rgbt_test_rooms{phase=\"waiting\"} 5"), std::string::npos) << text;
+}
+
+TEST(MetricsTest, SameGaugeNameAndLabelsStillDeduplicates) {
+    // 名字与标签都相同时仍要保留第一次：否则同名同标签的 gauge 会导出多条，
+    // 而那在 Prometheus 里是重复时间序列（抓取会报错）。
+    MetricsRegistry registry;
+    registry.Gauge("rgbt_test_gauge_same", "去重", []() { return 1U; }, {{"k", "v"}});
+    registry.Gauge("rgbt_test_gauge_same", "去重", []() { return 9U; }, {{"k", "v"}});
+    EXPECT_EQ(registry.MetricCount(), 1U);
+    EXPECT_NE(registry.TextExposure().find("rgbt_test_gauge_same{k=\"v\"} 1"), std::string::npos);
+}
+
 TEST(MetricsTest, DuplicateGaugeRegistrationKeepsTheFirst) {
     // 同名重复登记保留第一次：否则回调会被调用两次（值可能不同），
     // 导出里出现两条同名 gauge 样本。
