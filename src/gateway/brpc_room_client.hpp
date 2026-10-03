@@ -37,20 +37,24 @@ public:
     BrpcRoomClient& operator=(const BrpcRoomClient&) = delete;
 
     RoomCallStatus Join(const std::string& room_id, const std::string& player_id,
-                        RoomSnapshot* out_snapshot) override;
+                        const std::string& request_id, RoomSnapshot* out_snapshot) override;
 
     RoomCallStatus SubmitAttack(const std::string& room_id, const std::string& player_id,
-                                RoomSnapshot* out_snapshot) override;
+                                const std::string& request_id, RoomSnapshot* out_snapshot) override;
 
-    RoomCallStatus GetState(const std::string& room_id, RoomSnapshot* out_snapshot) override;
+    RoomCallStatus GetState(const std::string& room_id, const std::string& request_id,
+                            RoomSnapshot* out_snapshot) override;
 
-    RoomCallStatus GetResult(const std::string& match_id, MatchResultView* out_view) override;
+    RoomCallStatus GetResult(const std::string& match_id, const std::string& request_id,
+                             MatchResultView* out_view) override;
 
     RoomCallStatus GetSnapshotsSince(const std::string& room_id, std::int64_t since_frame,
+                                     const std::string& request_id,
                                      SnapshotRange* out_range) override;
 
     RoomCallStatus SetPresence(const std::string& room_id, const std::string& player_id,
-                               bool online, RoomSnapshot* out_snapshot) override;
+                               bool online, const std::string& request_id,
+                               RoomSnapshot* out_snapshot) override;
 
     [[nodiscard]] bool IsHealthy() override;
 

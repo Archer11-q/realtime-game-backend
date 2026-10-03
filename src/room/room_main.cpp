@@ -30,6 +30,7 @@
 #include <string>
 #include <thread>
 
+#include "common/logging.hpp"
 #include "common/mysql_connection.hpp"
 #include "common/version.hpp"
 #include "mysql_match_result_writer.hpp"
@@ -71,6 +72,10 @@ std::int64_t NowMs() {
 
 int main(int argc, char* argv[]) {
     google::ParseCommandLineFlags(&argc, &argv, true);
+
+    // TASK-018：结构化日志的 service 字段。必须在任何日志之前设置，
+    // 否则进程启动阶段（最容易出问题的那一段）的日志会缺服务名。
+    rgbt::common::SetServiceName("room");
 
     const std::string env_prefix = FLAGS_env_prefix;
 
