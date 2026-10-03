@@ -308,6 +308,57 @@ ResultOutcome RoomManager::GetResult(const std::string& match_id, std::int64_t n
     }
 }
 
+SnapshotRange RoomManager::GetSnapshotsSince(const std::string& room_id, std::int64_t since_frame,
+                                             std::int64_t now_ms) {
+    SnapshotRange result;
+
+    const std::lock_guard<std::mutex> lock(mutex_);
+    ReapExpiredLocked(now_ms);
+
+    const auto it = rooms_.find(room_id);
+    if (it == rooms_.end()) {
+        result.outcome = SnapshotRangeOutcome::kNotFound;
+        return result;
+    }
+
+    const BattleRoom& room = *it->second;
+    result.snapshots = room.SnapshotsAfter(since_frame);
+    result.latest_frame = room.frame();
+    // 窗口起点直接取缓冲里**实际存在的最小帧号**，不做任何计数推算。
+    //
+    // 这里原先写的是 `oldest = latest - (latest - MaxSnapshotFrame()) + 1`，等价于
+    // `MaxSnapshotFrame() + 1`。那个式子在**缓冲已满**时才碰巧成立；缓冲没满时
+    // `MaxSnapshotFrame() == latest`，于是算出"窗口为空"，把任何能补齐的请求都判成
+    // kIncomplete（单元测试直接抓到）。条数、容量、最新帧三者都不能单独推出窗口起点，
+    // 因为同一帧可能有多条记录（加入房间、断线上报、结束都会立刻写一条）。
+    const BattleRoom::FrameRange window = room.SnapshotFrameRange();
+    result.oldest_frame = window.oldest;
+
+    if (since_frame > room.frame()) {
+        // 客户端声称的帧**晚于**服务端当前帧。帧号由服务端单调递增，因此这只可能
+        // 是客户端状态与服务端不一致，不能按"没有缺失"处理——那会让它永远停在
+        // 一个服务端认为"已经最新"、实际对不上的状态上。
+        //
+        // 判据必须是 `>` 而不是 `>=`：相等表示"客户端与服务端停在同一帧"（对局刚
+        // 建好、或双方都还没推进时的常态），那是**完全一致**，不是超前。
+        // 写成 `>=` 会把"刚进房、谁都还没动"的首次订阅判成 kAhead 并回 stream.reset
+        // （单元测试 SnapshotsSinceZeroOnEmptyBufferIsReady 抓到）。
+        result.outcome = SnapshotRangeOutcome::kAhead;
+        return result;
+    }
+
+    const std::int64_t first_needed = since_frame + 1;
+    if (first_needed < result.oldest_frame) {
+        // 需要的起点早于缓冲里实际保留的最早一帧：中间那段已经不在内存里了。
+        // 仍返回已取到的部分（调用方可以据此判断缺口），但状态如实标为"不完整"。
+        result.outcome = SnapshotRangeOutcome::kIncomplete;
+        return result;
+    }
+
+    result.outcome = SnapshotRangeOutcome::kOk;
+    return result;
+}
+
 void RoomManager::Tick(std::int64_t now_ms) {
     std::vector<std::string> to_persist;
     std::vector<RoomSnapshotRecord> snapshots;

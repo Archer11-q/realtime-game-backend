@@ -79,6 +79,23 @@ RoomSnapshot ToSnapshot(const rgbt::room::v1::RoomSnapshot& source) {
     return snapshot;
 }
 
+/// 快照窗口状态转换（TASK-017）。
+///
+/// 不认识的取值按 `kIncomplete` 处理，而不是 `kReady`：把"看不懂"当成"补得齐"
+/// 会让客户端从一段可能有洞的历史往下接，而它自己无从发现。
+SnapshotWindowStatus ToWindowStatus(rgbt::room::v1::SnapshotWindowStatus status) {
+    switch (status) {
+        case rgbt::room::v1::SNAPSHOTS_READY:
+            return SnapshotWindowStatus::kReady;
+        case rgbt::room::v1::SNAPSHOTS_AHEAD:
+            return SnapshotWindowStatus::kAhead;
+        case rgbt::room::v1::SNAPSHOTS_INCOMPLETE:
+        case rgbt::room::v1::SNAPSHOT_WINDOW_STATUS_UNSPECIFIED:
+        default:
+            return SnapshotWindowStatus::kIncomplete;
+    }
+}
+
 /// 把 Room 的业务错误码转成调用结果。
 ///
 /// 关键区分：传输层失败（controller.Failed()）单独处理为 kUnavailable，
@@ -268,6 +285,45 @@ RoomCallStatus BrpcRoomClient::GetResult(const std::string& match_id, MatchResul
     }
 
     return ToCallStatus(response.error().code());
+}
+
+RoomCallStatus BrpcRoomClient::GetSnapshotsSince(const std::string& room_id,
+                                                 std::int64_t since_frame,
+                                                 SnapshotRange* out_range) {
+    rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
+
+    rgbt::room::v1::GetRoomSnapshotsSinceRequest request;
+    // request_id 用「房间:帧号」：排障时一眼能看出这次补发是从哪一帧开始的。
+    request.set_request_id(room_id + ":since:" + std::to_string(since_frame));
+    request.set_room_id(room_id);
+    request.set_since_frame(since_frame);
+    rgbt::room::v1::GetRoomSnapshotsSinceResponse response;
+
+    brpc::Controller controller;
+    controller.set_timeout_ms(impl_->options.timeout_ms);
+    stub.GetRoomSnapshotsSince(&controller, &request, &response, nullptr);
+
+    if (controller.Failed()) {
+        return RoomCallStatus::kUnavailable;
+    }
+
+    const RoomCallStatus status = ToCallStatus(response.error().code());
+    if (status != RoomCallStatus::kOk) {
+        // 房间不存在等确定性失败：不填 out_range，避免调用方误用半份数据。
+        return status;
+    }
+
+    if (out_range != nullptr) {
+        *out_range = SnapshotRange{};
+        out_range->status = ToWindowStatus(response.status());
+        out_range->oldest_frame = response.oldest_frame();
+        out_range->latest_frame = response.latest_frame();
+        out_range->snapshots.reserve(static_cast<std::size_t>(response.snapshots_size()));
+        for (const rgbt::room::v1::RoomSnapshot& snapshot : response.snapshots()) {
+            out_range->snapshots.push_back(ToSnapshot(snapshot));
+        }
+    }
+    return RoomCallStatus::kOk;
 }
 
 bool BrpcRoomClient::IsHealthy() {

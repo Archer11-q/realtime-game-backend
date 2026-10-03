@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
 #
-# verify-reconnect.sh - TASK-016 断线重连与宽限期的验收入口
+# verify-reconnect.sh - TASK-016 / TASK-017 的验收入口
 #
-# 覆盖的验收标准（见 docs/TASKS.md 的 TASK-016）：
+# 覆盖的验收标准（见 docs/TASKS.md 的 TASK-016 与 TASK-017）：
+#   [TASK-016]
 #   1. 对局中断开推送连接 → 房间如实记录该玩家离线，且**对局暂停推进**（帧号冻结）
 #   2. 宽限期内重连 → 仍在原房间，帧号与血量与断线那一刻**精确一致**，随后继续推进
 #   3. 超过宽限期未归 → 判断线方负，reason = disconnect，并正常写入 match_results
 #   4. 双方都断线且都没回来 → 本局作废，不写 match_results（不造一个假胜负）
+#   [TASK-017]
+#   5. 带一个落后的 `Last-Event-ID` 重连 → 收到补发的中间帧，事件带 `id:`，
+#      且补发之后实时推送接上
+#   6. `Last-Event-ID` 超前于服务端、或根本不是数字 → 回 `stream.reset`
+#      并附当前完整状态，**不假装补上了**
+#   7. 首次订阅（不带该头）→ **不发 reset**，按既有行为推当前状态
 #
 # 为什么要自己驱动 SSE 而不是只靠 HTTP：**"连接断了"这个事实只有 Gateway 的
 # 推送出口才知道**（SSE 是长连接，客户端断开时服务端收不到显式通知）。
 # 因此本脚本用 curl 起一条真实的 SSE 流，再把它杀掉来制造断线。
+# 补发那一段同理：`Last-Event-ID` 是 HTTP 头，只有真发一次请求才能验证它被读到了
+# ——brpc 不会把 HTTP 头映射进任何 protobuf 字段，少读一次就表现为"永远不补发"。
 #
 # 用法：
 #   bash scripts/verify-reconnect.sh              # 完整验收
@@ -52,9 +61,10 @@ fail() { failures+=("$1"); echo "x  $1"; }
 ok() { echo "v  $1"; }
 compose() { docker compose -f "$compose_file" "$@"; }
 
-gateway_pid=""; match_pid=""; room_pid=""; sse_pid=""
+gateway_pid=""; match_pid=""; room_pid=""; sse_pid=""; bob_sse_pid=""
 cleanup() {
   [ -n "$sse_pid" ] && kill "$sse_pid" 2>/dev/null
+  [ -n "$bob_sse_pid" ] && kill "$bob_sse_pid" 2>/dev/null
   for pid in "$gateway_pid" "$match_pid" "$room_pid"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       [ "$keep_running" -eq 1 ] && echo "已保留进程 $pid（--keep）" || kill "$pid" 2>/dev/null || true
@@ -455,8 +465,174 @@ else
 fi
 echo
 
-# ---------- 7. 优雅退出 ----------
-echo "===== 7. 优雅退出 ====="
+# ---------- 7. 推送连续性与补发（TASK-017） ----------
+#
+# 这一段验证的是"重连时缺的帧能不能补上"，以及**补不上时是否如实告知**。
+# 为什么必须有独立的端到端断言：单测能证明 StreamHub 与 Room 各自的逻辑，
+# 但"Last-Event-ID 经过 HTTP 头 -> brpc -> Gateway -> Room -> 补发 -> SSE id 行"
+# 这条真实链路只有在这里才会被走通（HTTP 头不会被 brpc 映射进任何字段，
+# 少读一次就表现为"永远不补发"）。
+echo "===== 7. 推送连续性与补发（Last-Event-ID） ====="
+wait_idle
+room4=$(open_playing_room)
+if [ -z "$room4" ]; then
+  fail "无法为补发验收开出对局"
+else
+  ok "对局已开始（room_id=$room4）"
+
+  # bob 持续订阅：只要有一方在线，对局就会继续推进（TASK-016 语义）。
+  curl -sN --max-time 120 -H "Authorization: Bearer $bob_token" \
+    "http://127.0.0.1:$gateway_port/api/v1/stream?room_id=$room4" \
+    >/tmp/rc-sse-bob.out 2>&1 &
+  bob_sse_pid=$!
+  sleep 2
+
+  # 记下一个已经收到的帧号：稍后就用它当 Last-Event-ID，
+  # 于是服务端必须把 (该帧, 当前帧] 之间的帧补发出来。
+  frame_checkpoint=$(room_field "$room4" room.frame)
+  if [ "${frame_checkpoint:-0}" -gt 0 ] 2>/dev/null; then
+    ok "取到补发基准帧 frame=$frame_checkpoint"
+  else
+    fail "对局没有推进，无法取补发基准帧：[$frame_checkpoint]"
+  fi
+
+  # 让对局在"没有 alice 订阅"的情况下继续走几帧。
+  sleep 2
+  frame_now=$(room_field "$room4" room.frame)
+  if [ "${frame_now:-0}" -gt "${frame_checkpoint:-0}" ] 2>/dev/null; then
+    ok "对局在缺口期间继续推进（$frame_checkpoint -> $frame_now）"
+  else
+    fail "对局没有产生缺口：$frame_checkpoint -> $frame_now"
+  fi
+
+  # 带一个落后的 Last-Event-ID 重连。
+  curl -sN --max-time 60 -H "Authorization: Bearer $alice_token" \
+    -H "Last-Event-ID: $frame_checkpoint" \
+    "http://127.0.0.1:$gateway_port/api/v1/stream?room_id=$room4" \
+    >/tmp/rc-sse-replay.out 2>&1 &
+  sse_pid=$!
+  for _ in $(seq 1 40); do
+    grep -q 'session.ready' /tmp/rc-sse-replay.out 2>/dev/null && break
+    sleep 0.25
+  done
+  sleep 1
+
+  # 补发的事件必须带 SSE 的 id 行，且帧号从 checkpoint+1 开始递增。
+  backfill_ids=$(grep -o '^id: [0-9]*' /tmp/rc-sse-replay.out 2>/dev/null | awk '{print $2}')
+  if [ -z "$backfill_ids" ]; then
+    fail "补发的事件没有带 id 行（客户端无法判断连续性）"
+  else
+    ok "补发/推送的事件带上了 id 行"
+    first_id=$(echo "$backfill_ids" | head -1)
+    if [ "${first_id:-0}" -eq $((frame_checkpoint + 1)) ] 2>/dev/null; then
+      ok "补发从缺口的第一帧开始（first id=$first_id）"
+    else
+      fail "补发起点不是 $((frame_checkpoint + 1))：[$first_id]"
+    fi
+    # 缺口中间的帧必须真的出现过：只发"当前帧"是补不上连续性的。
+    if echo "$backfill_ids" | grep -qx "$frame_now"; then
+      ok "补发覆盖到了缺口末端（id=$frame_now）"
+    else
+      fail "补发没有覆盖缺口末端 $frame_now：$(echo "$backfill_ids" | tr '\n' ' ')"
+    fi
+    if grep -q 'event: stream.reset' /tmp/rc-sse-replay.out; then
+      fail "窗口内的补发不应发出 stream.reset"
+    else
+      ok "窗口内补发，没有发 stream.reset（没有让客户端做无谓的全量刷新）"
+    fi
+  fi
+
+  # 补发之后实时推送要接上：帧号继续前进，且与轮询到的一致。
+  frame_replay_1=$(room_field "$room4" room.frame)
+  sleep 2
+  frame_replay_2=$(room_field "$room4" room.frame)
+  if [ "${frame_replay_2:-0}" -gt "${frame_replay_1:-0}" ] 2>/dev/null; then
+    ok "补发之后对局继续推进（$frame_replay_1 -> $frame_replay_2）"
+  else
+    fail "补发之后对局没有继续推进：$frame_replay_1 -> $frame_replay_2"
+  fi
+  # 慢客户端（alice）在窗口外重连之后，bob 应当能在 30 秒宽限期内重新上报 online。
+  online_bob=$(wait_room_field "$room4" room.players.1.online true)
+  if [ "$online_bob" = "true" ]; then
+    ok "补发期间一直订阅的 bob 仍然 online"
+  else
+    fail "bob 在补发期间变成离线：[$online_bob]"
+  fi
+  close_stream
+
+  # ---- 窗口外 / 非法 id：必须 stream.reset，而不是假装补上了 ----
+  # 用一个远超当前帧的 id：服务端无法判断客户端到底有什么，只能要求全量刷新。
+  curl -sN --max-time 30 -H "Authorization: Bearer $alice_token" \
+    -H "Last-Event-ID: 999999" \
+    "http://127.0.0.1:$gateway_port/api/v1/stream?room_id=$room4" \
+    >/tmp/rc-sse-reset.out 2>&1 &
+  sse_pid=$!
+  for _ in $(seq 1 40); do
+    grep -q 'stream.reset\|session.ready' /tmp/rc-sse-reset.out 2>/dev/null && break
+    sleep 0.25
+  done
+  sleep 1
+  if grep -q 'event: stream.reset' /tmp/rc-sse-reset.out; then
+    ok "id 超前时发出 stream.reset（明确要求全量刷新）"
+    grep -q '"reason":"id_ahead"' /tmp/rc-sse-reset.out &&
+      ok "reset 带上了可判定的原因（id_ahead）" ||
+      fail "reset 的原因不是 id_ahead：$(grep -o '"reason":"[^"]*"' /tmp/rc-sse-reset.out | head -1)"
+    # 载荷里必须带完整状态，否则客户端还得自己再查一次。
+    grep -q '"room":{' /tmp/rc-sse-reset.out &&
+      ok "reset 载荷里带上了当前完整状态" ||
+      fail "reset 载荷里没有完整状态"
+  else
+    fail "id 超前时没有发出 stream.reset"
+  fi
+  close_stream
+
+  # 非法 id：同样要求全量刷新，但原因必须不同（这是客户端的 bug，不是首次订阅）。
+  curl -sN --max-time 30 -H "Authorization: Bearer $alice_token" \
+    -H "Last-Event-ID: not-a-number" \
+    "http://127.0.0.1:$gateway_port/api/v1/stream?room_id=$room4" \
+    >/tmp/rc-sse-bad-id.out 2>&1 &
+  sse_pid=$!
+  for _ in $(seq 1 40); do
+    grep -q 'stream.reset\|session.ready' /tmp/rc-sse-bad-id.out 2>/dev/null && break
+    sleep 0.25
+  done
+  sleep 1
+  if grep -q '"reason":"id_malformed"' /tmp/rc-sse-bad-id.out; then
+    ok "非法 Last-Event-ID 被单独识别（reason=id_malformed）"
+  else
+    fail "非法 Last-Event-ID 没有被识别：$(head -3 /tmp/rc-sse-bad-id.out | tr '\n' ' ')"
+  fi
+  close_stream
+
+  # ---- 首次订阅（不带 Last-Event-ID）：不发 reset，按既有行为推当前状态 ----
+  # 这条断言是**双向**的：既要求 stream.reset 不出现，也要求状态确实送达。
+  # 只断言前一半会让"订阅彻底不工作"也通过。
+  curl -sN --max-time 30 -H "Authorization: Bearer $alice_token" \
+    "http://127.0.0.1:$gateway_port/api/v1/stream?room_id=$room4" \
+    >/tmp/rc-sse-first.out 2>&1 &
+  sse_pid=$!
+  for _ in $(seq 1 40); do
+    grep -q 'event: room.state\|event: room.finished' /tmp/rc-sse-first.out 2>/dev/null && break
+    sleep 0.25
+  done
+  sleep 1
+  if grep -q 'event: stream.reset' /tmp/rc-sse-first.out; then
+    fail "首次订阅不应发 stream.reset（缺失该头属正常路径）：$(grep -o '"reason":"[^"]*"' /tmp/rc-sse-first.out | head -1)"
+  elif grep -q 'event: room.state\|event: room.finished' /tmp/rc-sse-first.out; then
+    ok "首次订阅不发 stream.reset，直接推当前状态（等同既有行为）"
+  else
+    fail "首次订阅既没有 reset 也没有状态推送：$(head -3 /tmp/rc-sse-first.out | tr '\n' ' ')"
+  fi
+  close_stream
+
+  kill "$bob_sse_pid" 2>/dev/null
+  wait "$bob_sse_pid" 2>/dev/null
+  bob_sse_pid=""
+fi
+echo
+
+# ---------- 8. 优雅退出 ----------
+echo "===== 8. 优雅退出 ====="
 close_stream
 for pair in "Gateway:$gateway_pid" "Match:$match_pid" "Room:$room_pid"; do
   name="${pair%%:*}"; pid="${pair#*:}"
@@ -482,6 +658,8 @@ if [ "${#failures[@]}" -eq 0 ]; then
   echo "          期内重连后血量与帧号与断线那一刻一致并继续推进；"
   echo "          超过宽限期判断线方负（finish_reason=disconnect）并写入 match_results；"
   echo "          双方都断线则作废且不写结果"
+  echo "  [TASK-017] 带落后的 Last-Event-ID 重连时按帧号补发缺失帧（事件带 id 行）；"
+  echo "          id 超前 / 非法 / 首次订阅分别给出可判定的 stream.reset 与完整状态"
   exit 0
 fi
 
@@ -489,5 +667,5 @@ echo "验收失败 ${#failures[@]} 项："
 for item in "${failures[@]}"; do echo "  - $item"; done
 echo
 echo "排查提示：Gateway /tmp/reconnect-gateway.out，Match /tmp/reconnect-match.out，"
-echo "          Room /tmp/reconnect-room.out，SSE /tmp/rc-sse.out"
+echo "          Room /tmp/reconnect-room.out，SSE /tmp/rc-sse.out（补发见 /tmp/rc-sse-replay.out）"
 exit 1

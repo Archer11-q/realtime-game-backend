@@ -46,6 +46,9 @@ public:
 
     RoomCallStatus GetResult(const std::string& match_id, MatchResultView* out_view) override;
 
+    RoomCallStatus GetSnapshotsSince(const std::string& room_id, std::int64_t since_frame,
+                                     SnapshotRange* out_range) override;
+
     RoomCallStatus SetPresence(const std::string& room_id, const std::string& player_id,
                                bool online, RoomSnapshot* out_snapshot) override;
 

@@ -45,6 +45,8 @@ using rgbt::room::RoomSnapshotReader;
 using rgbt::room::RoomSnapshotRecord;
 using rgbt::room::RoomSnapshotRow;
 using rgbt::room::RoomSnapshotWriter;
+using rgbt::room::SnapshotRange;
+using rgbt::room::SnapshotRangeOutcome;
 using rgbt::room::SnapshotWriteStatus;
 using rgbt::room::SubmitOutcome;
 using rgbt::room::ValidateRoomSnapshot;
@@ -382,6 +384,103 @@ TEST(RoomManagerTest, PlayingCountTracksActiveRooms) {
     EXPECT_EQ(manager.Join("r-fixed", "p-0001", kT0, nullptr), JoinOutcome::kOk);
     EXPECT_EQ(manager.Join("r-fixed", "p-0002", kT0, nullptr), JoinOutcome::kOk);
     EXPECT_EQ(manager.PlayingCount(), 1U);
+}
+
+// ---------------------------------------------------------------------------
+// 历史快照补发（TASK-017）
+//
+// 这一组锁定的是 Gateway 补发逻辑所依赖的**窗口判定**：能不能补齐、为什么补不齐。
+// 窗口外必须如实报告，因为"假装补上了"会让客户端从一段有洞的历史往下接，
+// 而它自己无从发现。
+// ---------------------------------------------------------------------------
+
+/// 夹具：原地持有一个已经推进到 frame_limit 的对局。
+///
+/// 为什么必须是夹具，而不是"返回 RoomManager 的辅助函数"：`RoomManager` 含
+/// `std::mutex`，既不可拷贝也不可移动；按值返回只能指望保证的拷贝消除，
+/// 而那是**非强制的优化**——实测在 GCC 15.2 上直接编译失败
+/// （`use of deleted function RoomManager(const RoomManager&)`）。
+/// 与其依赖编译器，不如让对象待在测试自己的作用域里。
+struct PlayingRoom {
+    RoomManager manager{nullptr, nullptr, nullptr, []() { return std::string("r-fixed"); }};
+
+    explicit PlayingRoom(std::int64_t frame_limit) {
+        OpenPlayingRoom(&manager);
+        AdvanceTo(&manager, kT0, kT0 + frame_limit * kFrameIntervalMs);
+    }
+};
+
+TEST(RoomManagerTest, SnapshotsSinceReturnsReadyWindow) {
+    PlayingRoom room(5);
+    RoomManager& manager = room.manager;
+    const SnapshotRange range = manager.GetSnapshotsSince("r-fixed", 2, kT0 + 5 * kFrameIntervalMs);
+
+    EXPECT_EQ(range.outcome, SnapshotRangeOutcome::kOk);
+    EXPECT_EQ(range.latest_frame, 5);
+    ASSERT_FALSE(range.snapshots.empty());
+    EXPECT_EQ(range.snapshots.back().frame, 5);
+    for (std::size_t i = 1; i < range.snapshots.size(); ++i) {
+        EXPECT_LT(range.snapshots[i - 1].frame, range.snapshots[i].frame);
+    }
+}
+
+TEST(RoomManagerTest, SnapshotsSinceUnknownRoomIsNotFound) {
+    PlayingRoom room(3);
+    RoomManager& manager = room.manager;
+    const SnapshotRange range = manager.GetSnapshotsSince("r-nope", 0, kT0 + 3 * kFrameIntervalMs);
+    EXPECT_EQ(range.outcome, SnapshotRangeOutcome::kNotFound);
+    EXPECT_TRUE(range.snapshots.empty());
+}
+
+TEST(RoomManagerTest, SnapshotsSinceAheadNeedsStrictlyNewerFrame) {
+    // 判据必须是"客户端帧 **严格晚于** 服务端当前帧"，而不是 `>=`。
+    // 相等表示双方停在同一帧（对局刚建好时是常态），那是完全一致，
+    // 把这种情况判成 kAhead 会让每个刚进房的客户端都收到一次无谓的 stream.reset。
+    PlayingRoom room(4);
+    RoomManager& manager = room.manager;
+
+    // 相等：不是超前，也没有缺失帧。
+    const SnapshotRange same = manager.GetSnapshotsSince("r-fixed", 4, kT0 + 4 * kFrameIntervalMs);
+    EXPECT_EQ(same.outcome, SnapshotRangeOutcome::kOk);
+    EXPECT_TRUE(same.snapshots.empty());
+
+    // 严格更新：确实是不一致。
+    EXPECT_EQ(manager.GetSnapshotsSince("r-fixed", 99, kT0 + 4 * kFrameIntervalMs).outcome,
+              SnapshotRangeOutcome::kAhead);
+}
+
+TEST(RoomManagerTest, SnapshotsSinceEvictedFrameIsIncomplete) {
+    // 推进到远超环形缓冲容量的位置，再请求一个早就被挤掉的帧：
+    // 中间有一段已经不在内存里了，必须如实报告"不完整"。
+    PlayingRoom room(400);
+    RoomManager& manager = room.manager;
+    const std::int64_t now = kT0 + 400 * kFrameIntervalMs;
+
+    const SnapshotRange stale = manager.GetSnapshotsSince("r-fixed", 0, now);
+    EXPECT_EQ(stale.outcome, SnapshotRangeOutcome::kIncomplete);
+    EXPECT_GT(stale.latest_frame, 0);
+    EXPECT_GT(stale.oldest_frame, 1);  // 缓冲区确实从中间开始了
+    // 仍然返回已经取到的部分：调用方可以据此判断缺口有多大。
+    EXPECT_FALSE(stale.snapshots.empty());
+
+    // 反过来，请求一个仍在窗口内的帧应当成功——否则上面那条断言可能只是
+    // "永远不完整"这种实现缺陷的表现。
+    const SnapshotRange fresh = manager.GetSnapshotsSince("r-fixed", stale.latest_frame - 1, now);
+    EXPECT_EQ(fresh.outcome, SnapshotRangeOutcome::kOk);
+    ASSERT_EQ(fresh.snapshots.size(), 1U);
+    EXPECT_EQ(fresh.snapshots.front().frame, stale.latest_frame);
+}
+
+TEST(RoomManagerTest, SnapshotsSinceZeroOnEmptyBufferIsReady) {
+    // 房间刚建好、还没推进：没有要补的帧。这不是错误，也不该报"不完整"。
+    RoomManager manager(nullptr, nullptr, nullptr, []() { return std::string("r-fixed"); });
+    ASSERT_EQ(manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr),
+              CreateOutcome::kOk);
+
+    const SnapshotRange range = manager.GetSnapshotsSince("r-fixed", 0, kT0);
+    EXPECT_EQ(range.outcome, SnapshotRangeOutcome::kOk);
+    EXPECT_TRUE(range.snapshots.empty());
+    EXPECT_EQ(range.latest_frame, 0);
 }
 
 // ---------------------------------------------------------------------------

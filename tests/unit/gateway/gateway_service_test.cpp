@@ -241,6 +241,13 @@ public:
         return next_status;
     }
 
+    /// TASK-017：本用例集不验证补发（那是 stream_hub_test 的职责），
+    /// 因此只做最小实现，但**必须实现**——抽象接口不会给默认行为。
+    RoomCallStatus GetSnapshotsSince(const std::string&, std::int64_t,
+                                     rgbt::gateway::SnapshotRange*) override {
+        return RoomCallStatus::kOk;
+    }
+
     /// TASK-016：本用例集不验证 presence 上报（那是 stream_hub_test 的职责），
     /// 因此这里只做最小实现，但**必须实现**——抽象接口不会给默认行为，
     /// 这正是"新增 RPC 会强迫所有调用方表态"的体现。

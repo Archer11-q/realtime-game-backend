@@ -1,16 +1,16 @@
 /// @file stream.test.ts
-/// @brief SSE 解析的单元测试。
+/// @brief SSE 解析与请求头的单元测试。
 ///
 /// 为什么这段逻辑值得单独测：它是整个前端里最容易出错、又最难靠肉眼发现的部分。
 /// 解析错了的表现是「事件偶发丢失」或「JSON.parse 失败被静默吞掉」，
 /// 在浏览器里看起来只是"有时候血条不更新"，几乎不可能稳定复现。
 ///
 /// 这里覆盖的都是 SSE 规范里真实存在的边界，不是凑数：
-/// 注释（心跳）、多行 data、冒号后无空格、CRLF、无 data 行。
+/// 注释（心跳）、多行 data、冒号后无空格、CRLF、无 data 行、id 字段（TASK-017）。
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { decodeEnvelope, parseSseBlock } from './stream'
+import { decodeEnvelope, parseSseBlock, streamRoom } from './stream'
 
 describe('parseSseBlock', () => {
   it('解析带 event 与 data 的普通事件', () => {
@@ -63,6 +63,43 @@ describe('parseSseBlock', () => {
     const event = parseSseBlock('event: x\ndata:')
     expect(event).toEqual({ event: 'x', data: '' })
   })
+
+  // --- TASK-017：id 字段（补发的依据） ------------------------------------
+
+  it('解析 id 行成数字（帧号）', () => {
+    const event = parseSseBlock('id: 42\nevent: room.state\ndata: {"frame":42}')
+    expect(event).toEqual({ event: 'room.state', data: '{"frame":42}', id: 42 })
+  })
+
+  it('id 可以出现在 event 之前', () => {
+    // 服务端固定把 id 写在第一行，但解析不应依赖顺序。
+    const event = parseSseBlock('event: stream.reset\nid: 7\ndata: {}')
+    expect(event?.id).toBe(7)
+  })
+
+  it('没有 id 行时不产生 id 字段', () => {
+    // session.ready 与心跳没有 id。若默认填 0，客户端会把 0 当成
+    // "我收到了第 0 帧"，下次重连时回传一个假的 Last-Event-ID。
+    const event = parseSseBlock('event: session.ready\ndata: {}')
+    expect(event).toEqual({ event: 'session.ready', data: '{}' })
+    expect(event?.id).toBeUndefined()
+  })
+
+  it('id 不是合法数字时忽略它', () => {
+    const event = parseSseBlock('id: abc\nevent: x\ndata: {}')
+    expect(event?.id).toBeUndefined()
+  })
+
+  it('负数 id 被忽略', () => {
+    // 帧号由服务端从 0 单调生成，不存在负数。
+    const event = parseSseBlock('id: -5\nevent: x\ndata: {}')
+    expect(event?.id).toBeUndefined()
+  })
+
+  it('id 为 0 时保留（0 是合法的帧号）', () => {
+    const event = parseSseBlock('id: 0\nevent: x\ndata: {}')
+    expect(event?.id).toBe(0)
+  })
 })
 
 describe('decodeEnvelope', () => {
@@ -75,5 +112,73 @@ describe('decodeEnvelope', () => {
   it('非法 JSON 返回 null 而不是抛异常', () => {
     // 一条坏事件不应该让整个流断掉。
     expect(decodeEnvelope({ event: 'room.state', data: '{坏' })).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Last-Event-ID 请求头（TASK-017）
+// ---------------------------------------------------------------------------
+
+/** 让 fetch 返回一条立刻结束的 SSE 流，并记录它收到的 headers。 */
+function stubFetch(): { headers: Record<string, string> } {
+  const captured: { headers: Record<string, string> } = { headers: {} }
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.close()
+    },
+  })
+  vi.stubGlobal('fetch', (url: string | URL, init?: RequestInit) => {
+    const headers = (init?.headers ?? {}) as Record<string, string>
+    captured.headers = headers
+    return Promise.resolve(
+      new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+    )
+  })
+  return captured
+}
+
+describe('streamRoom 的 Last-Event-ID', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('带 lastEventId 时发送 Last-Event-ID 请求头', async () => {
+    const captured = stubFetch()
+    await streamRoom({
+      roomId: 'r-1',
+      token: 't-1',
+      signal: new AbortController().signal,
+      lastEventId: 42,
+      onEvent: () => undefined,
+    })
+
+    expect(captured.headers['Last-Event-ID']).toBe('42')
+    // token 仍然走 Authorization 头：补发功能不能把凭据挤到查询串里。
+    expect(captured.headers.Authorization).toBe('Bearer t-1')
+  })
+
+  it('不带 lastEventId 时不发送这个头（首次订阅）', async () => {
+    const captured = stubFetch()
+    await streamRoom({
+      roomId: 'r-1',
+      token: 't-1',
+      signal: new AbortController().signal,
+      onEvent: () => undefined,
+    })
+
+    expect(captured.headers['Last-Event-ID']).toBeUndefined()
+  })
+
+  it('lastEventId 为 0 时也要发送（0 是合法帧号）', async () => {
+    const captured = stubFetch()
+    await streamRoom({
+      roomId: 'r-1',
+      token: 't-1',
+      signal: new AbortController().signal,
+      lastEventId: 0,
+      onEvent: () => undefined,
+    })
+
+    expect(captured.headers['Last-Event-ID']).toBe('0')
   })
 })

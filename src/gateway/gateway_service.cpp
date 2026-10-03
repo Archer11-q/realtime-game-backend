@@ -132,6 +132,59 @@ std::string ExtractQueryParam(::google::protobuf::RpcController* controller, con
     return {};
 }
 
+/// `Last-Event-ID` 的解析结果（TASK-017）。
+///
+/// **不需要单独一个 `has_header` 字段**：调用方（以及 StreamHub 的 SubscribeOptions）
+/// 只关心两件事——"有没有一个可用的帧号"（`value`）与"头是不是存在但坏了"
+/// （`malformed`）。再加一个布尔值只会多出一个必须保持一致的状态组合。
+struct LastEventIdHeader {
+    /// 解析出来的帧号；`malformed == true` 时无意义。
+    std::int64_t value = 0;
+    /// 头存在，但解析不成合法的非负整数。
+    bool malformed = false;
+};
+
+/// 从 HTTP 请求中取出 SSE 的 `Last-Event-ID` 头（TASK-017）。
+///
+/// `Last-Event-ID` 是 SSE 规范定义的请求头：浏览器/客户端重连时把它设为**最后收到的
+/// 那个 `id:` 值**，服务端据此补发断线期间错过的事件。本项目的 `id:` 就是房间帧号，
+/// 因此这里解析成一个非负整数。
+///
+/// 解析规则与理由：
+///   * 头不存在 → `value == 0 && !malformed`。这是"第一次订阅"，不是错误。
+///   * 头存在但为空或不是合法的非负十进制整数 → `malformed == true`。
+///     明确区分它与"头不存在"：前者是客户端在说自己有状态却说不清是哪个，
+///     静默当成首次订阅会让它以为自己拿到了连续的事件。
+///   * 负数、带符号、超长数字按非法处理：帧号由服务端从 0 单调生成，不可能是负数。
+///
+/// 为什么在这里解析而不是在 StreamHub 里：只有这里能读到 HTTP 头，而 StreamHub
+/// 不依赖 brpc（它要能被单元测试直接驱动）。把 HTTP 细节留在服务层是本项目一贯的分层。
+LastEventIdHeader ParseLastEventId(::google::protobuf::RpcController* controller) {
+    LastEventIdHeader result;
+    auto* cntl = static_cast<brpc::Controller*>(controller);
+    if (cntl == nullptr || !cntl->has_http_request()) {
+        return result;  // 无 HTTP 上下文（单元测试直接调用服务）：等同"没有这个头"。
+    }
+    const std::string* raw = cntl->http_request().GetHeader("Last-Event-ID");
+    if (raw == nullptr) {
+        return result;
+    }
+    if (raw->empty() || raw->size() > 18) {  // 18 位十进制足够表达任何 int64 帧号
+        result.malformed = true;
+        return result;
+    }
+    std::int64_t value = 0;
+    for (const char ch : *raw) {
+        if (ch < '0' || ch > '9') {
+            result.malformed = true;
+            return result;
+        }
+        value = value * 10 + (ch - '0');
+    }
+    result.value = value;
+    return result;
+}
+
 /// 校验登录请求的输入。返回空字符串表示通过，否则返回失败原因。
 std::string ValidateLoginRequest(const rgbt::gateway::v1::LoginRequest& request) {
     if (request.account().empty()) {
@@ -959,9 +1012,23 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         return;
     }
 
-    const std::uint64_t subscription_id = stream_->Subscribe(
-        player_id, room_id, std::make_unique<ProgressiveAttachmentSink>(attachment));
-    if (subscription_id == 0) {
+    // TASK-017：解析 Last-Event-ID。它决定订阅建立时是否补发缺的帧。
+    // 解析必须在这里完成（只有这里能读到 HTTP 头），StreamHub 只接受结论。
+    //
+    // 注意：**补发结果不在这里**。补发出现在订阅建立之后的第一次 Tick 里
+    // （理由见 StreamHub::Subscribe 的注释），因此返回值里只有订阅 id；
+    // 补发与 stream.reset 的结果由 StreamHub 自己记日志，也可以事后用
+    // `StreamHub::SubscribeReport(id)` 查到。
+    const LastEventIdHeader last_event_id = ParseLastEventId(controller);
+
+    SubscribeOptions subscribe_options;
+    subscribe_options.last_event_id = last_event_id.value;
+    subscribe_options.last_event_id_malformed = last_event_id.malformed;
+
+    const SubscriptionReport subscription = stream_->Subscribe(
+        player_id, room_id, std::make_unique<ProgressiveAttachmentSink>(attachment),
+        subscribe_options);
+    if (subscription.id == 0) {
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::INTERNAL,
                                               "stream_unavailable", "订阅注册失败", request_id);
         response->set_status_code(status);
@@ -971,6 +1038,19 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
 
     // 成功。不写 error、也不写响应体：后续内容全部由 StreamHub 持续写出，
     // 直到对局结束或客户端断开。
+    //
+    // 这一行日志是排障时判断"客户端到底有没有带 Last-Event-ID"的最直接依据：
+    // 补发是否发生由 StreamHub 记，但"请求里有没有那个头"只有这里知道。
+    // （实测踩过同类问题：HTTP 头不会被 brpc 映射进 protobuf 字段，漏读一次
+    // 就表现为"永远不补发"，而链路上没有任何报错。）
+    //
+    // `last_event_id_text` 必须先落到具名变量：`std::to_string(...).c_str()`
+    // 里的临时 std::string 会在整条语句结束时析构，日志拿到的是悬空指针。
+    const std::string last_event_id_text =
+        last_event_id.malformed ? std::string("malformed") : std::to_string(last_event_id.value);
+    std::fprintf(stderr, "[gateway] 订阅已建立：sub=%llu room=%s player=%s last_event_id=%s\n",
+                 static_cast<unsigned long long>(subscription.id), room_id.c_str(),
+                 player_id.c_str(), last_event_id_text.c_str());
     response->set_status_code(200);
     ApplyHttpStatus(controller, 200);
 }

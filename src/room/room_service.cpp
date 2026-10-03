@@ -255,6 +255,53 @@ void RoomServiceImpl::SubmitInput(google::protobuf::RpcController* /*controller*
     }
 }
 
+void RoomServiceImpl::GetRoomSnapshotsSince(
+    google::protobuf::RpcController* /*controller*/,
+    const rgbt::room::v1::GetRoomSnapshotsSinceRequest* request,
+    rgbt::room::v1::GetRoomSnapshotsSinceResponse* response, google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    if (manager_ == nullptr) {
+        SetError(response->mutable_error(), rgbt::room::v1::ROOM_INTERNAL, "room_internal",
+                 "房间管理器未初始化", request->request_id());
+        return;
+    }
+
+    const SnapshotRange range =
+        manager_->GetSnapshotsSince(request->room_id(), request->since_frame(), NowMs());
+
+    response->set_oldest_frame(range.oldest_frame);
+    response->set_latest_frame(range.latest_frame);
+
+    if (range.outcome == SnapshotRangeOutcome::kNotFound) {
+        SetError(response->mutable_error(), rgbt::room::v1::ROOM_NOT_FOUND, "room_not_found",
+                 "房间不存在或已回收", request->request_id());
+        return;
+    }
+
+    // 三种"能查到房间"的情况都返回 200：补不齐不是调用失败，而是一个必须让调用方
+    // 知道的事实。用错误码表达会诱导调用方去重试一个重试一万次也一样的结果。
+    switch (range.outcome) {
+        case SnapshotRangeOutcome::kOk:
+            response->set_status(rgbt::room::v1::SNAPSHOTS_READY);
+            break;
+        case SnapshotRangeOutcome::kIncomplete:
+            response->set_status(rgbt::room::v1::SNAPSHOTS_INCOMPLETE);
+            break;
+        case SnapshotRangeOutcome::kAhead:
+            response->set_status(rgbt::room::v1::SNAPSHOTS_AHEAD);
+            break;
+        case SnapshotRangeOutcome::kNotFound:
+        default:
+            response->set_status(rgbt::room::v1::SNAPSHOT_WINDOW_STATUS_UNSPECIFIED);
+            break;
+    }
+
+    for (const RoomSnapshot& snapshot : range.snapshots) {
+        FillSnapshot(snapshot, response->add_snapshots());
+    }
+}
+
 void RoomServiceImpl::SetPlayerPresence(google::protobuf::RpcController* /*controller*/,
                                         const rgbt::room::v1::SetPlayerPresenceRequest* request,
                                         rgbt::room::v1::SetPlayerPresenceResponse* response,

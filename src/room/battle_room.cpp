@@ -452,4 +452,49 @@ void BattleRoom::PushSnapshot() {
     }
 }
 
+BattleRoom::FrameRange BattleRoom::SnapshotFrameRange() const noexcept {
+    FrameRange range;
+    bool first = true;
+    for (const RoomSnapshot& snapshot : history_) {
+        if (first || snapshot.frame < range.oldest) {
+            range.oldest = snapshot.frame;
+        }
+        if (first || snapshot.frame > range.newest) {
+            range.newest = snapshot.frame;
+        }
+        first = false;
+    }
+    return range;
+}
+
+std::int64_t BattleRoom::MaxSnapshotFrame() const noexcept {
+    std::int64_t max_frame = 0;
+    for (const RoomSnapshot& snapshot : history_) {
+        if (snapshot.frame > max_frame) {
+            max_frame = snapshot.frame;
+        }
+    }
+    return max_frame;
+}
+
+std::vector<RoomSnapshot> BattleRoom::SnapshotsAfter(std::int64_t since_frame) const {
+    std::vector<RoomSnapshot> result;
+    for (const RoomSnapshot& snapshot : history_) {
+        if (snapshot.frame <= since_frame) {
+            continue;
+        }
+        // 同一帧可能有多条（"对方断线了"这类事件会立刻再写一条）。只保留最新的一份：
+        // 补发的目的是让客户端回到"这一帧结束时"的状态，而不是重放这一帧的历史。
+        //
+        // 判据用"帧号相同即替换"而不是"小于前一条才替换"：前者不依赖缓冲有序，
+        // 后者一旦写入顺序被打乱就会静默返回重复帧号。
+        if (!result.empty() && result.back().frame == snapshot.frame) {
+            result.back() = snapshot;
+            continue;
+        }
+        result.push_back(snapshot);
+    }
+    return result;
+}
+
 }  // namespace rgbt::room

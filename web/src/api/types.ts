@@ -109,3 +109,19 @@ export interface SessionReadyPayload {
   room_id?: string
   server_time_ms?: number
 }
+
+/**
+ * `stream.reset` 的载荷（TASK-017）。
+ *
+ * 服务端在「无法补发缺的帧」时发出它：客户端必须按 `room` 里的完整状态刷新，
+ * 而不是把它当成一次普通的增量帧。`reason` 是稳定标识，取值见
+ * `docs/05-api-and-data.md` 第 2 节：id_malformed / id_out_of_window /
+ * id_ahead / id_current。
+ *
+ * 注意**没有** `no_last_event_id`：不带 `Last-Event-ID` 的首次订阅走的仍是
+ * 普通的 `room.state` 推送，服务端不会为此发 reset。
+ */
+export interface StreamResetPayload {
+  reason?: string
+  room?: RoomStateInfo
+}

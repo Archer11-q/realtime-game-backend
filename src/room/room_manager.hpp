@@ -75,6 +75,33 @@ enum class ResultOutcome {
     kUnavailable,
 };
 
+/// 查询历史快照时，"请求的区间能不能补齐"的判定结果（TASK-017）。
+///
+/// 它与 RoomCallStatus 是**两个维度**：后者说"这次调用成不成功"，本枚举说
+/// "成功的前提下，缺的帧补得齐吗"。合并成一个枚举会让调用方在
+/// "Room 挂了"与"Room 好好的但这段历史已经不在内存里了"之间失去区分——
+/// 前者可以稍后重试，后者重试一万次也一样。
+enum class SnapshotRangeOutcome {
+    /// 区间被完整覆盖，`out_snapshots` 里就是全部缺失帧。
+    kOk,
+    /// 房间不存在或已回收。
+    kNotFound,
+    /// 请求的帧号早于环形缓冲中最早的一帧：中间有一段已经不可恢复。
+    kIncomplete,
+    /// 请求的帧号晚于房间当前帧号（正常流程下不会出现）。
+    kAhead,
+};
+
+/// 历史快照查询的返回结果。
+struct SnapshotRange {
+    SnapshotRangeOutcome outcome = SnapshotRangeOutcome::kNotFound;
+    /// 帧号严格递增且不重复的缺失帧。仅 kOk 时保证完整。
+    std::vector<RoomSnapshot> snapshots;
+    /// 环形缓冲当前的帧号区间。缓冲为空时为 0，用于向调用方解释"为什么补不齐"。
+    std::int64_t oldest_frame = 0;
+    std::int64_t latest_frame = 0;
+};
+
 /// 房间注册表。
 class RoomManager {
 public:
@@ -154,6 +181,21 @@ public:
     /// @param now_ms 恢复时刻。由调用方注入，理由与 Tick 相同：
     ///        让"停机期间的帧被丢弃"这条边界能被单元测试精确验证。
     [[nodiscard]] RestoreReport Restore(std::int64_t now_ms);
+
+    /// @brief 查询帧号大于 since_frame 的历史快照（TASK-017）。
+    ///
+    /// 返回的 `snapshots` 保证帧号严格递增且不重复（由 `BattleRoom::SnapshotsAfter`
+    /// 保证），因此 Gateway 可以按序直接写出，不需要再去重或排序。
+    ///
+    /// 完整性判定：把请求区间 `(since_frame, current_frame]` 与环形缓冲区间
+    /// `[oldest, latest]`（左闭右闭）对照——
+    ///   * `since_frame >= current_frame` → `kAhead`（客户端比服务端还新，状态不一致）
+    ///   * `since_frame + 1 < oldest`、或缓冲为空而请求区间非空 → `kIncomplete`
+    ///   * 其余 → `kOk`
+    /// **不完整时不假装完整**：调用方（Gateway）据此给客户端一个明确的
+    /// `stream.reset`，而不是让它从这段残缺的历史往后接。
+    [[nodiscard]] SnapshotRange GetSnapshotsSince(const std::string& room_id,
+                                                  std::int64_t since_frame, std::int64_t now_ms);
 
     /// @brief 推进所有房间，并处理结果落库与房间回收。由定时线程调用。
     void Tick(std::int64_t now_ms);

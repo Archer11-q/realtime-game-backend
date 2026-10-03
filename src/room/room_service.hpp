@@ -49,6 +49,11 @@ public:
                         rgbt::room::v1::GetMatchResultResponse* response,
                         google::protobuf::Closure* done) override;
 
+    void GetRoomSnapshotsSince(google::protobuf::RpcController* controller,
+                               const rgbt::room::v1::GetRoomSnapshotsSinceRequest* request,
+                               rgbt::room::v1::GetRoomSnapshotsSinceResponse* response,
+                               google::protobuf::Closure* done) override;
+
     void SetPlayerPresence(google::protobuf::RpcController* controller,
                            const rgbt::room::v1::SetPlayerPresenceRequest* request,
                            rgbt::room::v1::SetPlayerPresenceResponse* response,

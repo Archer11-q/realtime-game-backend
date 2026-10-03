@@ -234,7 +234,7 @@ export function useGameSession() {
   }
 
   /**
-   * 订阅房间推送，并带上自动重连（TASK-016 前端部分）。
+   * 订阅房间推送，并带上自动重连（TASK-016 前端部分、TASK-017 补发）。
    *
    * 重连窗口就是 Gateway 的 30 秒宽限期：期内重连成功，对局接着打；
    * 超过宽限期判断线方负。因此这里的重试预算（1/2/4/5/5 秒）刻意压在 17 秒内，
@@ -242,8 +242,10 @@ export function useGameSession() {
    *
    * 状态与重连的关系：
    *   * session.ready 只说明「流通了」，不重置退避——真正重置的是收到带 payload
-   *     的事件（room.state / room.finished），由 push.resetBudget() 表达。
+   *     的事件（room.state / room.finished / stream.reset），由 push.resetBudget() 表达。
    *   * room.finished 是终局：立刻 stop()，不再重连，也不会留下定时器。
+   *   * 重连时带上 `Last-Event-ID`：服务端据此补发这期间错过的帧；
+   *     补不上时回一条 `stream.reset`，客户端按它载荷里的完整状态刷新。
    */
   function startStream(roomId: string): void {
     stopStream()
@@ -253,22 +255,35 @@ export function useGameSession() {
     streamStatus.value = 'connecting'
 
     const connection = connectRoomPush({
-      run: (signal) =>
-        streamRoom({
+      run: (signal) => {
+        // TASK-017：把"上一次收到的最后一帧"作为 Last-Event-ID 带上去。
+        // 首次订阅时为 -1（不带这个头），服务端会先回一条 stream.reset 附当前完整状态。
+        // **注意必须在这里读**：run 每次重连都会被调用，读的是那一刻的值，
+        // 因此退避期间收到的任何一帧都会自然进入下一次尝试。
+        const lastEventId = lastSequence.value
+        return streamRoom({
           roomId,
           token: token.value,
           signal,
+          lastEventId: lastEventId >= 0 ? lastEventId : undefined,
           onEvent: (event) => {
             if (event.event === 'session.ready') {
               streamStatus.value = 'connected'
               return
             }
             const envelope = decodeEnvelope<StreamEnvelope<RoomStateInfo>>(event)
-            if (envelope?.payload === undefined) {
+            // stream.reset（TASK-017）：服务端无法补发缺的帧，要求按当前状态全量刷新。
+            // 载荷的形状是 { reason, room }，因此这里把 room 取出来用**同一段逻辑**落地——
+            // 不能新增一条"只更新部分状态"的路径，那会制造第二种真相。
+            const payload =
+              event.event === 'stream.reset'
+                ? (envelope?.payload as { room?: RoomStateInfo } | undefined)?.room
+                : envelope?.payload
+            if (payload === undefined) {
               return
             }
-            room.value = envelope.payload
-            if (typeof envelope.sequence === 'number') {
+            room.value = payload
+            if (typeof envelope?.sequence === 'number') {
               lastSequence.value = envelope.sequence
             }
             // 收到真实数据：链路确实通了，退避预算回到起点。
@@ -282,7 +297,8 @@ export function useGameSession() {
               void finishBattle()
             }
           },
-        }),
+        })
+      },
       onStatus: (status) => {
         streamStatus.value = status
         // 重试次数是状态的派生值，不单独维护一个可能跑偏的计数器：
