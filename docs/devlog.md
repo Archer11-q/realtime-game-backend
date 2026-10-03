@@ -2471,6 +2471,88 @@ bash scripts/verify-all.sh                                        # 7/7 通过�
 - 登录、结果查询等路径尚未补结构化日志（当前覆盖的是关键路径）。
 - `verify-all.sh` 尚未把 `verify-observability.sh` 纳入常规门禁。
 
+## TASK-019 指标暴露（2026-10-03）
+
+### 完成
+
+- `include/common/metrics.hpp` + `src/common/metrics.cpp`：counter / gauge /
+  histogram 三种类型 + Prometheus 文本导出。**不引入 prometheus-cpp**：需要的类型
+  只有三种，而文本暴露格式本身就是协议；新依赖会扩大构建时间与迁移面。
+- `api/proto/metrics.proto` + `include/common/metrics_service.hpp` +
+  `src/common/metrics_service.cpp`：三个服务在**各自端口**上注册同一个
+  `MetricsService`，因此 Prometheus 分别抓三个端口即可，不需要聚合进程。
+- 指标接入：
+  - Gateway：`rgbt_http_requests_total{path,status}`（记账放在 `ApplyHttpStatus`
+    这个唯一收敛点）、`rgbt_sse_connections`、`rgbt_push_backfilled_frames`、
+    `rgbt_push_reset_total{reason}`。
+  - Match：`rgbt_match_queue_length`、`rgbt_match_events_total{event}`（enqueued /
+    rejected / paired / canceled）。
+  - Room：`rgbt_rooms{phase}`（六个阶段）、`rgbt_room_frames_advanced_total`
+    （所有房间帧号之和）。
+- `scripts/verify-observability.sh` 增加 `--metrics`；`verify-all.sh` 把它纳入
+  常规门禁（现为 8 个脚本）。
+
+### 决策
+
+1. **counter 用句柄**：首次注册解析一次（内部要加锁查表），此后事件路径上只剩一次
+   原子加。句柄指向的单元由 `unique_ptr` 持有，容器扩容不会让它失效（有测试锁定）。
+2. **gauge 用回调而不是 `Set`**：gauge 是"此刻的状态"（连接数、房间数），而状态本来
+   就有唯一来源。采集时去问那个来源，就不会出现"忘了更新导致数值僵死"；`Set` 则要求
+   每个状态变更点都记得调用。队列长度、房间数、SSE 连接数、补发帧数全部走这条。
+3. **注册即存在**：一次也没 `Add` 的 counter 也导出为 0。否则"计数是 0"与"指标还没
+   创建"在采集端无法区分，而这两者对排障的含义完全不同。
+4. **导出前做快照，不持锁渲染**：gauge 回调会去问业务对象（可能拿它们自己的锁），
+   在指标表的锁内调用它们会把两把锁串起来。
+5. **响应体写进 `Controller::response_attachment()`**，不写 protobuf 字段：
+   restful 暴露的 protobuf 响应会被序列化成 JSON，只设字段时 `GET /metrics` 回的是
+   `200` + `{}`，而 **Prometheus 会把它当成"空指标集"静默接受**。
+
+### 踩到并修掉的问题
+
+1. **没有 restful 映射 → 404**：brpc 收到 `GET /metrics` 是按**路径**在映射表里找
+   方法，不是按 service/method 名找。Match/Room 原本没有映射。
+2. **响应体写错地方 → 200 但内容是 `{}`**（见决策 5）。
+3. **brpc 头文件泄漏进被广泛包含的头**：为声明 `const brpc::Controller*` 而
+   include `<brpc/controller.h>`，触发 glog 的"没有被正确包含"报错（glog 要求导出宏
+   在它之前定义）。改为声明用 `google::protobuf::RpcController*`、实现里 downcast。
+4. **`Gauge` 最初不支持标签** → 六个阶段的房间数同名，被按名字去重成一条，
+   **而且不报任何错**，面板上只是少五条曲线。这正是"静默丢指标"，已改为
+   `(name, labels)` 联合判定，并补两个单元测试锁住。
+5. **Match 指标的记账点选错**：最初做进 `MatchQueue`，队列内部返回
+   `EnqueueOutcome` 的路径分散在多处且形式不统一（有直接 `return`、有赋值后
+   `return`），逐个注入必然漏。完整回滚后改到服务层——`EnqueueMatch` 里四种结果汇成
+   一个 `outcome` 变量，一处插入覆盖全部分支。
+6. **验收脚本自身三个判据错误**（都是断言写错，不是产品错）：
+   - 基线取在第一次请求**之前**，样本还不存在（MISSING）→ 被判成"没有增长"；
+   - 用 `login` 计量 Gateway 增长，而它只发生两次且都早于基线 → 必然 2→2。
+     改用基线之后确实还会被调用的读路径 `/api/v1/matches/current`；
+   - 结构化的"断行检测"跑在服务退出**之前**，而 Room 在优雅退出时会再写一条
+     `presence_reported`，导致"含固定字段的行数"比"ts= 开头行数"多一，被误判为
+     "日志被换行截断"。移到退出之后即可。
+
+### 验证
+
+```bash
+cmake --build --preset brpc-debug            # 0 error / 0 warning
+ctest --test-dir build/brpc-debug            # 269/269（TASK-018 为 253，本任务新增 16）
+bash scripts/check-format.sh                 # 通过（82 文件）
+bash scripts/verify-observability.sh --logs    # 退出码 0（TASK-018）
+bash scripts/verify-observability.sh --metrics # 退出码 0（TASK-019）
+bash scripts/verify-all.sh                   # 8/8 通过，206 秒
+```
+
+`--metrics` 的关键实测（一次真实对局期间）：
+
+- Gateway HTTP 计数 1 → 2；Match 配对 0 → 1；Room 帧推进 134 → 213；
+- 三个端点的样本都带 `# TYPE`，`Content-Type` 都是 `text/plain; version=0.0.4`；
+- 标签里没有 `room_id`/`player_id`/`token`（高基数会把 Prometheus 拖垮，且不报错）；
+- Room 导出全部 6 个阶段。
+
+### 未纳入本任务
+
+- `verify.sh` 与 `verify-all.sh` 的旧文档注释里仍写着"7 个脚本"，本次已更新为 8 个。
+- 任务单里提到的 brpc 调用数与失败数、以及 Match/Room 的快照写入成功失败数
+  **未实现**：这三个计数需要改动客户端实现与快照写入路径，属下一轮范围。
 ## CI 格式门禁的版本漂移（2026-10-03）
 
 **现象**：PR #16 与 #17 的三个预设（debug / release / asan）**全部失败**，且都发生在

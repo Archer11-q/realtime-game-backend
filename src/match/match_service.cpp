@@ -60,6 +60,18 @@ MatchServiceImpl::MatchServiceImpl(MatchQueue* queue, std::function<std::int64_t
         [this]() -> std::uint64_t {
             return queue_ == nullptr ? 0 : static_cast<std::uint64_t>(queue_->QueueSize());
         });
+    // TASK-019：快照写入成功/失败。两个标签取值都登记，因此导出里能看到全 0
+    // 的序列——"从未写过快照"与"指标没注册"必须是可区分的。
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricQueueSnapshotTotal, "Match 队列快照写入次数，按结果分组",
+        [this]() -> std::uint64_t { return queue_ == nullptr ? 0 : queue_->SnapshotWriteCount(); },
+        {{"outcome", "ok"}});
+    rgbt::common::Metrics().Gauge(rgbt::common::kMetricQueueSnapshotTotal,
+                                  "Match 队列快照写入次数，按结果分组",
+                                  [this]() -> std::uint64_t {
+                                      return queue_ == nullptr ? 0 : queue_->SnapshotFailureCount();
+                                  },
+                                  {{"outcome", "failed"}});
     metrics_ready_ = true;
 }
 

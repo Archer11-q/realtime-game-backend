@@ -1220,7 +1220,10 @@ Phase 2 已全部完成并合并（TASK-013 ~ TASK-017，`main` 含至 PR #15）
 
 ### TASK-019：指标暴露（`/metrics`）
 
-- 状态：待确认（开工前由项目所有者确认）
+- 状态：**部分完成**（2026-10-03）。核心已落地并实测通过：模块、三个服务的端点与
+  主要指标、`verify-observability.sh --metrics` 验收、`verify-all.sh` 门禁均已就绪；
+  **brpc 调用数与快照写入成功/失败数未实现**，见文末「剩余范围」。
+  完整经过与实测数字见 `docs/devlog.md` 的「TASK-019 指标暴露」。
 - 依赖：无（可与 TASK-018 并行）
 - 背景问题：`docs/04-quality-and-observability.md` 第 4 节列了 8 类指标的清单，
   但至今**一个都没有暴露**。`StreamHub` 已经有可断言的计数器
@@ -1254,6 +1257,24 @@ Phase 2 已全部完成并合并（TASK-013 ~ TASK-017，`main` 含至 PR #15）
 - 验收命令：`bash scripts/verify-observability.sh --metrics` + 既有全套回归。
 - 测试要求：单元测试覆盖文本格式与计数语义；端到端断言计数与真实事件一一对应。
 - 回退方式：`git revert`；指标是旁路，去掉后退回无指标状态。
+- 已完成（2026-10-03）：
+  - `include/common/metrics.*`（counter/gauge/histogram + 文本导出）、
+    `api/proto/metrics.proto` + `MetricsService`（三个服务各自端口注册）；
+  - Gateway：`rgbt_http_requests_total{path,status}`、`rgbt_sse_connections`、
+    `rgbt_push_backfilled_frames`、`rgbt_push_reset_total{reason}`；
+  - Match：`rgbt_match_queue_length`、`rgbt_match_events_total{event}`；
+  - Room：`rgbt_rooms{phase}`（6 个阶段）、`rgbt_room_frames_advanced_total`；
+  - `scripts/verify-observability.sh --metrics` 与 `verify-all.sh` 门禁；
+  - 实测：构建 0 error/0 warning；ctest 269/269；格式 82 文件通过；
+    `--logs` 与 `--metrics` 均退出码 0；`verify-all.sh` **8/8 通过**。
+- 剩余范围（未完成）：
+  - **brpc 调用数与失败数**（Gateway 的 `MatchClient`/`RoomClient`）。
+    这一项**留到 TASK-021（trace 贯通）一起做**：调用数与失败数要按
+    `target`（match/room）与 `outcome`（ok/failed）分组，而这条路径同时是
+    trace 传播的路径，两件事共用一个挂钩点，分开做要改两遍。
+  - 快照写入成功/失败数**已完成**（Match 的 `PersistSnapshot`、
+    Room 的 `FlushSnapshots` 早已在计数，本次暴露为
+    `rgbt_queue_snapshot_total{outcome}` 与 `rgbt_snapshot_write_total{outcome}`）。
 
 ### TASK-020：Prometheus + Grafana 接入
 

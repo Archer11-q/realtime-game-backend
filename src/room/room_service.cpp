@@ -138,6 +138,21 @@ RoomServiceImpl::RoomServiceImpl(RoomManager* manager, std::function<std::int64_
                        ? 0
                        : static_cast<std::uint64_t>(manager_->TotalFramesAdvanced());
         });
+    // TASK-019：房间快照写入成功/失败。RoomManager 早已在计数
+    // （`SnapshotWriteCount` / `SnapshotFailureCount`），这里只是把它暴露出来，
+    // 不再维护第二份计数。
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricSnapshotWriteTotal, "Room 快照写入次数，按结果分组",
+        [this]() -> std::uint64_t {
+            return manager_ == nullptr ? 0 : manager_->SnapshotWriteCount();
+        },
+        {{"outcome", "ok"}});
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricSnapshotWriteTotal, "Room 快照写入次数，按结果分组",
+        [this]() -> std::uint64_t {
+            return manager_ == nullptr ? 0 : manager_->SnapshotFailureCount();
+        },
+        {{"outcome", "failed"}});
     metrics_ready_ = true;
 }
 
