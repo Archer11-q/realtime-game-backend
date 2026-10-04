@@ -435,7 +435,7 @@ class Bot:
             # test_credentials.cpp 的 IsSyntheticBenchAccount 严格对应。
             if index >= BENCH_MAX:
                 raise SystemExit(
-                    f"--players 超过合成账号上限 {BENCH_MAX}（benh-{BENCH_DIGITS} 位）"
+                    f"--players 超过合成账号上限 {BENCH_MAX}（bench-{BENCH_DIGITS} 位）"
                 )
             self.account = f"{BENCH_PREFIX}{index:0{BENCH_DIGITS}d}"
             self.password = BENCH_PASSWORD

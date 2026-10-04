@@ -3069,70 +3069,7 @@ bash scripts/verify-all.sh               # 9/9 通过，236 秒
   删除不会丢提交。清理与否由项目所有者决定（本次只删了 TASK-021 那条，
   因为它是本轮搬移的直接产物）。
 
-## TASK-022 进行中记录（2026-10-04）
-
-> 本节是**编码过程中的记录**，最终容量报告与瓶颈结论见 `docs/benchmarks/`。
-> 任务完成时会在本文件补一节完整的「TASK-022 实施记录」。
-
-### 前置探测（项目所有者要求的两个问题，实测回答）
-
-- **压测客户端形态**：`wrk`/`wrk2`/`hey`/`bombardier`/`ab`/`siege`/`vegeta`/`k6`/`locust`
-  **一个都没有**；`sudo -n` **不可用**，装不了。可用的是 `python3 3.14.4`（含 `asyncio`）、
-  `requests`（**阻塞**，压测不可用）、`gcc/g++ 15.2`、`cmake 4.2.3`。
-  决定：**自研 Python asyncio 机器人**。理由不是"装不上"，而是 `wrk`/`hey` 只能打
-  静态 HTTP，恰好绕开本系统真正的四个瓶颈候选（SSE 扇出、房间帧推进、每秒快照写入、
-  匹配队列写入）——用它测出来的好看数字回答不了本任务的问题。
-- **1000 连接可行性**：`/proc/sys/fs/file-max` 与 `nr_open` 实际无上限（9.2e18 / 2.1e9），
-  已分配 fd 仅 2386；但 **shell `ulimit -n` 只有 10240**，服务端与压测端都必须显式提高，
-  否则失败原因是 EMFILE 而不是被测系统的行为。CPU 16 核；内存 11 GiB（Docker 同样 11 GiB）
-  是真正的约束。MySQL `max_connections=151`、Redis `maxclients=10000`。
-
-### 一个必须规避的坑：request_id 幂等键没有玩家维度
-
-`RedisSessionStore::KeyForLoginIdempotency` 拼的是 `<env>:gateway:idem:login:<request_id>`，
-**不含 player_id**。而现有测试与验收脚本普遍用 shell 的 `$RANDOM` 生成 request_id
-（只有 32768 种取值）。压测机器人如果照做，撞号时会**拿到别人的 Token**，整轮压测静默
-退化成"少数几个玩家在打"。因此 `bench/loadgen.py` 的每一处 request_id 都用 `uuid4`。
-
-### 已发现并修掉的三个真实缺陷（都在压测工具自身）
-
-1. **匿名命名空间里的时钟**：`logging.cpp` 只有 `SystemNowMs()`，HTTP 耗时统计需要微秒。
-   新增 `rgbt::common::NowUs()`。**刻意与日志时间戳同源**（同一个 `system_clock`，
-   只是分辨率不同）：若计时改用 `steady_clock`，"日志说请求在 T 时刻结束"与
-   "这次耗时 3 ms"就来自两个时基，时钟跳变时互相矛盾。代价是 NTP 回拨会算出负耗时，
-   因此 `RecordHttpLatency` **显式丢弃**负值观测（归零会落进第一个桶、把分位数拉低）。
-2. **`Stats` 少了 `attack_rejections` 字段**：`attack()` 在记录失败原因时抛
-   `AttributeError`，而异常发生在计数之前——**攻击失败根本没被记录**。
-   是压测工具里最危险的一类错误：统计自欺。已修，并在异常文字里带上类名与消息
-   （只记类名的话，"`AttributeError`"这种线索等于没有，本次实测踩到）。
-3. **重入队立刻拿回上一局的旧房间**：Match 的已配对结果保留
-   `kDefaultResultTtlMs`（120 秒），于是"打完一局 -> 立刻重新入队"会拿到上一局的
-   `room_id`，再 `JoinRoom` 必然 409 `room_already_finished`。实测证据：91 次配对里
-   **86 次进房被拒**，稳态压测退化成"反复撞已结束的房间"。
-   修法是机器人记住 `last_finished_room` 并跳过该结果（新增 `stale_result_skipped` 计数）。
-
-另外修掉两处误报：`stream.reset` 的原因此前全部记成 `unknown`（漏了下钻 SSE 的
-`payload.room` 那一层），以及 `AttributeError` 只记类名不记文字。
-
-### 环境残留导致的一次假失败（值得记进 Runbook）
-
-对着**残留的旧服务进程**跑压测时，症状是 `join_room` 全部 404、而 Room 侧
-**一条结构化日志都没有**、Match 侧也没有 `create_room_*`。原因是端口被上一轮残留的
-服务占着："配对"发生在旧 Match 里，新 Room 从未收到 `CreateRoom`。
-在干净环境（端口预检 + 清 Redis/rooms）下同样的负载**0 异常、3 局全部 `hp_zero` 收尾**。
-教训：压测脚本**必须**先做端口预检与状态清理，否则失败原因与真实缺陷毫无关系
-——这与 TASK-021 的 verify-trace.sh 踩到的第三个坑是同一类。
-
-### 延迟直方图（TASK-020 遗留项）已接通
-
-- `MetricsRegistry::Observe` 新增**自定义桶边界**重载：HTTP 端点的 SLO 是
-  P95 < 100 ms、P99 < 250 ms，而默认桶（1 ms ~ 5 s）把这两条线放进同一个桶，
-  读不出"达标了吗"。边界只在**首次**注册时生效，避免运行中换刻度。
-- Gateway 的 11 个处理函数入口各取一次 `NowUs()`，`ApplyHttpStatusAndRecord`
-  多收一个 `start_us` 形参；`start_us == 0` 时**不观测**（宁可不记，也不记一个假的 0）。
-  51 处调用点已补齐。非 `/api/v1/` 前缀（brpc 内置端点）不记。
-- 单元测试 `ctest` 269 -> 280（新增 5 个：自定义桶、首注生效、业务请求产生观测、
-  无 HTTP 上下文不观测、非业务路径不观测），全绿 0 warning。
+> **2026-10-04 清理说明**：此处原有一段「TASK-022 进行中记录」。它写在发现**账号池缺陷之前**，其中的配对/攻击数字来自复用 3 个种子账号的那一版，已被证明是夹具假象（详见下一节）。为避免过期数字被当成结论，整段删除；其中有效的方法学教训已并入下一节。
 
 ## TASK-022 实施记录（2026-10-04）
 
