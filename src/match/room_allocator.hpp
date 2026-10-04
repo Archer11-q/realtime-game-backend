@@ -37,12 +37,26 @@ public:
     /// @param match_id 已生成的匹配 ID。实现应把它交给 Room Service 作为**幂等键**，
     ///        保证重复分配得到同一个房间。
     /// @param player_ids 本局玩家。Room 据此建立成员名单。
+    /// @param request_id 这次配对所属请求的关联 id（TASK-021）。实现应把它**透传**
+    ///        给 Room，使 Room 的 `room_created` 与 Gateway 的 `request_done`、
+    ///        Match 的 `match_enqueued` 能用同一个 trace 串起来。
+    ///
+    ///        **为什么必须单独一个参数、而不是复用 match_id**：TASK-008 时期这里写的是
+    ///        `request_id = match_id`——一个由服务端生成的伪 id。于是 Room 侧记下的
+    ///        trace 在 Gateway 与 Match 的日志里**根本不存在**，"匹配 → 建房间"这条
+    ///        跨服务链路实际上是断的（TASK-021 用实测数据确认）。
+    ///
+    ///        **配对是异步的**，因此这里的取值不是"发起配对的客户端"，而是
+    ///        "该组队首玩家的 request_id"——由 `MatchQueue` 决定
+    ///        （见其 `TakePairGroupsLocked`）。空字符串表示没有可用的关联 id，
+    ///        此时实现**不得编造一个**（宁缺勿假，与 logging.hpp 的口径一致）。
     /// @return 房间号；无法分配时返回空字符串，调用方按失败处理。
     ///
     /// **调用约定**：本方法会发起网络调用，调用方**不得在持有自己的锁时调用它**，
     /// 否则一次对端超时会把整个匹配队列卡住。
     [[nodiscard]] virtual std::string Allocate(std::string_view match_id,
-                                               const std::vector<std::string>& player_ids) = 0;
+                                               const std::vector<std::string>& player_ids,
+                                               std::string_view request_id) = 0;
 };
 
 /// @brief 占位实现：由 match_id 直接派生 room_id。
@@ -53,7 +67,8 @@ public:
 class DerivedRoomAllocator final : public RoomAllocator {
 public:
     [[nodiscard]] std::string Allocate(std::string_view match_id,
-                                       const std::vector<std::string>& player_ids) override;
+                                       const std::vector<std::string>& player_ids,
+                                       std::string_view request_id) override;
 };
 
 }  // namespace rgbt::match

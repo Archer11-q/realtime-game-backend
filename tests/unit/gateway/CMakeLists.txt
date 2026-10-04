@@ -15,6 +15,16 @@ add_executable(
 
 target_link_libraries(rgbt_gateway_tests PRIVATE rgbt_gateway_lib GTest::gtest_main)
 
+# TASK-021：测试直接构造 `brpc::Controller` 来驱动 HTTP 路径（`request_done` 的
+# `op=` 由请求 URI 推导，没有真实的 Controller 就测不到）。
+#
+# 这里必须显式链接 brpc，而不能只靠 `rgbt_gateway_lib` 传递：库把它作为 PRIVATE
+# 依赖，因此 brpc 的**接口编译定义**（vcpkg 的 glog 要求 `GLOG_USE_GLOG_EXPORT`
+# 与 `GLOG_USE_GFLAGS`）不会传到测试目标。缺了它们的表现是连 brpc 头文件都编不过
+# ——报错是 `<glog/logging.h> was not included correctly`，看不出与 brpc 有关。
+find_package(unofficial-brpc CONFIG REQUIRED)
+target_link_libraries(rgbt_gateway_tests PRIVATE unofficial::brpc::brpc)
+
 # 测试目标使用 rgbt_set_test_warnings 而不是项目级告警策略：
 # GTest 的 TEST_F 宏生成的静态函数会被 -Wunused-function 误报。
 rgbt_set_test_warnings(rgbt_gateway_tests)

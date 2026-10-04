@@ -107,13 +107,43 @@
 
 ### 链路追踪
 
-优先追踪：
+**已实现（TASK-018 ~ TASK-021）**：不引入 OpenTelemetry SDK、也不部署 OTLP
+collector（这是项目所有者 2026-10-02 确认的决策）。做法是**共用同一个 id 写进三个
+服务的结构化日志**，满足"任一错误可以定位到服务、请求、会话或房间"这条退出标准；
+真正的 span 导出留到需要时再评估（它需要额外的 C++ 依赖与 collector）。
 
-- 登录。
-- 进入/取消匹配。
-- 创建/加入房间。
-- 断线重连。
-- 对局结果的幂等写入。
+约定：
+
+- **id 就是 `request_id`**，经 proto 的既有字段在 Gateway → Match → Room 之间透传，
+  **不新增契约字段**。Gateway 的每个 HTTP 响应都会留下一条
+  `event=request_done`（含 `op=`、`status=`、`trace=`），因此"每个请求都可检索"不依赖
+  谁来记得加日志。
+- **配对这类异步环节取"该组队首玩家"的 request_id**。配对可能由第二个玩家入队触发，
+  也可能由轮询触发的惰性重试触发；取队首才与"谁触发"无关，因此确定、可复现。
+- **没有 id 时不编造**：`request_id` 为空的行不输出 `trace=` 字段，也不生成伪 id。
+  （这一条是有代价的：这类请求只能靠 `op=` 与时间定位。宁可少一个字段，也不要一个
+  在别处查不到的假 id。）
+- **不做跨服务的时序排序断言**：三个进程各自取系统时钟，毫秒级先后会受调度影响，
+  那不是缺陷。可判据是"两边有同一个 trace"，即因果关系，而不是时钟先后。
+  单个服务内部仍要求同一 trace 的时间戳单调不减。
+
+优先追踪的五条路径与它们的落点：
+
+| 路径 | 跨服务环节 |
+|---|---|
+| 登录 | Gateway `request_done(op=login)` |
+| 进入匹配 | Gateway `match_enqueue_ok` → Match `match_enqueued` → Room `room_created` |
+| 创建/加入房间 | Gateway `request_done(op=join_room)` → Room `room_joined` |
+| 断线重连 | Gateway `subscribe_ready` → Room `presence_reported`（在线/离线两次） |
+| 对局结果 | Gateway `request_done(op=get_match_result)` → Room `match_result_queried` |
+
+对局结果的**写入**发生在 Room 的推进线程上，没有请求上下文，因此它用 `match_id`
+关联（见 `room_manager.cpp` 的 `result_persist_failed`）——这是有意的不对称：
+"这一局的结果写失败了吗"问的是对局，不是某一次 HTTP 请求。
+
+验收命令：`bash scripts/verify-trace.sh`（也可经 `scripts/verify-all.sh` 一起跑）。
+它逐条断言上表五行，并检查"未带 `request_id` 时不编造 trace"与"结构化行没有被
+字段值断行"两条不变量。
 
 > **不使用消息队列**，因此没有消费位点、Lag、死信和重复消费相关的测试与指标，
 > 见 [ADR-0003](adr/0003-scope-reduction.md)。

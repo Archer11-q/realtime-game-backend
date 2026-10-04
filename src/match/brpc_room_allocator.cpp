@@ -37,7 +37,8 @@ BrpcRoomAllocator::BrpcRoomAllocator(RoomAllocatorOptions options)
 BrpcRoomAllocator::~BrpcRoomAllocator() = default;
 
 std::string BrpcRoomAllocator::Allocate(std::string_view match_id,
-                                        const std::vector<std::string>& player_ids) {
+                                        const std::vector<std::string>& player_ids,
+                                        std::string_view request_id) {
     if (match_id.empty() || player_ids.empty()) {
         return {};
     }
@@ -45,7 +46,14 @@ std::string BrpcRoomAllocator::Allocate(std::string_view match_id,
     rgbt::room::v1::RoomService_Stub stub(&impl_->channel);
 
     rgbt::room::v1::CreateRoomRequest request;
-    request.set_request_id(std::string(match_id));
+    // TASK-021：`request_id` 是**上游传来的关联 id**（该组队首玩家那次入队请求的 id），
+    // 与幂等键 `match_id` 是两件事。
+    //
+    // 修复前这里写的是 `set_request_id(std::string(match_id))`：Room 的 `room_created`
+    // 因此记录了一个在 Gateway 与 Match 日志里都不存在的 id，"匹配 → 建房间"这条
+    // 跨服务链路实际上是断的。**幂等键仍然是 match_id**，所以换掉它不影响任何
+    // 幂等行为——只是日志里终于能串起来了（这就是 TASK-021 要解决的事）。
+    request.set_request_id(std::string(request_id));
     request.set_match_id(std::string(match_id));
     for (const std::string& player_id : player_ids) {
         request.add_player_ids(player_id);
@@ -56,16 +64,22 @@ std::string BrpcRoomAllocator::Allocate(std::string_view match_id,
     controller.set_timeout_ms(impl_->options.timeout_ms);
     stub.CreateRoom(&controller, &request, &response, nullptr);
 
+    // 失败日志沿用同一个 trace（而不是 match_id）：此时 Room 侧可能什么都没写，
+    // "Match 知道这次调用失败了"与"Room 那边有没有记录"要能在同一条链上对上。
+    // 另外把 match_id 作为独立字段保留——它的作用是定位是哪一局，
+    // 在队列里 match_id 与 trace 不再混为一谈。
+    const std::string trace(request_id);
     if (controller.Failed()) {
         // 传输失败或对端未启动。返回空串让调用方把玩家放回队列，
         // 而不是在这里重试——重试会延长持锁之外的处理时间，也会掩盖故障。
-        rgbt::common::LogError("create_room_call_failed", std::string(match_id),
-                               {{"err", controller.ErrorText()}});
+        rgbt::common::LogError("create_room_call_failed", trace,
+                               {{"match", std::string(match_id)}, {"err", controller.ErrorText()}});
         return {};
     }
     if (response.error().code() != rgbt::room::v1::ROOM_ERROR_CODE_UNSPECIFIED) {
-        rgbt::common::LogError("create_room_rejected", std::string(match_id),
-                               {{"reason", response.error().reason()}});
+        rgbt::common::LogError(
+            "create_room_rejected", trace,
+            {{"match", std::string(match_id)}, {"reason", response.error().reason()}});
         return {};
     }
     return response.room_id();

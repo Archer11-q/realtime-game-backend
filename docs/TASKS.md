@@ -1,7 +1,7 @@
 # 当前任务
 
-> 状态：**Phase 1 与 Phase 2 均已完成并合并到 `main`；Phase 3 已确认拆分，
-> TASK-018 待开工。**
+> 状态：**Phase 1 与 Phase 2 均已完成并合并到 `main`；Phase 3 已完成 4/5，
+> 仅剩 TASK-022。**
 > `main` 已包含 **TASK-000 ~ TASK-017**：TASK-013 ~ TASK-016 分别经
 > PR #10 ~ #13 合并；**TASK-017 经 PR #15 合并（merge commit `a61495a7`，
 > 2026-10-02）**。
@@ -10,8 +10,13 @@
 > 「推送连续性与恢复时间汇总」。
 > **Phase 3**（可观测性和容量基线）已由项目所有者确认拆为 5 个任务
 > （TASK-018 ~ TASK-022，见本文档「Phase 3 任务拆分」一节）；
-> **TASK-018 的任务单已确认、可开工**，TASK-019 及之后逐个确认后再开始。
-> 未经确认不开始编码。
+> **TASK-018 ~ TASK-021 已完成并实测通过**（TASK-019 经 PR #18、TASK-020 经
+> PR #19 合并；TASK-021 见本文档其任务单的「实施结果」）。
+> **TASK-022 待项目所有者确认后开工**，未经确认不开始编码。
+>
+> **2026-10-03 状态清理**：TASK-019 的任务单此前停留在"待确认"，而它早已实现并
+> 经 PR #18 合并；已按 `git log` 更正。同一轮也修正了本文档顶部的进度描述
+> （此前写的是"TASK-018 待开工"，已过期两个任务）。
 >
 > **2026-10-02 分支粒度纠正**：上一轮误按 Phase 1 的「一任务一分支」建了
 > `feat/task-014-*` / `feat/task-015-*` 两条分支（并建议 squash 合并），
@@ -1118,6 +1123,10 @@ Phase 2 要还的历史欠账（此前各任务明确标注为 "Phase 2" 的）�
 Phase 2 已全部完成并合并（TASK-013 ~ TASK-017，`main` 含至 PR #15）。Phase 3 的
 范围与退出标准见 `docs/02-roadmap.md` 第 6 节。
 
+**进度（2026-10-03）**：TASK-018 / 019 / 020 / 021 均已完成并实测通过
+（019 经 PR #18、020 经 PR #19 合并）。**TASK-022 待项目所有者确认后开工**
+（它的两个前置问题见该任务单：压测客户端形态、1000 连接可行性）。
+
 拆分原则与前两个阶段一致：**每个任务都要有可独立运行的验收命令，且不引入下一个
 任务的组件。** 与前两阶段的差别是：本阶段的任务**交付物是"可验证的事实"而不是
 功能**——判定标准是"能不能定位问题、能不能复现数字"，而不是"接口能不能调通"。
@@ -1224,6 +1233,8 @@ Phase 2 已全部完成并合并（TASK-013 ~ TASK-017，`main` 含至 PR #15）
   快照写入成功/失败数）、`verify-observability.sh --metrics` 验收、`verify-all.sh`
   门禁均已落地并实测通过。完整经过与实测数字见 `docs/devlog.md` 的
   「TASK-019 指标暴露」，其中包含一次**验收门禁被改坏**的事故记录。
+  （2026-10-03 状态更正：本条此前长期停留在"待确认"，与 git 记录不符——
+  TASK-019 已由 PR #18 合并、TASK-020 已由 PR #19 合并。）
 - 依赖：无（可与 TASK-018 并行）
 - 背景问题：`docs/04-quality-and-observability.md` 第 4 节列了 8 类指标的清单，
   但至今**一个都没有暴露**。`StreamHub` 已经有可断言的计数器
@@ -1301,7 +1312,9 @@ Phase 2 已全部完成并合并（TASK-013 ~ TASK-017，`main` 含至 PR #15）
 
 ### TASK-021：关键路径 trace id 贯通
 
-- 状态：待确认
+- 状态：**已实现并实测通过**（2026-10-03）。
+  完整经过（含修掉的真实缺陷与验收脚本自己坏掉的三次）见 `docs/devlog.md` 的
+  「TASK-021 实施记录」。
 - 依赖：TASK-018
 - 背景问题：日志有 id 了，但"一次登录/匹配/进房/重连/结算"跨三个服务的完整
   路径仍然要人脑拼。
@@ -1315,8 +1328,35 @@ Phase 2 已全部完成并合并（TASK-013 ~ TASK-017，`main` 含至 PR #15）
   不做采样策略与 span 可视化；不改 proto。
 - 失败场景：id 在跨进程边界丢失（实测踩过同类问题：brpc 不会把 HTTP 头映射进
   protobuf 字段，必须显式读取）→ 由验收脚本逐跳断言覆盖。
-- 验收命令：`bash scripts/verify-observability.sh --trace`。
+- 验收命令：`bash scripts/verify-trace.sh`（见下方"实施结果"关于脚本归属的说明）。
 - 回退方式：`git revert`。
+- **实施结果（2026-10-03）**：
+  - **修掉一个真实缺陷**：`BrpcRoomAllocator` 此前把 `match_id` 当成 `request_id`
+    发给 Room，于是 Room 的 `room_created` 记下一个在 Gateway 与 Match 日志里
+    都不存在的 id —— "匹配 → 建房间"这条跨服务链路**本来就是断的**。
+    `RoomAllocator::Allocate` 增加 `request_id` 形参，由 `MatchQueue` 填入
+    **该组队首玩家**的 request_id（配对是异步的，取队首才确定、可复现；
+    幂等键仍是 `match_id`，两者不再混用）。
+  - **Gateway 的收敛点**：`ApplyHttpStatusAndRecord` 增加 `request_id` 形参，
+    在所有 HTTP 响应（含成功路径）处输出一条 `request_done`，字段为
+    `op`（由 restful 路径推导，11 条映射，找不到记 `unknown` 而不编造）、
+    `status`、`trace`；级别随状态码（5xx→error，4xx→warn）。51 处调用点补齐。
+    此前 15 个接口里只有 2 个有结构化日志。
+  - **Room 补齐结算路径**：`GetMatchResult` 新增 `match_result_queried`
+    （ok / pending / store_unavailable / not_found 四条出口）。
+  - `scripts/verify-trace.sh`（新增）：五条关键路径的 trace 贯通验收，
+    含"未带 request_id 时不编造 trace"与"结构化行未被字段值断行"两条不变量。
+    **取代**任务单里"给 `verify-observability.sh` 加 `--trace`"的写法：
+    那边已有三个互相独立的模式，再加一个会放大"条件块没闭合就吞掉整段断言"的
+    历史风险；且本脚本需要真的打完一整局（实测 17~20 秒），混进去会让只验日志的
+    人白等。
+  - 新增 6 个单元测试（`ctest` 269 → 275），其中
+    `EveryMappedPathEmitsRequestDoneWithItsOperation` **逐条覆盖全部 11 个映射
+    路径**——本任务修的就是覆盖面问题，抽查证明不了覆盖面。
+    用例通过重定向并捕获进程级 stderr 来断言真实输出。
+  - 实测：构建 0 error / 0 warning；`ctest` **275/275**；
+    `check-format.sh` 通过（82 个文件）；`verify-trace.sh` **连跑 2 次均退出码 0**；
+    `verify-all.sh` **9/9 通过（含新脚本，实测 236 秒）**。
 
 ### TASK-022：容量基线与首份报告
 

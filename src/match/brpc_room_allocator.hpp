@@ -41,8 +41,13 @@ public:
     ///
     /// **幂等**：request 里带上 match_id，Room 侧以它为幂等键。因此本方法即使因为
     /// 超时被重试，也不会为同一局造出第二个房间。
+    ///
+    /// `request_id` 只用于**可观测性**（TASK-021），与幂等键是两件事：幂等靠
+    /// match_id，trace 靠上游传来的 request_id。把两者混用会让日志里出现一个
+    /// 在其它服务中根本查不到的 id（TASK-008 起的实际缺陷）。
     [[nodiscard]] std::string Allocate(std::string_view match_id,
-                                       const std::vector<std::string>& player_ids) override;
+                                       const std::vector<std::string>& player_ids,
+                                       std::string_view request_id) override;
 
     /// @brief Room 当前是否可用。用于启动日志，不做真实往返调用。
     [[nodiscard]] bool IsHealthy() const;

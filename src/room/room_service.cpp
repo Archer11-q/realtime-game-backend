@@ -445,6 +445,30 @@ void RoomServiceImpl::GetMatchResult(google::protobuf::RpcController* /*controll
     const ResultOutcome outcome =
         manager_->GetResult(request->match_id(), NowMs(), &record, &snapshot);
 
+    // TASK-021：结算查询的**每一条出口**都留痕。
+    //
+    // 为什么必须四条都记：`GetMatchResult` 是"对局结算"这条关键路径在服务端的
+    // 落点，而它的失败形态（还没落库 / 存储不可用 / 没有这条结果）在客户端看来
+    // 都是"查不到"，只有这里能区分。此前这条路径在 Room 侧一条日志都没有，
+    // 于是"结算链路"在日志里只剩 Gateway 的一段。
+    const char* outcome_name = "unknown";
+    switch (outcome) {
+        case ResultOutcome::kOk:
+            outcome_name = "ok";
+            break;
+        case ResultOutcome::kPending:
+            outcome_name = "pending";
+            break;
+        case ResultOutcome::kUnavailable:
+            outcome_name = "store_unavailable";
+            break;
+        case ResultOutcome::kNotFound:
+            outcome_name = "not_found";
+            break;
+    }
+    rgbt::common::LogInfo("match_result_queried", request->request_id(),
+                          {{"match", request->match_id()}, {"outcome", outcome_name}});
+
     switch (outcome) {
         case ResultOutcome::kOk:
             FillResult(record, response->mutable_result());
