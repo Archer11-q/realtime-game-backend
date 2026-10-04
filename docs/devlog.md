@@ -3312,6 +3312,11 @@ Match   -> Redis(队列快照)      Room    -> MySQL(快照 + 对局结果)
 
 ### 实测发现（比交付物本身更重要）
 
+下面三条**本轮都没有修**，但它们已经作为 Backlog 条目写进
+[`docs/TASKS.md`](TASKS.md) 的「Backlog：后续待办」一节，每条都带**触发条件**
+（什么情况下才需要动手）与"判断它需不需要跑测试"的说明。因此后续任务遇到相关
+场景时按条目处理即可，不必现在决策。
+
 1. **Gateway 的依赖不可用路径不写日志。** `FillError()` 只填错误体并返回状态码，
    既没有 `LogWarn` 也没有 `LogInfo`。因此 `session_store_unavailable` 与
    `player_store_unavailable` 在日志里**查不到**，唯一可观测的痕迹是
