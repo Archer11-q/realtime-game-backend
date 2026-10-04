@@ -120,8 +120,9 @@ MySQL：players（Gateway 拥有）、match_results（Room/Battle 拥有）
 
 ## 当前状态
 
-当前处于 `Phase 1：最小业务闭环`，**功能范围已全部实现并验证**，等待项目所有者
-对 TASK-011 的合并确认后即可推进到 Phase 2。
+**Phase 0 ~ Phase 3 已完成并合并到 `main`**（Phase 3 于 2026-10-04 完成，
+merge commit `94b0393`）。**Phase 4（故障注入与可靠性验证）已拆分任务单，
+等待项目所有者逐个确认后开工**；开工前不写实现代码。
 
 已完成的能力：
 
@@ -131,6 +132,14 @@ MySQL：players（Gateway 拥有）、match_results（Room/Battle 拥有）
 - 服务端推送走 **SSE**（不用 WebSocket，理由见
   [ADR-0004](docs/adr/0004-sse-instead-of-websocket.md)）。
 - Vue 3 + TypeScript + Vite + Canvas 的演示前端，四个视图（登录/大厅/对战/结算）。
+- **重启恢复**：房间快照落 MySQL 并在 Room 启动时恢复；匹配队列快照落 Redis。
+- **断线重连**：30 秒宽限期内对局暂停推进，重连后接着打；SSE 支持
+  `Last-Event-ID` 补发。
+- **可观测性**：三个服务的结构化日志（单行 `key=value`）与 `/metrics`
+  端点；同一个 `request_id` 贯通 Gateway → Match → Room；Prometheus + Grafana
+  面板，含按端点的延迟分位数。
+- **容量基线**：`scripts/bench.sh` 六档（1/10/50/100/500/1000 连接）压测，
+  首份报告与原始数据见 [容量基线报告](docs/benchmarks/README.md)。
 - Redis 与 MySQL 通过 Docker Compose 启动，含健康检查与数据卷。
 - 依赖不可用路径均返回明确错误码（503 / 409 / 404）且恢复后无需重启服务。
 - CI 覆盖三个构建预设与代码格式检查。
