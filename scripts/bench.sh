@@ -23,6 +23,11 @@
 #   端口。换端口会让 `--prometheus` 的采集全部查不到数据，而报告里"面板口径与端点
 #   一致"正是要证明的事。因此端口被占用时**直接报错退出**，让用户先停掉 dev-up 起
 #   的服务，而不是静默换端口制造一份查不到指标的报告。
+#
+# 退出时**会清理自己造的状态**（`bench-*` 账号、`rooms`、`match_results`、Redis 的
+# `dev:*`），理由见 `cleanup_bench_state` 的注释：不清理会让 `verify-login.sh`
+# 的"players 行数为 4"断言失败，并让后续验收的 Room 被上一轮的数百个房间拖住。
+# 用 `--keep` 可以跳过清理（需要保留现场排查时用）。
 
 set -uo pipefail
 
@@ -108,7 +113,12 @@ stop_services() {
 }
 
 cleanup() {
-  [ "$keep" -eq 1 ] || stop_services
+  if [ "$keep" -eq 1 ]; then
+    echo "（--keep：保留服务进程，不清理状态）"
+    return
+  fi
+  stop_services
+  cleanup_bench_state
 }
 trap cleanup EXIT
 
@@ -376,6 +386,32 @@ reset_state() {
     while read -r key; do docker exec rgbt-redis redis-cli DEL "$key" >/dev/null 2>&1; done
   docker exec -i rgbt-mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" \
     -e "DELETE FROM rooms;" >/dev/null 2>&1
+}
+
+# 压测结束后把开发环境恢复成"只有种子数据"的样子。
+#
+# **为什么必须做**（实测踩到，2026-10-04）：
+#   压测结束时 `players` 里多了 1000 个 `bench-*` 账号、`match_results` 里多了
+#   1181 行、`rooms` 里还有若干快照。而 `scripts/verify-login.sh` 会断言
+#   "players 行数为 4（期望 4）"，直接失败；同一轮 `verify-all.sh` 里
+#   `verify-room` / `verify-stream` 也失败（Room 启动时要恢复上一轮的数百个房间，
+#   ticker 被快照写入拖住，新对局推进不动）。
+#   按 `CLAUDE.md` 的纪律，"改变的依赖或环境"必须能被后续脚本正确接手——
+#   一个会把开发库弄脏的压测脚本会让整套验收失去可信度，而且失败原因
+#   （"对局打不完"）与真正的原因（上一轮的房间快照）毫无关系。
+#
+# 只删自己造的东西：`bench-*` 账号、`rooms`、`match_results`。
+# **不动** `migrations/004` 的种子身份（alice/bob/carol/dave）与其它表。
+cleanup_bench_state() {
+  docker exec -i rgbt-mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" \
+    -e "DELETE FROM players WHERE account LIKE 'bench-%'; DELETE FROM rooms; DELETE FROM match_results;" \
+    >/dev/null 2>&1
+  docker exec rgbt-redis redis-cli --scan --pattern 'dev:*' 2>/dev/null |
+    while read -r key; do docker exec rgbt-redis redis-cli DEL "$key" >/dev/null 2>&1; done
+  local players_left
+  players_left=$(docker exec -i rgbt-mysql mysql -N -B -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" \
+    "$MYSQL_DATABASE" -e "SELECT COUNT(*) FROM players;" 2>/dev/null | tr -d '\r')
+  echo "已清理压测状态：players 剩 ${players_left:-?} 行（期望 4，即 004 的种子身份），rooms/match_results 已清空"
 }
 
 collect_metrics() {
