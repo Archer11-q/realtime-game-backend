@@ -334,6 +334,47 @@ TEST(StreamHubTest, OfflineStateChangeIsPushedEvenWhenFrameIsUnchanged) {
     EXPECT_NE(sub.log->writes.back().find("\"online\":false"), std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// TASK-026：排空
+// ---------------------------------------------------------------------------
+
+TEST(StreamHubTest, BeginShutdownRejectsNewSubscriptions) {
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 1);
+    StreamHub hub(&room);
+
+    hub.BeginShutdown();
+
+    const Subscribed sub = Subscribe(&hub, "p-0001", "r-1");
+    EXPECT_EQ(sub.id, 0U) << "排空后不应再登记订阅（调用方据此给 503 shutting_down）";
+    EXPECT_EQ(hub.ConnectionCount(), 0U);
+}
+
+TEST(StreamHubTest, CloseAllWithEventTellsTheClientWhy) {
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 1);
+    StreamHub hub(&room);
+
+    const Subscribed sub = Subscribe(&hub, "p-0001", "r-1");
+    ASSERT_NE(sub.id, 0U);
+
+    const std::size_t closed = hub.CloseAllWithEvent("server_shutdown");
+
+    EXPECT_EQ(closed, 1U);
+    EXPECT_EQ(hub.ConnectionCount(), 0U);
+    EXPECT_TRUE(sub.log->closed);
+    // 客户端必须能看见**原因**：直接断开会让它把"服务优雅退出"当成"网络故障"，
+    // 而这两者对应完全相反的下一步（停止重连 vs 立刻重连）。
+    EXPECT_TRUE(Contains(sub.log, "stream.closed"));
+    EXPECT_TRUE(Contains(sub.log, "server_shutdown"));
+}
+
+TEST(StreamHubTest, CloseAllWithEventOnEmptyHubIsSafe) {
+    FakeRoomClient room;
+    StreamHub hub(&room);
+    EXPECT_EQ(hub.CloseAllWithEvent("server_shutdown"), 0U);
+}
+
 }  // namespace
 
 TEST(StreamHubTest, NoSubscribersMeansNoRoomPolling) {

@@ -194,6 +194,14 @@ void RoomServiceImpl::CreateRoom(google::protobuf::RpcController* /*controller*/
             SetError(response->mutable_error(), rgbt::room::v1::ROOM_INVALID_ARGUMENT,
                      "invalid_argument", "match_id 或玩家列表不合法", request->request_id());
             return;
+        case CreateOutcome::kShuttingDown:
+            // TASK-026：排空中拒绝新房间。**必须留痕**：Match 侧只会看到"分配失败"，
+            // 而"这次失败是因为 Room 在退出"只有这里能说清楚（验收脚本也靠这一行）。
+            rgbt::common::LogWarn("room_create_rejected", request->request_id(),
+                                  {{"reason", "shutting_down"}, {"match_id", request->match_id()}});
+            SetError(response->mutable_error(), rgbt::room::v1::ROOM_SHUTTING_DOWN, "shutting_down",
+                     "服务正在排空，不再接受新房间", request->request_id());
+            return;
         case CreateOutcome::kInternal:
         default:
             SetError(response->mutable_error(), rgbt::room::v1::ROOM_INTERNAL, "room_internal",

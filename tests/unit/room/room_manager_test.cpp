@@ -951,4 +951,103 @@ TEST(RoomSnapshotValidationTest, RejectsTerminalStateWithoutFinishReason) {
     EXPECT_NE(ValidateRoomSnapshot(record), "");
 }
 
+// ---------------------------------------------------------------------------
+// TASK-026：排空
+// ---------------------------------------------------------------------------
+
+TEST(RoomManagerTest, CreateIsRejectedWhileShuttingDown) {
+    FakeResultWriter writer;
+    RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
+
+    manager.BeginShutdown();
+    EXPECT_TRUE(manager.IsShuttingDown());
+
+    std::string room_id;
+    EXPECT_EQ(manager.Create("m-new", {"p-0001", "p-0002"}, kT0, &room_id, nullptr),
+              CreateOutcome::kShuttingDown);
+    EXPECT_TRUE(room_id.empty());
+    // 排空不是"建了但不给用"：一个房间都不该建起来。
+    EXPECT_EQ(manager.RoomCount(), 0U);
+}
+
+TEST(RoomManagerTest, ExistingRoomStillReturnsIdempotentlyWhileShuttingDown) {
+    // 排空**不能**打断幂等：Match 的一次重试必须还能拿到已经建好的那个房间，
+    // 否则玩家会被退回队列，而房间其实已经存在了。
+    FakeResultWriter writer;
+    RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
+    ASSERT_EQ(manager.Create("m-1", {"p-0001", "p-0002"}, kT0, nullptr, nullptr),
+              CreateOutcome::kOk);
+
+    manager.BeginShutdown();
+
+    std::string room_id;
+    EXPECT_EQ(manager.Create("m-1", {"p-0001", "p-0002"}, kT0, &room_id, nullptr),
+              CreateOutcome::kOk);
+    EXPECT_EQ(room_id, "r-fixed");
+    // 新的 match_id 仍然被拒。
+    EXPECT_EQ(manager.Create("m-2", {"p-0003", "p-0004"}, kT0, nullptr, nullptr),
+              CreateOutcome::kShuttingDown);
+}
+
+TEST(RoomManagerTest, UnfinishedGameCountDropsWhenTheGameEnds) {
+    FakeResultWriter writer;
+    RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
+    OpenPlayingRoom(&manager);
+    EXPECT_EQ(manager.UnfinishedGameCount(), 1U);
+
+    // 打到超时：结果在同一次 Tick 内落库，房间进入 FINISHED。
+    AdvanceTo(&manager, kT0, kTimeoutAtMs);
+    EXPECT_EQ(manager.UnfinishedGameCount(), 0U);
+    EXPECT_EQ(manager.PendingResultCount(), 0U);
+    // 已结束的房间不算"未结束"，哪怕它还在保留期内。
+    EXPECT_EQ(manager.RoomCount(), 1U);
+}
+
+TEST(RoomManagerTest, AbortUnfinishedGamesMarksAbortedAndWritesNoResult) {
+    FakeResultWriter writer;
+    FakeSnapshotWriter snapshots;
+    RoomManager manager(&writer, &snapshots, nullptr, []() { return std::string("r-fixed"); });
+    OpenPlayingRoom(&manager);
+
+    const std::size_t aborted = manager.AbortUnfinishedGames(kT0 + 5000);
+    EXPECT_EQ(aborted, 1U);
+
+    RoomSnapshot snapshot;
+    ASSERT_TRUE(manager.GetState("r-fixed", kT0 + 5000, &snapshot));
+    EXPECT_EQ(snapshot.phase, RoomPhase::kAborted);
+    EXPECT_EQ(snapshot.finish_reason, FinishReason::kAborted);
+    EXPECT_TRUE(snapshot.winner_id.empty());
+    // **没有结果就是没有结果**：不许写一行平局或随便一个胜者。
+    EXPECT_EQ(writer.write_calls, 0);
+    EXPECT_EQ(manager.PendingResultCount(), 0U);
+    EXPECT_EQ(manager.UnfinishedGameCount(), 0U);
+
+    // 终态快照必须落库：否则重启后这一局在库里还停在 PLAYING。
+    ASSERT_EQ(snapshots.rows.count("m-1"), 1U);
+    EXPECT_EQ(snapshots.rows.at("m-1").phase, RoomPhase::kAborted);
+    EXPECT_TRUE(snapshots.rows.at("m-1").winner_id.empty());
+}
+
+TEST(RoomManagerTest, AbortUnfinishedGamesLeavesFinishingRoomAlone) {
+    // FINISHING 的房间**有真实结果**，只是还没落库。把它标成 ABORTED 等于丢掉
+    // 一个真实结果——这是排空里最容易写错的一处（任务单只说了"未结束的房间"，
+    // 而 FINISHING 在语义上已经结束、只是在等落库）。
+    FakeResultWriter writer;
+    writer.next_write = WriteStatus::kUnavailable;
+    RoomManager manager(&writer, nullptr, nullptr, []() { return std::string("r-fixed"); });
+    OpenPlayingRoom(&manager);
+    AdvanceTo(&manager, kT0, kTimeoutAtMs);
+    manager.Tick(kTimeoutAtMs + kFrameIntervalMs);
+    ASSERT_EQ(manager.PendingResultCount(), 1U);
+    const int writes_before = writer.write_calls;
+
+    EXPECT_EQ(manager.AbortUnfinishedGames(kTimeoutAtMs + 2 * kFrameIntervalMs), 0U);
+
+    RoomSnapshot snapshot;
+    ASSERT_TRUE(manager.GetState("r-fixed", kTimeoutAtMs + 2 * kFrameIntervalMs, &snapshot));
+    EXPECT_EQ(snapshot.phase, RoomPhase::kFinishing)
+        << "有胜负、只是在等落库的对局不能被排空改成 ABORTED";
+    EXPECT_EQ(writer.write_calls, writes_before);
+}
+
 }  // namespace

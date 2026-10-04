@@ -86,6 +86,9 @@ MatchCallStatus ToCallStatus(const rgbt::match::v1::MatchError& error) {
         case rgbt::match::v1::MATCH_QUEUE_FULL:
             RecordRpcCall(false);
             return MatchCallStatus::kQueueFull;
+        case rgbt::match::v1::MATCH_SHUTTING_DOWN:
+            // TASK-026：对端排空。不并入 kUnavailable：重试没有意义。
+            return MatchCallStatus::kShuttingDown;
         case rgbt::match::v1::MATCH_INTERNAL:
         default:
             RecordRpcCall(false);

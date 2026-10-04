@@ -80,6 +80,7 @@ enum FinishReason {
 //   STORE_UNAVAILABLE      对端存储（MySQL）暂时不可用，可有限重试
 //   NOT_A_MEMBER           该玩家不是这一局的成员
 //   NOT_PLAYING            对局尚未开始，此时不接受输入
+//   SHUTTING_DOWN          服务正在排空（收到停止信号），不再接受新房间
 //   INTERNAL               未分类内部错误
 //
 // 为什么 NOT_A_MEMBER 与 NOT_PLAYING 要有独立错误码，而不是复用 INVALID_ARGUMENT
@@ -96,6 +97,13 @@ enum RoomErrorCode {
   ROOM_INTERNAL = 6;
   ROOM_NOT_A_MEMBER = 7;
   ROOM_NOT_PLAYING = 8;
+
+  // TASK-026：服务正在排空（收到 SIGTERM），**不再接受新房间**。
+  //
+  // 为什么需要一个独立错误码而不是复用 INTERNAL：调用方（Match）要据此把玩家
+  // **退回队列**并记一条明确的日志，而不是把"服务正在退出"当成内部故障。
+  // 契约要能承载调用方真正需要的区分——与 NOT_A_MEMBER / NOT_PLAYING 同理。
+  ROOM_SHUTTING_DOWN = 9;
 }
 
 // 统一错误体。

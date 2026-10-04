@@ -158,6 +158,9 @@ RoomCallStatus ToCallStatus(rgbt::room::v1::RoomErrorCode code) {
         case rgbt::room::v1::ROOM_STORE_UNAVAILABLE:
             RecordRpcCall(false);
             return RoomCallStatus::kStoreUnavailable;
+        case rgbt::room::v1::ROOM_SHUTTING_DOWN:
+            // TASK-026：对端排空。不并入 kUnavailable：重试没有意义。
+            return RoomCallStatus::kShuttingDown;
         case rgbt::room::v1::ROOM_INTERNAL:
         default:
             RecordRpcCall(false);

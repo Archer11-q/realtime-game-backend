@@ -217,6 +217,19 @@ std::string RoomFinishedJson(const RoomSnapshot& snapshot, std::int64_t now_ms) 
     return Envelope("room.finished", snapshot.frame, now_ms, RoomPayload(snapshot));
 }
 
+/// TASK-026：服务排空时的显式关闭。
+///
+/// 为什么 sequence 用 0 而不是帧号：它不是"某一帧的状态"，而是一条控制信号
+/// （与 session.ready 同类）。用帧号会让客户端以为它标志着某个游戏帧。
+std::string StreamClosedJson(const std::string& reason, std::int64_t now_ms) {
+    std::string payload = "{\"reason\":\"";
+    payload += JsonEscape(reason);
+    payload += "\",\"server_time_ms\":";
+    payload += std::to_string(now_ms);
+    payload += "}";
+    return Envelope("stream.closed", 0, now_ms, payload);
+}
+
 /// 需要全量刷新的明确告知（TASK-017）。
 ///
 /// 载荷里带**当前完整状态**：客户端收到它之后不需要再发一次查询请求，
@@ -246,6 +259,13 @@ SubscriptionReport StreamHub::Subscribe(std::string player_id, std::string room_
                                         std::unique_ptr<EventSink> sink, SubscribeOptions options) {
     SubscriptionReport report;
     if (sink == nullptr) {
+        return report;
+    }
+
+    // TASK-026：排空中不再登记新订阅，返回 id == 0 让调用方给 503。
+    // 守卫放在这里而不是只放在调用方：订阅表是 StreamHub 自己的状态，
+    // "还能不能订阅"该由它说了算；调用方那份检查只是让客户端更早拿到明确的错误。
+    if (draining_.load()) {
         return report;
     }
 
@@ -792,6 +812,38 @@ void StreamHub::CloseAll() {
             entry.second.sink->Close();
         }
     }
+}
+
+void StreamHub::BeginShutdown() {
+    draining_.store(true);
+}
+
+std::size_t StreamHub::CloseAllWithEvent(const std::string& reason) {
+    std::unordered_map<std::uint64_t, Subscription> taken;
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        taken.swap(subscriptions_);
+        last_pushed_state_.clear();
+    }
+    if (taken.empty()) {
+        return 0;
+    }
+    // 先把事件写出去，再关闭：顺序反了客户端只会看到连接被切断，看不到原因。
+    for (auto& entry : taken) {
+        if (entry.second.sink != nullptr) {
+            entry.second.sink->Write(
+                SseEvent("stream.closed", StreamClosedJson(reason, SystemNowMs()), 0));
+        }
+    }
+    // 关闭与上报都在锁外（理由同 CloseAll：不持锁做 I/O）。
+    for (auto& entry : taken) {
+        ReportPresence(entry.second.room_id, entry.second.player_id, false,
+                       entry.second.request_id);
+        if (entry.second.sink != nullptr) {
+            entry.second.sink->Close();
+        }
+    }
+    return taken.size();
 }
 
 std::size_t StreamHub::ConnectionCount() {

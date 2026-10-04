@@ -95,6 +95,11 @@ struct MatchStatusSnapshot {
 
 /// 入队结果。
 enum class EnqueueOutcome {
+    /// TASK-026：服务正在排空，**不再接受新入队**。
+    ///
+    /// 与 kQueueFull 分开：队列满时退避重试有意义，而这个状态下重试没有意义
+    /// ——调用方应当换成"稍后重连"，而不是原样重试。
+    kShuttingDown,
     /// 已进入队列（可能在同一调用内就已经配对成功，以 status 为准）。
     kQueued,
     /// 玩家已在队列中，或已有尚未领取的匹配结果。按幂等成功处理，返回当前状态。
@@ -159,6 +164,15 @@ public:
     /// 本方法内部会调用 RoomAllocator（网络调用），但**不会持有锁**。
     EnqueueOutcome Enqueue(const std::string& player_id, const std::string& request_id,
                            std::int64_t now_ms);
+
+    /// @brief 进入排空（TASK-026）。之后 Enqueue 一律返回 kShuttingDown。
+    ///
+    /// 只挡**新入队**：GetStatus 继续可用，已配对的结果仍能领取。
+    /// 否则玩家会在拿到房间号之前被夺走那一局——那比"拒绝新请求"更糟。
+    void BeginShutdown();
+
+    /// @brief 是否已进入排空。
+    [[nodiscard]] bool IsShuttingDown() const;
 
     /// @brief 从存储恢复队列（TASK-015）。**在开始接受请求之前调用一次。**
     ///
@@ -283,6 +297,8 @@ private:
 
     std::function<std::string()> match_id_factory_;
     std::int64_t match_timeout_ms_;
+    /// TASK-026：是否已进入排空。置位后 Enqueue 不再接受新入队。
+    bool shutting_down_ = false;
     std::int64_t result_ttl_ms_;
     std::size_t max_queue_size_;
 

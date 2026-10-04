@@ -139,6 +139,16 @@ MatchRestoreReport MatchQueue::Restore(std::int64_t now_ms) {
     return report;
 }
 
+void MatchQueue::BeginShutdown() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    shutting_down_ = true;
+}
+
+bool MatchQueue::IsShuttingDown() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return shutting_down_;
+}
+
 MatchQueueSnapshot MatchQueue::MakeSnapshotLocked() const {
     MatchQueueSnapshot snapshot;
     snapshot.queued.reserve(queue_.size() + entries_.size());
@@ -241,6 +251,18 @@ EnqueueOutcome MatchQueue::Enqueue(const std::string& player_id, const std::stri
     if (player_id.empty() || player_id.size() > kMaxPlayerIdLength || request_id.empty() ||
         request_id.size() > kMaxRequestIdLength) {
         return EnqueueOutcome::kInvalidArgument;
+    }
+
+    // TASK-026：排空中不再接受**新**入队。
+    //
+    // 放在最前面（早于幂等判断）：排空期间连"重复入队返回已有状态"也不做，
+    // 因为那个状态对应的房间不会再有人分配。已在队列里的玩家不受影响——
+    // 他们的配对结果仍可领取（见 MatchServiceImpl::GetMatchStatus）。
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (shutting_down_) {
+            return EnqueueOutcome::kShuttingDown;
+        }
     }
 
     EnqueueOutcome outcome = EnqueueOutcome::kQueued;

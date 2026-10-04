@@ -56,6 +56,11 @@ enum class MatchCallStatus {
     kQueueFull,
     /// 对端返回了未分类错误，对外返回 500。
     kInternal,
+    /// TASK-026：对端正在排空（`MATCH_SHUTTING_DOWN`）。
+    ///
+    /// 与 kUnavailable 分开：那种是"暂时不可用，退避重试有用"，
+    /// 这种是"对端要走了，重试没有意义"。合并会让调用方一直重试一个正在退出的服务。
+    kShuttingDown,
 };
 
 /// Gateway 侧的匹配客户端接口。

@@ -492,6 +492,14 @@ GatewayServiceImpl::GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* 
     metrics_ready_ = true;
 }
 
+void GatewayServiceImpl::BeginShutdown() {
+    shutting_down_.store(true);
+}
+
+bool GatewayServiceImpl::IsShuttingDown() const {
+    return shutting_down_.load();
+}
+
 std::int32_t GatewayServiceImpl::FillError(rgbt::gateway::v1::Error* error,
                                            rgbt::gateway::v1::ErrorCode code,
                                            const std::string& reason, const std::string& message,
@@ -514,6 +522,10 @@ void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
     // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
     // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
     const std::int64_t start_us = rgbt::common::NowUs();
+    // TASK-026：排空中拒绝**新**请求。读请求不受影响（见 RejectIfShuttingDown 的注释）。
+    if (RejectIfShuttingDown(controller, response, request->request_id(), start_us)) {
+        return;
+    }
 
     const std::string request_id = request->request_id();
 
@@ -713,6 +725,11 @@ std::int32_t GatewayServiceImpl::HandleMatchFailure(MatchCallStatus status,
             // 不是本服务代码错误，恢复后无需重启 Gateway 即可继续匹配。
             return FillError(error, ErrorCode::UNAVAILABLE, "match_unavailable",
                              "匹配服务暂时不可用，请稍后重试", request_id);
+        case MatchCallStatus::kShuttingDown:
+            // TASK-026：对端正在排空。503 + 稳定 reason，客户端据此**停止重试**，
+            // 而不是像 match_unavailable 那样退避后重试。
+            return FillError(error, ErrorCode::UNAVAILABLE, "shutting_down",
+                             "匹配服务正在排空，暂不接受新请求", request_id);
         case MatchCallStatus::kInvalidArgument:
             return FillError(error, ErrorCode::INVALID_ARGUMENT, "match_invalid_argument",
                              "匹配请求参数不合法", request_id);
@@ -797,6 +814,10 @@ std::int32_t GatewayServiceImpl::HandleRoomFailure(RoomCallStatus status,
             // 调用方稍后重试即可。返回 404 会让客户端以为这局没有结果。
             return FillError(error, ErrorCode::UNAVAILABLE, "result_pending",
                              "对局已结束，结果仍在写入，请稍后重试", request_id);
+        case RoomCallStatus::kShuttingDown:
+            // TASK-026：房间服务正在排空。理由同 Match 侧。
+            return FillError(error, ErrorCode::UNAVAILABLE, "shutting_down",
+                             "房间服务正在排空，暂不接受新请求", request_id);
         case RoomCallStatus::kNotFound:
             return FillError(error, ErrorCode::NOT_FOUND, not_found_reason, "房间或对局结果不存在",
                              request_id);
@@ -831,6 +852,10 @@ void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* control
     // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
     // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
     const std::int64_t start_us = rgbt::common::NowUs();
+    // TASK-026：排空中拒绝**新**请求。读请求不受影响（见 RejectIfShuttingDown 的注释）。
+    if (RejectIfShuttingDown(controller, response, request->request_id(), start_us)) {
+        return;
+    }
 
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
@@ -922,6 +947,10 @@ void GatewayServiceImpl::CancelMatch(::google::protobuf::RpcController* controll
     // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
     // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
     const std::int64_t start_us = rgbt::common::NowUs();
+    // TASK-026：排空中拒绝**新**请求。读请求不受影响（见 RejectIfShuttingDown 的注释）。
+    if (RejectIfShuttingDown(controller, response, request->request_id(), start_us)) {
+        return;
+    }
 
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
@@ -961,6 +990,10 @@ void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
     // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
     // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
     const std::int64_t start_us = rgbt::common::NowUs();
+    // TASK-026：排空中拒绝**新**请求。读请求不受影响（见 RejectIfShuttingDown 的注释）。
+    if (RejectIfShuttingDown(controller, response, request->request_id(), start_us)) {
+        return;
+    }
 
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
@@ -1017,6 +1050,10 @@ void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controll
     // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
     // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
     const std::int64_t start_us = rgbt::common::NowUs();
+    // TASK-026：排空中拒绝**新**请求。读请求不受影响（见 RejectIfShuttingDown 的注释）。
+    if (RejectIfShuttingDown(controller, response, request->request_id(), start_us)) {
+        return;
+    }
 
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
@@ -1205,6 +1242,10 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
     // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
     // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
     const std::int64_t start_us = rgbt::common::NowUs();
+    // TASK-026：排空中拒绝**新**请求。读请求不受影响（见 RejectIfShuttingDown 的注释）。
+    if (RejectIfShuttingDown(controller, response, request->request_id(), start_us)) {
+        return;
+    }
 
     const std::string token = ExtractToken(controller, request->token());
     // TASK-018：`request_id` 也从 query string 读。GET /stream 没有请求体，而 brpc

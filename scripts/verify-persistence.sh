@@ -151,6 +151,7 @@ ok "三个可执行文件均存在"
 # 启动（或重启）Room。抽成函数是因为 TASK-014 的恢复验收要反复 kill -9 再拉起它。
 start_room() {
   "$room_bin" -port "$room_port" -env_prefix dev \
+  -drain_timeout_ms 1000 \
     -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
     -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
     -mysql_database "$MYSQL_DATABASE" >/tmp/room.out 2>&1 &
@@ -191,6 +192,7 @@ else
 fi
 
 "$gw_bin" -port "$gateway_port" -env_prefix dev \
+  -drain_timeout_ms 1000 \
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
   -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
   -mysql_database "$MYSQL_DATABASE" \

@@ -47,6 +47,7 @@ enum MatchState {
 //   INVALID_ARGUMENT   输入错误，调用方不应重试
 //   ALREADY_QUEUED     状态冲突，按幂等成功处理，调用方取 status 即可
 //   QUEUE_FULL         限流，调用方退避后重试
+//   SHUTTING_DOWN      服务正在排空（收到停止信号），不再接受新入队
 //   INTERNAL           未分类内部错误
 enum MatchErrorCode {
   MATCH_ERROR_CODE_UNSPECIFIED = 0;
@@ -54,6 +55,16 @@ enum MatchErrorCode {
   MATCH_ALREADY_QUEUED = 2;
   MATCH_QUEUE_FULL = 3;
   MATCH_INTERNAL = 4;
+
+  // TASK-026：服务正在排空，**不再接受新入队**。
+  //
+  // 与 QUEUE_FULL 分开：那个是"队列满了，退避后重试有用"，这个是"服务要走了，
+  // 重试没有用，客户端应该去别的实例或稍后重连"。两者的退避策略不同，
+  // 合并成一个错误码会让调用方做出错误的重试决策。
+  //
+  // 注意：**已配对的结果仍可领取**（GetMatchStatus 不受排空影响），
+  // 否则玩家会在拿到房间号之前被夺走那一局。
+  MATCH_SHUTTING_DOWN = 5;
 }
 
 // 统一错误体。
