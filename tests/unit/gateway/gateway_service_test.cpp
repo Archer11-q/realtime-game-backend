@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/logging.hpp"
+#include "common/metrics.hpp"
 #include "common/token.hpp"
 #include "error.hpp"
 #include "match_client.hpp"
@@ -1590,6 +1592,98 @@ TEST_F(GatewayServiceTest, UnmappedPathIsRecordedAsUnknownOperation) {
         << "非映射路径必须记 op=unknown，不能猜一个动作名：" << capture;
     EXPECT_EQ(capture.find("op=get_current_player"), std::string::npos)
         << "op 必须由实际路径推导，不能来自处理函数名：" << capture;
+}
+
+// ---------------------------------------------------------------------------
+// TASK-022：HTTP 处理耗时（延迟直方图）
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// `rgbt_http_request_seconds_count` 的当前值；指标尚未注册时返回 -1。
+///
+/// 指标登记表是**进程级**的（`Metrics()`），同一个测试二进制里的用例共享它，且
+/// **注册即存在、只增不减**。因此这里用"增量"断言，并显式区分 `-1`（还没注册）
+/// 与 `0`（注册了但还没观测）——两者的失败含义完全不同。
+double HttpLatencyCount() {
+    const std::string text = rgbt::common::Metrics().TextExposure();
+    // TASK-022 起直方图带 `path` 标签，因此这里按标签精确取值；不写标签会匹配到
+    // `_count{path="/api/v1/players/me"} ` 之前的部分，读出错行的数字。
+    const std::string key = std::string(rgbt::common::kMetricHttpRequestSeconds) +
+                            "_count{path=\"/api/v1/players/me\"} ";
+    const std::size_t pos = text.find(key);
+    if (pos == std::string::npos) {
+        return -1.0;
+    }
+    const std::size_t begin = pos + key.size();
+    const std::size_t end = text.find('\n', begin);
+    return std::stod(
+        text.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
+}
+
+}  // namespace
+
+/// 走一次真实的业务请求，必须产生一次耗时观测。
+///
+/// 用例不人为制造"耗时 300 ms"：处理函数入口自己取 `NowUs()`，实际耗时是微秒级，
+/// 分桶值不可预测。这里要验证的是**接线**——计时起点真的取了、观测真的记了，
+/// 而这正是 TASK-020 遗留的问题（指标名与 `Observe()` 都在，但没有调用点）。
+/// 至于"值算得对不对"，由 `metrics_test` 的自定义桶用例与端到端读 Prometheus 覆盖。
+TEST_F(GatewayServiceTest, BusinessRequestObserversLatency) {
+    const std::string token = LoginAlice();
+    brpc::Controller controller;
+    controller.http_request().uri().set_path("/api/v1/players/me");
+    controller.http_request().set_method(brpc::HTTP_METHOD_GET);
+
+    GetCurrentPlayerRequest request;
+    request.set_token(token);
+    GetCurrentPlayerResponse response;
+
+    // 先读基线，再发请求。基线可能是 -1（本进程还没注册过该指标）或某个值——
+    // 两种都合法，因为 `Metrics()` 是进程级共享的，用例执行顺序会影响它。
+    const double before = HttpLatencyCount();
+
+    service_->GetCurrentPlayer(&controller, &request, &response, nullptr);
+    ASSERT_EQ(response.status_code(), 200);
+
+    const double after = HttpLatencyCount();
+    ASSERT_GE(after, 0.0) << "rgbt_http_request_seconds 没有注册，说明计时没接上";
+    EXPECT_DOUBLE_EQ(after, before < 0.0 ? 1.0 : before + 1.0)
+        << "业务请求没有产生耗时观测（TASK-020 的延迟面板会继续为空）";
+}
+
+/// 非 HTTP 上下文（无路径可推导）时不观测。
+///
+/// 单元测试里大量直接调用服务时传的就是 `nullptr` controller。如果那时也记一笔，
+/// 上报的耗时会是一个与真实处理无关的数——宁可不记。
+TEST_F(GatewayServiceTest, NoObservationWithoutHttpContext) {
+    const std::string token = LoginAlice();
+    GetCurrentPlayerRequest request;
+    request.set_token(token);
+    GetCurrentPlayerResponse response;
+
+    const double before = HttpLatencyCount();
+    service_->GetCurrentPlayer(nullptr, &request, &response, nullptr);
+    EXPECT_DOUBLE_EQ(HttpLatencyCount(), before);
+}
+
+/// 非业务路径（brpc 内置端点）不记延迟。
+///
+/// 与 `rgbt_http_requests_total` 的白名单一致：把 `/status`、`/metrics` 混进业务
+/// 延迟分位数，会让 SLO 读数字变好看——那不是被测对象。
+TEST_F(GatewayServiceTest, NonBusinessPathIsNotObserved) {
+    const std::string token = LoginAlice();
+    brpc::Controller controller;
+    controller.http_request().uri().set_path("/status");
+    controller.http_request().set_method(brpc::HTTP_METHOD_GET);
+
+    GetCurrentPlayerRequest request;
+    request.set_token(token);
+    GetCurrentPlayerResponse response;
+
+    const double before = HttpLatencyCount();
+    service_->GetCurrentPlayer(&controller, &request, &response, nullptr);
+    EXPECT_DOUBLE_EQ(HttpLatencyCount(), before);
 }
 
 }  // namespace

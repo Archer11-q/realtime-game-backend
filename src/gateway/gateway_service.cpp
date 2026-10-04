@@ -378,14 +378,74 @@ void GatewayServiceImpl::RecordRequestDone(::google::protobuf::RpcController* co
     rgbt::common::Log(record);
 }
 
-/// TASK-019 + TASK-021：设置状态码、记账、并留一条 `request_done`。
-/// 所有处理函数都走这里，因此这三件事都不会被漏掉。
+/// TASK-019 + TASK-021 + TASK-022：设置状态码、记账、留一条 `request_done`、
+/// 记录耗时。所有处理函数都走这里，因此这四件事都不会被漏掉。
+///
+/// **TASK-022 的耗时为什么必须由调用方传开始时刻**：brpc 服务端**拿不到**请求的
+/// 开始时间——`start_realtime_us` 只是客户端 `IssueRPC(int64_t)` 的参数，不是
+/// Controller 的访问器；而 `latency_us()` 在服务端的语义是"处理前的排队时间"
+/// （头文件原话：`it gets queue time before server processes the RPC call`），
+/// 不能当处理耗时用。因此开始时刻只能在每个处理函数入口取一次。
+/// `start_us == 0` 表示调用方没计时（单元测试路径），此时不观测，也不写
+/// `duration_ms`——**不做"假装记了 0 秒"**那种会污染分位数的处理。
 void GatewayServiceImpl::ApplyHttpStatusAndRecord(::google::protobuf::RpcController* controller,
                                                   std::int32_t status_code,
-                                                  const std::string& request_id) {
+                                                  const std::string& request_id,
+                                                  std::int64_t start_us) {
     ApplyHttpStatus(controller, status_code);
     RecordHttpRequest(controller, status_code);
     RecordRequestDone(controller, status_code, request_id);
+    RecordHttpLatency(controller, start_us);
+}
+
+/// TASK-022：把一次 HTTP 请求的处理耗时写进直方图。
+///
+/// 与 `RecordHttpRequest` 一样只对 `/api/v1/` 记账：brpc 内置端点（`/status`、
+/// `/metrics`、`/vars`）不是业务请求，混进延迟分位数会让 SLO 读数字变好看，
+/// 而那不是被测对象。
+///
+/// 用**自定义桶**（`kHttpLatencyBucketBounds`）而不是默认桶：后者的粒度让
+/// P95 < 100 ms 这条 SLO 无法判定，理由见 `metrics.hpp` 里该常量的注释。
+///
+/// 不带 `status` 维度：Prometheus 的惯例是"延迟由一个无状态标签的直方图描述，
+/// 错误率另由一个计数器描述"。把状态码拼进直方图会立刻带来 3 倍的时间序列数，
+/// 却只能回答"错误请求更快还是更慢"这种没人问的问题。
+void GatewayServiceImpl::RecordHttpLatency(::google::protobuf::RpcController* controller,
+                                           std::int64_t start_us) noexcept {
+    if (start_us <= 0 || controller == nullptr) {
+        return;
+    }
+    const auto* cntl = static_cast<const brpc::Controller*>(controller);
+    if (cntl == nullptr || !cntl->has_http_request()) {
+        return;
+    }
+    const std::string path(cntl->http_request().uri().path());
+    if (path.rfind("/api/v1/", 0) != 0) {
+        return;
+    }
+
+    const std::int64_t elapsed_us = rgbt::common::NowUs() - start_us;
+    // 负值只可能来自时钟回退。归零会让它落进第一个桶、把分位数拉低，
+    // 因此比"不记"更糟；这里直接丢弃这一次观测（指标层另有负值归零的兜底，
+    // 那条兜底是给"调用方忘了判断"用的，不该被我们自己依赖）。
+    if (elapsed_us < 0) {
+        return;
+    }
+
+    rgbt::common::Metrics().Observe(
+        rgbt::common::kMetricHttpRequestSeconds, "Gateway 的 HTTP 处理耗时（秒），按业务路径计",
+        static_cast<double>(elapsed_us) / 1'000'000.0,
+        {rgbt::common::kHttpLatencyBucketBounds[0], rgbt::common::kHttpLatencyBucketBounds[1],
+         rgbt::common::kHttpLatencyBucketBounds[2], rgbt::common::kHttpLatencyBucketBounds[3],
+         rgbt::common::kHttpLatencyBucketBounds[4], rgbt::common::kHttpLatencyBucketBounds[5],
+         rgbt::common::kHttpLatencyBucketBounds[6], rgbt::common::kHttpLatencyBucketBounds[7],
+         rgbt::common::kHttpLatencyBucketBounds[8], rgbt::common::kHttpLatencyBucketBounds[9],
+         rgbt::common::kHttpLatencyBucketBounds[10]},
+        // `path` 是**固定枚举**（11 条映射），与 `rgbt_http_requests_total` 用的是
+        // 同一个值，因此可以直接据此对齐两个指标、算"每个端点的 P95"。
+        // 带上它的理由见 metrics.hpp：没有它就只能给出"所有端点混在一起"的分位数，
+        // 而"哪个端点慢"正是容量报告要回答的第一个问题（TASK-022 实测踩到）。
+        {{"path", path}});
 }
 
 GatewayServiceImpl::GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* players,
@@ -451,6 +511,10 @@ void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
                                ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
 
+    // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
+    // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
+    const std::int64_t start_us = rgbt::common::NowUs();
+
     const std::string request_id = request->request_id();
 
     // 第一步：输入校验。输入错误不重试。
@@ -460,7 +524,7 @@ void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, input_error,
                       "登录请求参数不合法", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -472,14 +536,14 @@ void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAUTHENTICATED,
                                               "invalid_credential", "账号或密码不正确", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
     if (credential == CredentialStatus::kAccountDisabled) {
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAUTHENTICATED,
                                               "account_disabled", "账号已被禁用", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
     if (credential == CredentialStatus::kUnavailable) {
@@ -489,7 +553,7 @@ void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::UNAVAILABLE, "player_store_unavailable",
                       "玩家档案暂时不可用，请稍后重试", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -504,12 +568,12 @@ void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                       "session_store_unavailable", "会话存储暂时不可用，请稍后重试", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200, request_id);
+    ApplyHttpStatusAndRecord(controller, 200, request_id, start_us);
     response->set_token(token);
     response->set_expires_in_seconds(session_ttl_seconds_);
     *response->mutable_player() = player;
@@ -520,6 +584,10 @@ void GatewayServiceImpl::GetCurrentPlayer(::google::protobuf::RpcController* con
                                           rgbt::gateway::v1::GetCurrentPlayerResponse* response,
                                           ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
+
+    // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
+    // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
+    const std::int64_t start_us = rgbt::common::NowUs();
 
     // 注意：Token 不能只从 request->token() 取。brpc 不把 HTTP 头映射进 protobuf
     // 字段，携带 Authorization 头的请求在这里会是空字符串。
@@ -535,7 +603,7 @@ void GatewayServiceImpl::GetCurrentPlayer(::google::protobuf::RpcController* con
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth, request_id);
+        ApplyHttpStatusAndRecord(controller, auth, request_id, start_us);
         return;
     }
 
@@ -545,12 +613,12 @@ void GatewayServiceImpl::GetCurrentPlayer(::google::protobuf::RpcController* con
             FillError(response->mutable_error(), ErrorCode::NOT_FOUND, "player_not_found",
                       "会话对应的玩家不存在", request_id);
         response->set_status_code(http_status);
-        ApplyHttpStatusAndRecord(controller, http_status, request_id);
+        ApplyHttpStatusAndRecord(controller, http_status, request_id, start_us);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200, request_id);
+    ApplyHttpStatusAndRecord(controller, 200, request_id, start_us);
     *response->mutable_player() = player.value();
 }
 
@@ -559,6 +627,10 @@ void GatewayServiceImpl::Logout(::google::protobuf::RpcController* controller,
                                 rgbt::gateway::v1::LogoutResponse* response,
                                 ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
+
+    // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
+    // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
+    const std::int64_t start_us = rgbt::common::NowUs();
 
     // 同 GetCurrentPlayer：Token 需要从 HTTP 头或 query string 中提取。
     const std::string token = ExtractToken(controller, request->token());
@@ -570,7 +642,7 @@ void GatewayServiceImpl::Logout(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, token_error,
                       "Token 缺失或格式不合法", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -580,13 +652,13 @@ void GatewayServiceImpl::Logout(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                       "session_store_unavailable", "会话存储暂时不可用，请稍后重试", request_id);
         response->set_status_code(http_status);
-        ApplyHttpStatusAndRecord(controller, http_status, request_id);
+        ApplyHttpStatusAndRecord(controller, http_status, request_id, start_us);
         return;
     }
 
     // 会话本就不存在时也返回成功：登出是幂等操作，重复登出不应报错。
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200, request_id);
+    ApplyHttpStatusAndRecord(controller, 200, request_id, start_us);
 }
 
 std::int32_t GatewayServiceImpl::ResolvePlayerId(const std::string& token,
@@ -756,6 +828,10 @@ void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* control
                                       ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
 
+    // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
+    // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
+    const std::int64_t start_us = rgbt::common::NowUs();
+
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
 
@@ -765,7 +841,7 @@ void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* control
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth, request_id);
+        ApplyHttpStatusAndRecord(controller, auth, request_id, start_us);
         return;
     }
 
@@ -781,7 +857,7 @@ void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* control
                                {"http_status", std::to_string(status)}});
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -795,7 +871,7 @@ void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* control
                            {"room_id", snapshot.room_id}});
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200, request_id);
+    ApplyHttpStatusAndRecord(controller, 200, request_id, start_us);
     FillMatchStatus(snapshot, response->mutable_match());
 }
 
@@ -805,6 +881,10 @@ void GatewayServiceImpl::GetMatchStatus(::google::protobuf::RpcController* contr
                                         ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
 
+    // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
+    // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
+    const std::int64_t start_us = rgbt::common::NowUs();
+
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
 
@@ -814,7 +894,7 @@ void GatewayServiceImpl::GetMatchStatus(::google::protobuf::RpcController* contr
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth, request_id);
+        ApplyHttpStatusAndRecord(controller, auth, request_id, start_us);
         return;
     }
 
@@ -824,12 +904,12 @@ void GatewayServiceImpl::GetMatchStatus(::google::protobuf::RpcController* contr
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200, request_id);
+    ApplyHttpStatusAndRecord(controller, 200, request_id, start_us);
     FillMatchStatus(snapshot, response->mutable_match());
 }
 
@@ -838,6 +918,10 @@ void GatewayServiceImpl::CancelMatch(::google::protobuf::RpcController* controll
                                      rgbt::gateway::v1::CancelMatchResponse* response,
                                      ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
+
+    // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
+    // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
+    const std::int64_t start_us = rgbt::common::NowUs();
 
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
@@ -848,7 +932,7 @@ void GatewayServiceImpl::CancelMatch(::google::protobuf::RpcController* controll
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth, request_id);
+        ApplyHttpStatusAndRecord(controller, auth, request_id, start_us);
         return;
     }
 
@@ -859,12 +943,12 @@ void GatewayServiceImpl::CancelMatch(::google::protobuf::RpcController* controll
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200, request_id);
+    ApplyHttpStatusAndRecord(controller, 200, request_id, start_us);
     FillMatchStatus(snapshot, response->mutable_match());
 }
 
@@ -874,6 +958,10 @@ void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
                                   ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
 
+    // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
+    // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
+    const std::int64_t start_us = rgbt::common::NowUs();
+
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
     const std::string room_id = ExtractQueryParam(controller, "room_id", request->room_id());
@@ -884,7 +972,7 @@ void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth, request_id);
+        ApplyHttpStatusAndRecord(controller, auth, request_id, start_us);
         return;
     }
 
@@ -893,7 +981,7 @@ void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
                       "缺少 room_id", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -901,7 +989,7 @@ void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "room_unavailable", "房间服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -911,12 +999,12 @@ void GatewayServiceImpl::JoinRoom(::google::protobuf::RpcController* controller,
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200, request_id);
+    ApplyHttpStatusAndRecord(controller, 200, request_id, start_us);
     FillRoomState(snapshot, response->mutable_room());
 }
 
@@ -925,6 +1013,10 @@ void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controll
                                      rgbt::gateway::v1::SubmitInputResponse* response,
                                      ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
+
+    // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
+    // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
+    const std::int64_t start_us = rgbt::common::NowUs();
 
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
@@ -936,7 +1028,7 @@ void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controll
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth, request_id);
+        ApplyHttpStatusAndRecord(controller, auth, request_id, start_us);
         return;
     }
 
@@ -945,7 +1037,7 @@ void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controll
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
                       "缺少 room_id", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -953,7 +1045,7 @@ void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controll
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "room_unavailable", "房间服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -965,12 +1057,12 @@ void GatewayServiceImpl::SubmitInput(::google::protobuf::RpcController* controll
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200, request_id);
+    ApplyHttpStatusAndRecord(controller, 200, request_id, start_us);
     FillRoomState(snapshot, response->mutable_room());
 }
 
@@ -979,6 +1071,10 @@ void GatewayServiceImpl::GetRoomState(::google::protobuf::RpcController* control
                                       rgbt::gateway::v1::GetRoomStateResponse* response,
                                       ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
+
+    // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
+    // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
+    const std::int64_t start_us = rgbt::common::NowUs();
 
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
@@ -990,7 +1086,7 @@ void GatewayServiceImpl::GetRoomState(::google::protobuf::RpcController* control
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth, request_id);
+        ApplyHttpStatusAndRecord(controller, auth, request_id, start_us);
         return;
     }
     // 这里只校验身份，不使用 player_id：房间快照对同局玩家是共享信息，
@@ -1002,7 +1098,7 @@ void GatewayServiceImpl::GetRoomState(::google::protobuf::RpcController* control
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
                       "缺少 room_id", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -1010,7 +1106,7 @@ void GatewayServiceImpl::GetRoomState(::google::protobuf::RpcController* control
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "room_unavailable", "房间服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -1020,12 +1116,12 @@ void GatewayServiceImpl::GetRoomState(::google::protobuf::RpcController* control
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200, request_id);
+    ApplyHttpStatusAndRecord(controller, 200, request_id, start_us);
     FillRoomState(snapshot, response->mutable_room());
 }
 
@@ -1034,6 +1130,10 @@ void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* contr
                                         rgbt::gateway::v1::GetMatchResultResponse* response,
                                         ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
+
+    // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
+    // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
+    const std::int64_t start_us = rgbt::common::NowUs();
 
     const std::string token = ExtractToken(controller, request->token());
     const std::string request_id = request->request_id();
@@ -1045,7 +1145,7 @@ void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* contr
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth, request_id);
+        ApplyHttpStatusAndRecord(controller, auth, request_id, start_us);
         return;
     }
     (void)player_id;
@@ -1055,7 +1155,7 @@ void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* contr
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "match_id_required",
                       "缺少 match_id", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -1063,7 +1163,7 @@ void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* contr
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "room_unavailable", "房间服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -1079,12 +1179,12 @@ void GatewayServiceImpl::GetMatchResult(::google::protobuf::RpcController* contr
     if (status != 200) {
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200, request_id);
+    ApplyHttpStatusAndRecord(controller, 200, request_id, start_us);
     if (view.has_result) {
         rgbt::gateway::v1::MatchResultInfo* result = response->mutable_result();
         result->set_match_id(view.result.match_id);
@@ -1102,6 +1202,10 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
                                       ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
 
+    // TASK-022：处理耗时从这一行开始计。brpc 服务端拿不到请求开始时间，
+    // 因此只能在每个处理函数入口取一次（见 ApplyHttpStatusAndRecord 的注释）。
+    const std::int64_t start_us = rgbt::common::NowUs();
+
     const std::string token = ExtractToken(controller, request->token());
     // TASK-018：`request_id` 也从 query string 读。GET /stream 没有请求体，而 brpc
     // **不会**把 query string 映射进 protobuf 字段（与 token/room_id 同一个坑），
@@ -1117,7 +1221,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
     if (auth != 200) {
         *response->mutable_error() = error;
         response->set_status_code(auth);
-        ApplyHttpStatusAndRecord(controller, auth, request_id);
+        ApplyHttpStatusAndRecord(controller, auth, request_id, start_us);
         return;
     }
 
@@ -1126,7 +1230,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "room_id_required",
                       "缺少 room_id", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -1134,7 +1238,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "room_unavailable", "房间服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -1151,7 +1255,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         const std::int32_t status = HandleRoomFailure(lookup, request_id, &error);
         *response->mutable_error() = error;
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
     bool is_member = false;
@@ -1172,7 +1276,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
             FillError(response->mutable_error(), ErrorCode::INVALID_ARGUMENT, "not_a_member",
                       "该玩家不是这一局的成员", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -1180,7 +1284,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::UNAVAILABLE,
                                               "stream_unavailable", "推送服务未配置", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -1192,7 +1296,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
             FillError(response->mutable_error(), ErrorCode::INTERNAL, "stream_requires_http",
                       "推送接口只能通过 HTTP 访问", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -1213,7 +1317,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::INTERNAL,
                                               "stream_unavailable", "无法创建推送通道", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -1242,7 +1346,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
         const std::int32_t status = FillError(response->mutable_error(), ErrorCode::INTERNAL,
                                               "stream_unavailable", "订阅注册失败", request_id);
         response->set_status_code(status);
-        ApplyHttpStatusAndRecord(controller, status, request_id);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
         return;
     }
 
@@ -1265,7 +1369,7 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
                            {"player", player_id},
                            {"last_event_id", last_event_id_text}});
     response->set_status_code(200);
-    ApplyHttpStatusAndRecord(controller, 200, request_id);
+    ApplyHttpStatusAndRecord(controller, 200, request_id, start_us);
 }
 
 bool GatewayServiceImpl::DependenciesHealthy() {

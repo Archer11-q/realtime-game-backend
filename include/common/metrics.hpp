@@ -101,7 +101,39 @@ public:
                std::initializer_list<MetricLabel> labels = {});
 
     /// @brief 记录一次观测到直方图里。单位由调用方保证（惯例是秒）。
+    ///
+    /// 桶边界取 `DefaultBounds()`（1 ms ~ 5 s）。
     void Observe(std::string_view name, std::string_view help, double value);
+
+    /// @brief 同上，但由调用方给出桶边界（TASK-022）。
+    ///
+    /// 为什么需要自定义桶：默认桶是为**服务间 RPC** 挑的（1 ms ~ 5 s，见
+    /// `DefaultBounds`），而 HTTP 端点的 SLO 是「P95 < 100 ms、P99 < 250 ms」
+    /// （`docs/04-quality-and-observability.md` 第 5 节）。用默认桶时这三条目标线
+    /// **全部落在同一个桶里**，P95/P99 只能给出「< 250 ms」这种粒度，无法回答
+    /// "达标了吗"。把 SLO 线本身做成桶边界，读数才有意义。
+    ///
+    /// 边界只在**首次**注册时生效（沿用"注册即固定"的既有约定）：同一指标第二次
+    /// 用不同边界调用会被忽略，而不是让已经在计数的桶悄悄换一套刻度。
+    /// @param bounds 升序上界（秒）。空则退回 `DefaultBounds()`。
+    void Observe(std::string_view name, std::string_view help, double value,
+                 std::initializer_list<double> bounds);
+
+    /// @brief 带标签的直方图（TASK-022）。
+    ///
+    /// 为什么延迟直方图需要 `path` 标签：**没有它就无法定位瓶颈**。不带标签时
+    /// Prometheus 只能给出"所有业务端点混在一起"的 P95，而"哪个端点慢"恰恰是
+    /// 容量报告要回答的第一个问题——TASK-022 实测到该缺陷（报告里只有一行
+    /// `{-}` 的读数），因此补上。
+    ///
+    /// 这不违反"避免高基数标签"的纪律：`path` 是**固定枚举**（11 条 restful 映射，
+    /// 见 `gateway_service.cpp` 的 `OperationForPath`），与 `room_id`/`player_id`
+    /// 那种随业务无限增长的标签是两回事。`rgbt_http_requests_total` 从一开始就是
+    /// 这么做的，本条只是让直方图与它对齐。
+    ///
+    /// 桶边界同样只在**首次**注册时生效，因此边界与标签的组合一旦出现就不能再改。
+    void Observe(std::string_view name, std::string_view help, double value,
+                 std::initializer_list<double> bounds, std::initializer_list<MetricLabel> labels);
 
     /// @brief 导出 Prometheus 文本格式。
     ///
@@ -126,6 +158,8 @@ private:
     struct Histogram {
         std::string name;
         std::string help;
+        /// TASK-022：与 counter/gauge 一样支持标签（`path` 为固定枚举，非高基数）。
+        std::vector<MetricLabel> labels;
         std::vector<double> bounds;
         std::vector<std::uint64_t> bucket_counts;  // 与 bounds 对齐，非累计
         std::uint64_t count = 0;
@@ -160,7 +194,24 @@ private:
 inline constexpr const char* kMetricHttpRequestsTotal = "rgbt_http_requests_total";
 
 /// HTTP 请求耗时（秒）。标签与上面一致。
+///
+/// TASK-022 起**真的有数据了**：此前只有指标名与 `Observe()`，全仓库没有调用点，
+/// 于是 TASK-020 的延迟面板一直是空的。接入点在 Gateway 的
+/// `ApplyHttpStatusAndRecord`（每个 HTTP 响应都会经过它），桶边界取 SLO 线，
+/// 见 `kHttpLatencyBucketBounds`。
 inline constexpr const char* kMetricHttpRequestSeconds = "rgbt_http_request_seconds";
+
+/// HTTP 耗时的桶边界（秒）。
+///
+/// 为什么不用 `DefaultBounds()`（1 ms ~ 5 s 的粗粒度）：那是给服务间 RPC 挑的，
+/// 而 HTTP 端点的 SLO 是「P95 < 100 ms、P99 < 250 ms」
+/// （`docs/04-quality-and-observability.md` 第 5 节）。用默认桶时 100 ms 与 250 ms
+/// 会落进同一个桶，P95/P99 只能读出「< 250 ms」，无法回答"达标了吗"。
+///
+/// 因此边界**贴着 SLO 线**排：首尾 1 ms / 5 s 只用于给出量级，中间的 50/100/250 ms
+/// 是三条判据本身。
+inline constexpr double kHttpLatencyBucketBounds[] = {0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+                                                      0.1,   0.25,   0.5,   1.0,  5.0};
 
 /// 当前 SSE 连接数（gauge）。
 inline constexpr const char* kMetricSseConnections = "rgbt_sse_connections";

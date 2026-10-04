@@ -21,16 +21,19 @@
 #include "in_memory_player_directory.hpp"
 #include "password_hash.hpp"
 #include "player_reader.hpp"
+#include "test_credentials.hpp"
 
 namespace {
 
 using rgbt::gateway::CredentialStatus;
 using rgbt::gateway::DatabasePlayerDirectory;
+using rgbt::gateway::EnableSyntheticBenchAccounts;
 using rgbt::gateway::InMemoryPlayerDirectory;
 using rgbt::gateway::PlayerDirectory;
 using rgbt::gateway::PlayerReader;
 using rgbt::gateway::PlayerRecord;
 using rgbt::gateway::ReaderStatus;
+using rgbt::gateway::SyntheticBenchAccountsEnabled;
 using rgbt::gateway::v1::PlayerInfo;
 
 /// 内存玩家档案读取器，用于替代 MySQL。
@@ -166,6 +169,72 @@ TEST(DatabasePlayerDirectoryTest, NullReaderIsUnavailable) {
     PlayerInfo player;
     EXPECT_EQ(directory.Authenticate("alice", "alice_dev_pw", &player),
               CredentialStatus::kUnavailable);
+}
+
+// ---------------------------------------------------------------------------
+// TASK-022：压测合成账号
+// ---------------------------------------------------------------------------
+
+/// 默认**关闭**：`bench-NNNNN` 不识认，与今天的行为完全一致。
+///
+/// 这是安全边界：合成账号让"任何 bench-NNNNN 都能用一个固定口令登录"成立，
+/// 因此它必须默认关闭、只能由显式开关打开。用例锁住默认值。
+TEST(DatabasePlayerDirectoryTest, SyntheticBenchAccountsAreOffByDefault) {
+    EXPECT_FALSE(SyntheticBenchAccountsEnabled());
+    FakePlayerReader reader;
+    reader.Add(MakeRecord("bench-00001", "p-90001", "Bench 1", "active"));
+    DatabasePlayerDirectory directory(&reader);
+
+    PlayerInfo player;
+    EXPECT_EQ(directory.Authenticate("bench-00001", "bench_dev_pw", &player),
+              CredentialStatus::kInvalidCredential);
+}
+
+/// 开启后按严格规则识认：恰好 `bench-` + 5 位数字。
+///
+/// **为什么严格到 5 位**：这是夹具约定而不是用户标识。宽松匹配会让
+/// `benchmark`、`bench-admin`、`bench-1` 这类名字意外获得一个固定口令，
+/// 而那种错误在压测里完全看不出来。
+TEST(DatabasePlayerDirectoryTest, SyntheticBenchAccountsMatchOnlyTheExactPattern) {
+    EnableSyntheticBenchAccounts(true);
+    FakePlayerReader reader;
+    for (const char* account : {"bench-00001", "bench-99999", "benchmark", "bench-admin", "bench-1",
+                                "bench-000001", "bench-0000a"}) {
+        reader.Add(MakeRecord(account, std::string("p-9-") + account, account, "active"));
+    }
+    DatabasePlayerDirectory directory(&reader);
+    PlayerInfo player;
+
+    EXPECT_EQ(directory.Authenticate("bench-00001", "bench_dev_pw", &player),
+              CredentialStatus::kOk);
+    EXPECT_EQ(directory.Authenticate("bench-99999", "bench_dev_pw", &player),
+              CredentialStatus::kOk);
+
+    // 下列名字都不符合严格模式，必须仍按凭据无效处理。
+    for (const char* account :
+         {"benchmark", "bench-admin", "bench-1", "bench-000001", "bench-0000a"}) {
+        EXPECT_EQ(directory.Authenticate(account, "bench_dev_pw", &player),
+                  CredentialStatus::kInvalidCredential)
+            << account;
+    }
+
+    // 口令错也不行（合成账号不是"免密"）。
+    EXPECT_EQ(directory.Authenticate("bench-00001", "wrong", &player),
+              CredentialStatus::kInvalidCredential);
+
+    // 复原全局状态，避免影响同一二进制里的其它用例。
+    EnableSyntheticBenchAccounts(false);
+    EXPECT_FALSE(SyntheticBenchAccountsEnabled());
+}
+
+/// 内置身份不受开关影响（开关只管 bench-*）。
+TEST(DatabasePlayerDirectoryTest, BuiltinAccountsStillWorkWhenBenchAccountsAreOff) {
+    FakePlayerReader reader;
+    reader.Add(MakeRecord("alice", "p-0001", "Alice", "active"));
+    DatabasePlayerDirectory directory(&reader);
+
+    PlayerInfo player;
+    EXPECT_EQ(directory.Authenticate("alice", "alice_dev_pw", &player), CredentialStatus::kOk);
 }
 
 // ---------------------------------------------------------------------------

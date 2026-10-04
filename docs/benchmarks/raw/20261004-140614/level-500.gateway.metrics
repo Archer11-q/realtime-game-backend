@@ -1,0 +1,115 @@
+# HELP rgbt_http_requests_total Gateway 处理的 HTTP 请求数，按映射路径与 HTTP 状态码分组
+# TYPE rgbt_http_requests_total counter
+rgbt_http_requests_total{path="/api/v1/login",status="200"} 500
+rgbt_http_requests_total{path="/api/v1/matches",status="200"} 1000
+rgbt_http_requests_total{path="/api/v1/matches",status="503"} 183
+rgbt_http_requests_total{path="/api/v1/matches/current",status="200"} 38723
+rgbt_http_requests_total{path="/api/v1/rooms/input",status="200"} 4755
+rgbt_http_requests_total{path="/api/v1/rooms/input",status="400"} 245
+rgbt_http_requests_total{path="/api/v1/rooms/input",status="409"} 128
+rgbt_http_requests_total{path="/api/v1/rooms/join",status="200"} 500
+rgbt_http_requests_total{path="/api/v1/stream",status="200"} 500
+# HELP rgbt_rpc_calls_total Gateway 发起的服务间 RPC 调用数
+# TYPE rgbt_rpc_calls_total counter
+rgbt_rpc_calls_total{target="match",outcome="failed"} 183
+rgbt_rpc_calls_total{target="match",outcome="ok"} 39723
+rgbt_rpc_calls_total{target="room",outcome="failed"} 873
+rgbt_rpc_calls_total{target="room",outcome="ok"} 35567
+# HELP rgbt_push_backfilled_frames 累计补发出去的推送帧数
+# TYPE rgbt_push_backfilled_frames gauge
+rgbt_push_backfilled_frames 2134
+# HELP rgbt_push_reset_total 累计发出 stream.reset 的次数，按原因分组
+# TYPE rgbt_push_reset_total gauge
+rgbt_push_reset_total{reason="id_ahead"} 0
+rgbt_push_reset_total{reason="id_current"} 598
+rgbt_push_reset_total{reason="id_malformed"} 0
+rgbt_push_reset_total{reason="id_out_of_window"} 0
+# HELP rgbt_sse_connections 当前 SSE 连接数
+# TYPE rgbt_sse_connections gauge
+rgbt_sse_connections 0
+# HELP rgbt_http_request_seconds Gateway 的 HTTP 处理耗时（秒），按业务路径计
+# TYPE rgbt_http_request_seconds histogram
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="0.001"} 0
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="0.0025"} 1
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="0.005"} 4
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="0.01"} 10
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="0.025"} 499
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="0.05"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="0.1"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="0.25"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="0.5"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="1"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="5"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/login",le="+Inf"} 500
+rgbt_http_request_seconds_sum{path="/api/v1/login"} 8.29606
+rgbt_http_request_seconds_count{path="/api/v1/login"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="0.001"} 52
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="0.0025"} 105
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="0.005"} 153
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="0.01"} 427
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="0.025"} 626
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="0.05"} 689
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="0.1"} 694
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="0.25"} 897
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="0.5"} 996
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="1"} 1183
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="5"} 1183
+rgbt_http_request_seconds_bucket{path="/api/v1/matches",le="+Inf"} 1183
+rgbt_http_request_seconds_sum{path="/api/v1/matches"} 174.603
+rgbt_http_request_seconds_count{path="/api/v1/matches"} 1183
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="0.001"} 15798
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="0.0025"} 33757
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="0.005"} 37081
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="0.01"} 38129
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="0.025"} 38512
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="0.05"} 38572
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="0.1"} 38623
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="0.25"} 38719
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="0.5"} 38723
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="1"} 38723
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="5"} 38723
+rgbt_http_request_seconds_bucket{path="/api/v1/matches/current",le="+Inf"} 38723
+rgbt_http_request_seconds_sum{path="/api/v1/matches/current"} 85.302
+rgbt_http_request_seconds_count{path="/api/v1/matches/current"} 38723
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="0.001"} 98
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="0.0025"} 139
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="0.005"} 167
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="0.01"} 295
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="0.025"} 498
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="0.05"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="0.1"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="0.25"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="0.5"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="1"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="5"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/join",le="+Inf"} 500
+rgbt_http_request_seconds_sum{path="/api/v1/rooms/join"} 4.38167
+rgbt_http_request_seconds_count{path="/api/v1/rooms/join"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="0.001"} 47
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="0.0025"} 114
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="0.005"} 122
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="0.01"} 170
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="0.025"} 381
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="0.05"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="0.1"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="0.25"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="0.5"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="1"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="5"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/stream",le="+Inf"} 500
+rgbt_http_request_seconds_sum{path="/api/v1/stream"} 7.52906
+rgbt_http_request_seconds_count{path="/api/v1/stream"} 500
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="0.001"} 2557
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="0.0025"} 4349
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="0.005"} 4664
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="0.01"} 4991
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="0.025"} 5118
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="0.05"} 5128
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="0.1"} 5128
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="0.25"} 5128
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="0.5"} 5128
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="1"} 5128
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="5"} 5128
+rgbt_http_request_seconds_bucket{path="/api/v1/rooms/input",le="+Inf"} 5128
+rgbt_http_request_seconds_sum{path="/api/v1/rooms/input"} 9.90835
+rgbt_http_request_seconds_count{path="/api/v1/rooms/input"} 5128

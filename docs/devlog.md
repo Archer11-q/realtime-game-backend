@@ -3068,3 +3068,190 @@ bash scripts/verify-all.sh               # 9/9 通过，236 秒
   更早的任务分支**尚未清理**——它们的内容早已合并且各自对应一个已完成的任务，
   删除不会丢提交。清理与否由项目所有者决定（本次只删了 TASK-021 那条，
   因为它是本轮搬移的直接产物）。
+
+## TASK-022 进行中记录（2026-10-04）
+
+> 本节是**编码过程中的记录**，最终容量报告与瓶颈结论见 `docs/benchmarks/`。
+> 任务完成时会在本文件补一节完整的「TASK-022 实施记录」。
+
+### 前置探测（项目所有者要求的两个问题，实测回答）
+
+- **压测客户端形态**：`wrk`/`wrk2`/`hey`/`bombardier`/`ab`/`siege`/`vegeta`/`k6`/`locust`
+  **一个都没有**；`sudo -n` **不可用**，装不了。可用的是 `python3 3.14.4`（含 `asyncio`）、
+  `requests`（**阻塞**，压测不可用）、`gcc/g++ 15.2`、`cmake 4.2.3`。
+  决定：**自研 Python asyncio 机器人**。理由不是"装不上"，而是 `wrk`/`hey` 只能打
+  静态 HTTP，恰好绕开本系统真正的四个瓶颈候选（SSE 扇出、房间帧推进、每秒快照写入、
+  匹配队列写入）——用它测出来的好看数字回答不了本任务的问题。
+- **1000 连接可行性**：`/proc/sys/fs/file-max` 与 `nr_open` 实际无上限（9.2e18 / 2.1e9），
+  已分配 fd 仅 2386；但 **shell `ulimit -n` 只有 10240**，服务端与压测端都必须显式提高，
+  否则失败原因是 EMFILE 而不是被测系统的行为。CPU 16 核；内存 11 GiB（Docker 同样 11 GiB）
+  是真正的约束。MySQL `max_connections=151`、Redis `maxclients=10000`。
+
+### 一个必须规避的坑：request_id 幂等键没有玩家维度
+
+`RedisSessionStore::KeyForLoginIdempotency` 拼的是 `<env>:gateway:idem:login:<request_id>`，
+**不含 player_id**。而现有测试与验收脚本普遍用 shell 的 `$RANDOM` 生成 request_id
+（只有 32768 种取值）。压测机器人如果照做，撞号时会**拿到别人的 Token**，整轮压测静默
+退化成"少数几个玩家在打"。因此 `bench/loadgen.py` 的每一处 request_id 都用 `uuid4`。
+
+### 已发现并修掉的三个真实缺陷（都在压测工具自身）
+
+1. **匿名命名空间里的时钟**：`logging.cpp` 只有 `SystemNowMs()`，HTTP 耗时统计需要微秒。
+   新增 `rgbt::common::NowUs()`。**刻意与日志时间戳同源**（同一个 `system_clock`，
+   只是分辨率不同）：若计时改用 `steady_clock`，"日志说请求在 T 时刻结束"与
+   "这次耗时 3 ms"就来自两个时基，时钟跳变时互相矛盾。代价是 NTP 回拨会算出负耗时，
+   因此 `RecordHttpLatency` **显式丢弃**负值观测（归零会落进第一个桶、把分位数拉低）。
+2. **`Stats` 少了 `attack_rejections` 字段**：`attack()` 在记录失败原因时抛
+   `AttributeError`，而异常发生在计数之前——**攻击失败根本没被记录**。
+   是压测工具里最危险的一类错误：统计自欺。已修，并在异常文字里带上类名与消息
+   （只记类名的话，"`AttributeError`"这种线索等于没有，本次实测踩到）。
+3. **重入队立刻拿回上一局的旧房间**：Match 的已配对结果保留
+   `kDefaultResultTtlMs`（120 秒），于是"打完一局 -> 立刻重新入队"会拿到上一局的
+   `room_id`，再 `JoinRoom` 必然 409 `room_already_finished`。实测证据：91 次配对里
+   **86 次进房被拒**，稳态压测退化成"反复撞已结束的房间"。
+   修法是机器人记住 `last_finished_room` 并跳过该结果（新增 `stale_result_skipped` 计数）。
+
+另外修掉两处误报：`stream.reset` 的原因此前全部记成 `unknown`（漏了下钻 SSE 的
+`payload.room` 那一层），以及 `AttributeError` 只记类名不记文字。
+
+### 环境残留导致的一次假失败（值得记进 Runbook）
+
+对着**残留的旧服务进程**跑压测时，症状是 `join_room` 全部 404、而 Room 侧
+**一条结构化日志都没有**、Match 侧也没有 `create_room_*`。原因是端口被上一轮残留的
+服务占着："配对"发生在旧 Match 里，新 Room 从未收到 `CreateRoom`。
+在干净环境（端口预检 + 清 Redis/rooms）下同样的负载**0 异常、3 局全部 `hp_zero` 收尾**。
+教训：压测脚本**必须**先做端口预检与状态清理，否则失败原因与真实缺陷毫无关系
+——这与 TASK-021 的 verify-trace.sh 踩到的第三个坑是同一类。
+
+### 延迟直方图（TASK-020 遗留项）已接通
+
+- `MetricsRegistry::Observe` 新增**自定义桶边界**重载：HTTP 端点的 SLO 是
+  P95 < 100 ms、P99 < 250 ms，而默认桶（1 ms ~ 5 s）把这两条线放进同一个桶，
+  读不出"达标了吗"。边界只在**首次**注册时生效，避免运行中换刻度。
+- Gateway 的 11 个处理函数入口各取一次 `NowUs()`，`ApplyHttpStatusAndRecord`
+  多收一个 `start_us` 形参；`start_us == 0` 时**不观测**（宁可不记，也不记一个假的 0）。
+  51 处调用点已补齐。非 `/api/v1/` 前缀（brpc 内置端点）不记。
+- 单元测试 `ctest` 269 -> 280（新增 5 个：自定义桶、首注生效、业务请求产生观测、
+  无 HTTP 上下文不观测、非业务路径不观测），全绿 0 warning。
+
+## TASK-022 实施记录（2026-10-04）
+
+> 完整容量报告见 `docs/benchmarks/README.md`；原始数据见
+> `docs/benchmarks/raw/20261004-140614/`。本节记录**实现与踩坑经过**，
+> 数字只在必要时引用，避免两处维护同一份数据。
+
+### 交付物
+
+- `bench/loadgen.py`：asyncio 压测机器人。每个虚拟玩家走完整链路
+  （登录 → 入队 → 轮询配对 → 进房 → SSE 长连接 → 每 2 秒攻击）。
+  自带最小 HTTP/1.1 客户端（keep-alive 池 + chunked 解析）——因为 `requests`
+  是阻塞的会卡住事件循环，而 `aiohttp` 没装、也不能装（无免密 sudo）。
+- `bench/histogram_quantiles.py`：从 `/metrics` 原始文本按 `path` 分组算分位数。
+- `scripts/bench.sh`：6 档编排（端口预检 → ulimit → 清状态 → 起服务 → 开户 →
+  压测 → 采指标 → 归档日志 → 汇总），每档重启服务。
+- `docs/benchmarks/README.md`：首份容量报告（环境、方法、结果、瓶颈、未测项、决定）。
+
+### 顺带补齐的 TASK-020 遗留项（项目所有者确认并进本轮）
+
+- `MetricsRegistry::Observe` 新增**自定义桶边界**与**标签**两个重载。
+  桶边界取 SLO 线（50/100/250 ms）：默认桶（1 ms ~ 5 s）把 SLO 的两条线放进同一个
+  桶里，P95 只能读出「< 250 ms」，无法判定"达标了吗"。
+- 标签是必需的：**没有 `path` 标签只能说"所有端点混在一起的 P95"**，
+  而"哪个端点慢"正是容量报告要回答的第一个问题。第一版漏了它，实测报告里只出现
+  一行 `{-}`，因此补上（`path` 是固定枚举，不违反高基数纪律）。
+- Gateway 的 11 个处理函数入口各取一次 `rgbt::common::NowUs()`（新增），
+  `ApplyHttpStatusAndRecord` 多收一个 `start_us`；`start_us == 0` 时**不观测**。
+- 时钟刻意与日志时间戳同源（同一个 `system_clock`，只换分辨率）：
+  若计时改用 `steady_clock`，"日志说请求在 T 时刻结束"与"这次耗时 3 ms"
+  就来自两个时基，时钟跳变时互相矛盾。代价是 NTP 回拨会算出负耗时，
+  因此 `RecordHttpLatency` 显式丢弃负值观测（归零会落进第一个桶、拉低分位数）。
+
+### 一次严重的方法学失败（最值得记下来的一条）
+
+第一版压测复用种子账号 `alice/bob/dave`——内置**启用**身份只有 3 个，
+于是 1000 个机器人只产生 **3 个 `player_id`**：
+
+- 绝大多数入队被幂等判为 `kAlreadyQueued`（实测 997/1000 次），队列里根本没有
+  1000 个人；根因是 Match 的"已配对结果"保留 `kDefaultResultTtlMs`（120 秒），
+  期间同一玩家重新入队会直接拿回旧结果；
+- 同一玩家的重复进房是**幂等成功**（`BattleRoom::Join` 在 `player->connected` 时
+  返回 `kOk`），于是"重复加入同一个已结束房间"被计成正常对局；
+- 最终产出 `room_created=1` 却 `room_joined=667` —— **667 次 join 不可能挤进一个
+  两人房间**。这组自相矛盾的数字是发现问题的唯一线索。
+
+**这个矛盾数字差点被写进报告。** 教训：**压测夹具的每个虚拟玩家必须有独立身份**，
+否则测到的是夹具的行为而不是系统的行为。修正方式是在 Gateway 增加
+`-enable_bench_accounts`（**默认关闭**、只识认严格的 `bench-<5 位数字>`、
+口令固定 `bench_dev_pw`），并为每个机器人开一个档案。修正前后同一档位对比：
+
+| 指标（1000 连接） | 复用 3 个账号 | 独立身份 |
+|---|---|---|
+| 成功配对 | 667 | **1000** |
+| 服务端建房间数 | 1 | **2979** |
+| 成功攻击 | 694 | **25218** |
+| `rooms/join` 503 | 640 | **0** |
+
+### 其他三个被修掉的工具缺陷
+
+1. **`Stats` 少了 `attack_rejections` 字段**：`attack()` 在记录失败原因时抛
+   `AttributeError`，而异常发生在计数之前——**攻击失败根本没被记录**。
+   这是压测工具里最危险的一类错误：统计自欺。已修，并让异常文字带上类名与消息
+   （只记类名的话，`AttributeError` 这种线索等于没有）。
+2. **`stream.reset` 的原因全部记成 `unknown`**：漏了下钻 SSE 的 `payload.room`
+   那一层。修好后实测全部是 `id_current`（TASK-017 的正常路径）。
+3. **每档的服务端日志写同一个文件名**：事后只能看到最后一档的 Room 日志，
+   而"每档到底建了几个房间"恰恰是判断结果是否可信的关键证据（正是它暴露了上面
+   那个 667 次 join 的矛盾）。已改为 `logs/level-<N>/{room,match,gateway}.log`。
+
+### 环境残留导致的一次假失败
+
+对着残留的旧服务进程跑压测时，症状是 `join_room` 全部 404、而 Room 侧
+**一条结构化日志都没有**。原因是端口被上一轮残留进程占着："配对"发生在旧 Match
+里，新 Room 从未收到 `CreateRoom`。在干净环境下同样的负载 0 异常。
+教训：压测脚本**必须**先做端口预检与状态清理——这与 TASK-021 的 `verify-trace.sh`
+踩到的第三个坑是同一类，已是本项目第二次。
+
+### 瓶颈结论（详见报告第 5 节）
+
+**Match 的队列快照写入在请求路径上，并被全局 `snapshot_order_mutex_` 串行化**
+（`MatchQueue::PersistSnapshot`）。实测入队端点 P95：100 档位 88 ms →
+500 档位 **842 ms** → 1000 档位 **956 ms**（SLO 是 P95 < 100 ms）；
+轮询端点从 5.8 ms 涨到 859 ms（次生效应：超时清算也走快照写入）。
+这是 Backlog 里「把匹配队列的快照写入移出请求路径」那条已知限制的量化确认。
+
+**阶段决定：不优化。** Phase 3 的纪律是"只记录瓶颈，不立即优化"
+（`docs/02-roadmap.md` 第 6 节）；优化需要独立写入线程（引入新并发路径），
+更自然的落点是 Phase 4 故障注入之后——那时才知道"Redis 挂起"与"队列很长"
+哪一种该优先处理。
+
+### 未纳入本轮的两项
+
+- **Release 构建未测**：全部数字来自 `brpc-debug`，绝对延迟会显著高于 Release。
+- **长稳态未测**：120 秒结果保留期限制了对局周转，需要更长窗口才能与快照锁的影响
+  分开。
+
+## Phase 3 退出标准对照表（2026-10-04）
+
+Phase 3 的退出标准写在 [docs/02-roadmap.md](02-roadmap.md) 第 6 节。这张表逐条
+回答"凭什么认为达成了"——**每一行都必须落到一条实际跑过的命令或一段代码上**。
+
+| # | 退出标准（roadmap 第 6 节原文） | 凭什么认为达成 | 验收方式 | 任务 |
+|---|---|---|---|---|
+| 1 | 任一错误可以定位到服务、请求、会话或房间 | 三个服务输出单行 `key=value` 结构化日志，恒定字段含 `service=`/`level=`/`event=`；同一个 `request_id` 经 proto 既有字段贯通 Gateway → Match → Room，并在 Gateway 的每个 HTTP 响应上留一条 `request_done`（含 `op`/`status`/`trace`）；五条关键路径（登录/匹配/进房/重连/结算）都能按同一个 id 取出跨服务且时序单调的调用序 | `bash scripts/verify-observability.sh --logs`；`bash scripts/verify-trace.sh`；`ctest` 的 `logging_test` / `StreamHubTest` / `GatewayServiceTest` 用例 | TASK-018 / 021 |
+| 2 | 压测脚本、环境、版本和原始结果可复现 | `scripts/bench.sh` 一条命令跑 6 档（1/10/50/100/500/1000 连接），每档重启服务并清状态；每档落盘压测端 JSON、三个服务的 `/metrics` 快照、Prometheus 同源读数、RSS 采样与完整服务端日志；环境快照写入 `logs/env.txt`（内核、CPU、内存、编译器、构建类型、端口、抓取间隔） | `bash scripts/bench.sh`；`docs/benchmarks/README.md` 第 2、3 节；原始数据 `docs/benchmarks/raw/20261004-140614/` | TASK-022 |
+| 3 | 至少识别一个明确瓶颈，并决定暂不优化或进入下一阶段 | 瓶颈定位到 `MatchQueue::PersistSnapshot`（队列快照写入在请求路径上且被全局锁串行化），有代码指认与逐档延迟证据（入队 P95 88 ms → 842 ms → 956 ms，SLO 为 100 ms）；**决定：本阶段不优化**，把 Backlog 对应项升级为有证据的任务并补上量化目标（500 档位入队 P95 < 100 ms） | `docs/benchmarks/README.md` 第 5、7 节；`level-*.latency_by_path.txt` | TASK-022 |
+
+**本阶段明确未达成的部分**（写在这里，避免"全绿"被理解为一切都做到了）：
+
+1. **全部性能数字来自 `brpc-debug`（Debug、未开优化）**，因此只能用于横向比较
+   档位与定位瓶颈，**不能用于容量规划**。Release 复测留到需要时再做。
+2. **压测端与被测服务同机**，测到的是单机上限而非服务端能力上限。
+3. **长稳态未测**：`kDefaultResultTtlMs`（120 秒）限制了对局周转，
+   要把它与快照锁的影响分开需要更长的运行窗口。
+4. **未做故障注入**（Redis/MySQL 停机、进程崩溃、连接风暴）——那是 Phase 4 的范围，
+   本阶段的交付物是"容量基线"，不是"容错证据"。
+5. **`rooms/join`（P95 85 ms）与 `/api/v1/stream`（P95 216 ms）在 1000 档位偏高**，
+   但未突破同一数量级，已记为第二位观察项，未在本阶段处理。
+
+**结论**：三条退出标准都有对应的实测命令与代码依据；减去上面列出的五条未测项，
+Phase 3 可判定为完成，**最终结论由项目所有者验收后给出**。
