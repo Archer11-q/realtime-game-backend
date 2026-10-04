@@ -164,6 +164,22 @@ public:
     /// `brpc::Server::Stop()` 要等这些响应结束，进程就无法在预期时间内退出。
     void CloseAll();
 
+    /// @brief 进入排空（TASK-026）：**不再接受新订阅**。
+    ///
+    /// 之后 Subscribe 一律返回 `id == 0`，调用方据此给客户端 503 `shutting_down`
+    /// ——而不是让它连上一条马上就会被关掉的流。
+    void BeginShutdown();
+
+    /// @brief 对每条订阅发一个显式的关闭事件（`stream.closed`）后再关闭全部订阅。
+    ///
+    /// 与 CloseAll 的区别是**客户端看得见**：直接断开会让客户端把"服务优雅退出"
+    /// 与"网络故障"混为一谈，而两者对客户端意味着完全相反的下一步
+    /// （前者应停止重连，后者应立刻重连）。
+    ///
+    /// @param reason 稳定标识（本项目的取值是 `server_shutdown`），写进事件载荷。
+    /// @return 被关闭的订阅数。
+    std::size_t CloseAllWithEvent(const std::string& reason);
+
     /// @brief 当前订阅数（连接数）。
     [[nodiscard]] std::size_t ConnectionCount();
     /// @brief 当前被订阅的不同房间数。
@@ -317,6 +333,8 @@ private:
 
     std::thread thread_;
     std::atomic<bool> stopping_{false};
+    /// TASK-026：排空标志。置位后不再登记新订阅。
+    std::atomic<bool> draining_{false};
 };
 
 }  // namespace rgbt::gateway

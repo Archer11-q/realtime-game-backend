@@ -207,6 +207,16 @@ public:
     /// @brief 到达结果重试时刻。仅在 FINISHING 阶段有意义。
     [[nodiscard]] bool ShouldRetryPersist(std::int64_t now_ms) const;
 
+    /// @brief 作废对局（不产生胜负、不写对局结果）。
+    ///
+    /// 调用方必须已确认对局尚未结束（CREATED / WAITING / PLAYING）。
+    ///
+    /// 为什么它是 public（TASK-026）：有两个调用方——房间内部的宽限期结算
+    /// （双方都断线且都过期），以及服务排空时的超时兜底。排空那条路径上，
+    /// RoomManager 必须能把"还没打完的对局"留成一个明确的终态，
+    /// 而不是让它在库里永远停在 PLAYING。
+    void Abort(std::int64_t now_ms);
+
 private:
     /// 只给 RestoreFrom 用的默认构造。
     ///
@@ -223,9 +233,6 @@ private:
 
     /// 结束对局。调用方必须已确认对局处于 PLAYING。
     void Finish(FinishReason reason, std::string winner_id, std::int64_t now_ms);
-
-    /// 作废对局（不产生胜负、不写结果）。调用方必须已确认对局尚未结束。
-    void Abort(std::int64_t now_ms);
 
     /// @brief 宽限期结算：有人断线且已到期时结束或作废对局（TASK-016）。
     ///

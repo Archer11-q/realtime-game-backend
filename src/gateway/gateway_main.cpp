@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <memory>
@@ -79,6 +80,9 @@ DEFINE_string(room_host, "127.0.0.1", "Room/Battle Service 主机");
 DEFINE_int32(room_port, 8083, "Room/Battle Service 端口");
 DEFINE_int32(room_timeout_ms, 500, "调用 Room/Battle Service 的超时（毫秒）");
 DEFINE_int32(idle_timeout_s, -1, "连接空闲超时（秒），-1 表示不超时");
+DEFINE_int32(drain_timeout_ms, 30000,
+             "TASK-026：收到停止信号后等待已建立 SSE 走到终点的上限（毫秒）；"
+             "到点对仍未结束的订阅发显式 stream.closed 再关闭");
 // TASK-022：压测用的合成测试账号（`bench-00000` .. `bench-99999`，固定口令）。
 // **默认关闭**：只有并发容量测试才需要 N 个互不相同的玩家，而内置的 3 个启用
 // 身份做不到。用显式开关而不是"总是识认"，是为了让生产路径的行为不受影响，
@@ -91,6 +95,13 @@ std::atomic<bool> g_stopping{false};
 
 void HandleSignal(int /*sig*/) {
     g_stopping.store(true);
+}
+
+/// 当前墙钟毫秒。TASK-026 的排空需要它给"等多久"定上界。
+std::int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
 }  // namespace
@@ -257,10 +268,45 @@ int main(int argc, char* argv[]) {
 
     std::printf("收到停止信号，开始优雅退出\n");
     std::fflush(stdout);
-    // 顺序很重要：先停推送线程，再关闭所有 SSE 长连接，最后停服务器。
-    //   * 不先停线程，它会继续往正在被关闭的连接里写。
-    //   * 不关闭长连接，server.Stop() 要等这些响应结束，进程会挂住不退出——
-    //     SSE 是长连接，不会自己结束。
+
+    // --- TASK-026：排空 ---
+    //
+    // 三件事，顺序不能换：
+    //   1. 拒绝**新**请求（service.BeginShutdown()）：登录/入队/进房/输入/新订阅
+    //      一律 503 shutting_down；**读请求继续可用**，客户端还能读完自己那一局。
+    //   2. 停止接受新订阅（stream_hub.BeginShutdown()），并等已建立的 SSE 走到一个
+    //      明确的终点：房间打完就正常收到 `room.finished`；到点还没打完的，
+    //      先发 `stream.closed`（reason=server_shutdown）再关闭。
+    //      **不能直接断开**——那会让客户端把"服务优雅退出"与"网络故障"混为一谈，
+    //      而这两者对应完全相反的处理（前者停止重连，后者立刻重连）。
+    //   3. 最后才停推送线程并关连接（原有顺序：不先停线程，它会继续往正在被关闭的
+    //      连接里写；不关长连接，server.Stop() 会一直等它们结束，进程挂住不退出）。
+    service.BeginShutdown();
+    stream_hub.BeginShutdown();
+    const std::int64_t drain_started_ms = NowMs();
+    const std::int64_t drain_timeout_ms = FLAGS_drain_timeout_ms > 0 ? FLAGS_drain_timeout_ms : 0;
+    const std::int64_t drain_deadline_ms = drain_started_ms + drain_timeout_ms;
+    rgbt::common::LogInfo("drain_started",
+                          {{"subscribers", std::to_string(stream_hub.ConnectionCount())},
+                           {"timeout_ms", std::to_string(drain_timeout_ms)}});
+    while (stream_hub.ConnectionCount() > 0 && NowMs() < drain_deadline_ms) {
+        ::usleep(50 * 1000);
+    }
+    const std::size_t remaining = stream_hub.ConnectionCount();
+    if (remaining > 0) {
+        const std::size_t closed = stream_hub.CloseAllWithEvent("server_shutdown");
+        rgbt::common::LogWarn("drain_timeout_close",
+                              {{"closed", std::to_string(closed)},
+                               {"waited_ms", std::to_string(NowMs() - drain_started_ms)}});
+        std::printf("排空超时：显式关闭 %zu 条 SSE（已发送 stream.closed）\n", closed);
+    } else {
+        rgbt::common::LogInfo("drain_finished",
+                              {{"waited_ms", std::to_string(NowMs() - drain_started_ms)}});
+        std::printf("排空完成：等待 %lld ms，已建立的推送都走到了终点\n",
+                    static_cast<long long>(NowMs() - drain_started_ms));
+    }
+    std::fflush(stdout);
+
     stream_hub.Stop();
     stream_hub.CloseAll();
     server.Stop(0);

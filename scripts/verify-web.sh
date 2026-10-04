@@ -310,6 +310,7 @@ echo
 # ---------- 4. 启动后端 ----------
 echo "===== 4. 启动 Room、Match 与 Gateway ====="
 "$room_binary" -port "$room_port" -env_prefix dev \
+  -drain_timeout_ms 1000 \
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
   -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
   -mysql_database "$MYSQL_DATABASE" >/tmp/room.out 2>&1 &
@@ -336,6 +337,7 @@ curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$match_port/health" 2>/dev/n
   ok "Match 已就绪" || { fail "Match 未就绪"; cat /tmp/match.out; exit 1; }
 
 "$gateway_binary" -port "$gateway_port" -env_prefix dev \
+  -drain_timeout_ms 1000 \
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
   -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
   -mysql_database "$MYSQL_DATABASE" \

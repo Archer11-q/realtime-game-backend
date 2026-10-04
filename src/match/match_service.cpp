@@ -156,6 +156,7 @@ void MatchServiceImpl::EnqueueMatch(::google::protobuf::RpcController* /*control
             }
             case EnqueueOutcome::kAlreadyQueued:
             case EnqueueOutcome::kQueueFull:
+            case EnqueueOutcome::kShuttingDown:
             case EnqueueOutcome::kInvalidArgument:
                 event_rejected_.Add();
                 break;
@@ -186,6 +187,13 @@ void MatchServiceImpl::EnqueueMatch(::google::protobuf::RpcController* /*control
         case EnqueueOutcome::kQueueFull:
             FillError(response->mutable_error(), MatchErrorCode::MATCH_QUEUE_FULL, "queue_full",
                       "匹配队列已满，请稍后重试", request_id);
+            return;
+        case EnqueueOutcome::kShuttingDown:
+            // TASK-026：排空中拒绝新入队。留下一条日志，验收脚本与排障都靠它。
+            rgbt::common::LogWarn("match_enqueue_rejected", request_id,
+                                  {{"player", player_id}, {"reason", "shutting_down"}});
+            FillError(response->mutable_error(), MatchErrorCode::MATCH_SHUTTING_DOWN,
+                      "shutting_down", "服务正在排空，不再接受新的匹配请求", request_id);
             return;
         case EnqueueOutcome::kInvalidArgument:
             FillError(response->mutable_error(), MatchErrorCode::MATCH_INVALID_ARGUMENT,

@@ -262,6 +262,7 @@ echo
 # 玩家退回队列并表现为「一直 queued」——那是脚本少了依赖，不是系统坏了。
 echo "===== 4. 启动 Room、Match 与 Gateway ====="
 "$room_binary" -port "$room_port" -env_prefix dev \
+  -drain_timeout_ms 1000 \
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
   -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
   -mysql_database "$MYSQL_DATABASE" >/tmp/room.out 2>&1 &
@@ -308,6 +309,7 @@ else
 fi
 
 "$gateway_binary" -port "$gateway_port" -env_prefix dev \
+  -drain_timeout_ms 1000 \
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
   -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
   -mysql_database "$MYSQL_DATABASE" \

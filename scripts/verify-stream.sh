@@ -204,6 +204,7 @@ echo
 # ---------- 3. 启动服务 ----------
 echo "===== 3. 启动 Room、Match 与 Gateway ====="
 "$room_binary" -port "$room_port" -env_prefix dev \
+  -drain_timeout_ms 1000 \
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
   -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
   -mysql_database "$MYSQL_DATABASE" >/tmp/room.out 2>&1 &
@@ -233,6 +234,7 @@ curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$match_port/health" 2>/dev/n
 # 心跳默认 15 秒，本脚本没有耐心等那么久，因此缩短它是为了**能在脚本内观察到**，
 # 不是为了改产品默认值。
 "$gateway_binary" -port "$gateway_port" -env_prefix dev \
+  -drain_timeout_ms 1000 \
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
   -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
   -mysql_database "$MYSQL_DATABASE" \

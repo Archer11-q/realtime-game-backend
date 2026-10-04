@@ -464,4 +464,35 @@ TEST(DerivedRoomAllocatorTest, EmptyMatchIdIsRejected) {
     EXPECT_TRUE(allocator.Allocate("", {"p-0001", "p-0002"}, "req-1").empty());
 }
 
+// ---------------------------------------------------------------------------
+// TASK-026：排空
+// ---------------------------------------------------------------------------
+
+TEST_F(MatchQueueTest, EnqueueIsRejectedWhileShuttingDown) {
+    queue_->BeginShutdown();
+    EXPECT_TRUE(queue_->IsShuttingDown());
+
+    EXPECT_EQ(queue_->Enqueue("p-0001", "req-1", kT0), EnqueueOutcome::kShuttingDown);
+    // 排空不是"收下但不配对"：队列里一个人都不该留下。
+    EXPECT_EQ(queue_->QueueSize(), 0U);
+    EXPECT_EQ(queue_->GetStatus("p-0001", kT0).state, MatchStatusSnapshot::State::kIdle);
+}
+
+TEST_F(MatchQueueTest, ShuttingDownStillServesExistingResults) {
+    // "已配对的结果仍可领取"是任务单对 Match 排空的明确要求：否则玩家会在拿到
+    // 房间号之前被夺走那一局，而那比"拒绝新请求"更糟。
+    queue_->Enqueue("p-0001", "req-1", kT0);
+    ASSERT_EQ(queue_->Enqueue("p-0002", "req-2", kT0), EnqueueOutcome::kQueued);
+    ASSERT_EQ(queue_->GetStatus("p-0001", kT0).state, MatchStatusSnapshot::State::kMatched);
+
+    queue_->BeginShutdown();
+
+    const MatchStatusSnapshot status = queue_->GetStatus("p-0001", kT0);
+    EXPECT_EQ(status.state, MatchStatusSnapshot::State::kMatched);
+    EXPECT_EQ(status.room_id, "room-m-fixed");
+    // 新玩家被拒，且不会挤进队列。
+    EXPECT_EQ(queue_->Enqueue("p-0003", "req-3", kT0), EnqueueOutcome::kShuttingDown);
+    EXPECT_EQ(queue_->QueueSize(), 0U);
+}
+
 }  // namespace

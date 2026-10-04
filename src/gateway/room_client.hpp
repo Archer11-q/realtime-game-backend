@@ -98,6 +98,8 @@ enum class RoomCallStatus {
     kNotPlaying,
     /// 房间或结果不存在，对外返回 404。
     kNotFound,
+    /// TASK-026：对端正在排空（`ROOM_SHUTTING_DOWN`）。理由同 MatchCallStatus。
+    kShuttingDown,
     /// 对局已结束，不再接受该操作，对外返回 409。
     kAlreadyFinished,
     /// 对局已结束但结果尚未落库，对外返回 503 result_pending（可稍后重试）。

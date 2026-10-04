@@ -256,6 +256,7 @@ fi
 bin_dir="build/$preset/bin"
 
 "$bin_dir/rgbt_room" -port "$room_port" -env_prefix dev \
+  -drain_timeout_ms 1000 \
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
   -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
   -mysql_database "$MYSQL_DATABASE" >"$log_dir/room.log" 2>&1 &
@@ -277,6 +278,7 @@ done
 curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$match_port/health" && ok "Match 就绪" || { fail "Match 未就绪"; exit 1; }
 
 "$bin_dir/rgbt_gateway" -port "$gateway_port" -env_prefix dev \
+  -drain_timeout_ms 1000 \
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
   -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
   -mysql_database "$MYSQL_DATABASE" \

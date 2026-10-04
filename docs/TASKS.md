@@ -25,8 +25,11 @@
 > **TASK-025 已完成并实测通过**（2026-10-04）——`chaos/verify-connection-storm.sh`
 > 交付连接风暴下的失败方式、已有连接存活性与 fd 边界（含「当前没有显式限流」这个
 > 实测结论），见该任务单的「实施结果」。
-> **TASK-026 ~ TASK-027 仍是「待确认」**：未获得项目所有者逐个确认前，
-> 不写任何实现代码。
+> **TASK-026 已完成并实测通过**（2026-10-04）——三个服务都有了最小排空语义
+> （Room 等活跃对局结束、超时标 ABORTED 不伪造胜负；Match 拒新入队但已配对结果
+> 仍可领取；Gateway 拒新请求并让已建立 SSE 收到显式 `stream.closed`），
+> 见该任务单的「实施结果」。
+> **TASK-027 仍是「待确认」**：未获得项目所有者确认前，不写任何实现代码。
 >
 > **2026-10-03 状态清理**：TASK-019 的任务单此前停留在"待确认"，而它早已实现并
 > 经 PR #18 合并；已按 `git log` 更正。同一轮也修正了本文档顶部的进度描述
@@ -780,7 +783,8 @@ Phase 0 与 Phase 1 已全部完成并合并。Phase 2 的拆分原则与 Phase 
 其中 **TASK-023 已完成、实测通过并合并到 `main`**（2026-10-04，提交 `ed92604`，
 PR #23；见该任务单的「实施结果」），**TASK-024 已完成并实测通过**（2026-10-04，
 见该任务单的「实施结果」），**TASK-025 已完成并实测通过**（2026-10-04，
-见该任务单的「实施结果」），**TASK-026 ~ TASK-027 仍处于「待确认」**：
+见该任务单的「实施结果」），**TASK-026 已完成并实测通过**（2026-10-04，见该任务单的「实施结果」），
+**TASK-027 仍处于「待确认」**：
 按本项目的约定，任务单只写范围与验收标准，逐个确认后才开工，避免把「计划」写成
 「承诺」。
 **Phase 5 仍未拆分**：它的范围与退出标准保留在 `docs/02-roadmap.md` 第 8 节，
@@ -1743,7 +1747,8 @@ Phase 3 已全部完成并合并（TASK-018 ~ TASK-022，`main` 含至 PR #21）
 
 ### TASK-026：优雅退出与排空
 
-- 状态：**待确认**
+- 状态：**已完成并实测通过**（2026-10-04；交付物、实测数字与两处有意偏离见下方
+  「实施结果」）
 - 依赖：TASK-023
 - 背景问题：当前三个服务收到 SIGTERM 后会**立即停止**：`room_main` 停 ticker 线程、
   `server.Stop(0)`（0 = 不等待）。既有验收只断言"退出码 0"。而 Phase 4 的退出标准
@@ -1769,6 +1774,70 @@ Phase 3 已全部完成并合并（TASK-018 ~ TASK-022，`main` 含至 PR #21）
 - 回退方式：`git revert`。本任务**会改产品代码**（三个服务的退出路径），
   回退后恢复"立即退出"的现状。
 - 涉及目录：`src/gateway/`、`src/match/`、`src/room/`、`tests/unit/`、`chaos/`、`docs/`。
+
+- 实施结果（2026-10-04）：
+  - 交付：三个服务的最小排空语义 + `chaos/verify-drain.sh`（验收入口）。
+    - **Room**：新增 `-drain_timeout_ms`（默认 30000）。收到 SIGTERM 后对新
+      `match_id` 的 `CreateRoom` 返回 `ROOM_SHUTTING_DOWN`（**已存在的 match_id
+      仍按幂等返回**，否则 Match 的一次重试会把已经建好的房间丢掉），推进线程继续
+      推进对局，等「没有未结束的对局**且**没有待落库的结果」或到点为止；到点仍未
+      结束的对局标 `ABORTED` 并落一次终态快照。
+    - **Match**：新增 `-shutdown_grace_ms`（默认 1000）。停止接受新入队
+      （`MATCH_SHUTTING_DOWN`），**读状态与领取已配对的结果不受影响**。
+    - **Gateway**：新增 `-drain_timeout_ms`（默认 30000）。新请求（登录/入队/取消/
+      进房/输入/新订阅）返回 503 `shutting_down`，**读请求继续可用**；已建立的 SSE
+      等到房间结束（`room.finished`）或到点收到显式的 `stream.closed`
+      （reason=`server_shutdown`）之后才关闭。
+    - 契约：`room.proto` 追加 `ROOM_SHUTTING_DOWN = 9`、`match.proto` 追加
+      `MATCH_SHUTTING_DOWN = 5`（只追加枚举值，不改既有标签号）。
+  - 验收命令：`bash chaos/verify-drain.sh`。**两轮实测退出码 0、0 项失败**，
+    单轮约 45 秒。
+  - 实测结果（本机 16 核 / 11 GiB，brpc-debug；两轮区间）：
+    | 场景 | SIGTERM -> 退出 | 关键断言 |
+    |---|---|---|
+    | 1 Room 能排空完（上限 15 s） | 8178 ~ 8180 ms | 退出码 0、`drain_finished`；对局打完且**真实结果落库**（winner=p-0001、`rooms.state=finished`）；排空期间新配对拿不到房间（客户端停在 queued，Room 记 `room_create_rejected reason=shutting_down`） |
+    | 2 Room 必须超时截断（上限 3 s） | 3109 ~ 3114 ms | 退出码 0、`drain_timeout_abort`；快照 `state=aborted`、`finish_reason=aborted`、`winner=NULL`；**`match_results` 里没有这一局**；库里无残留 playing/finishing |
+    | 3 Match 排空（宽限 2 s） | 2073 ~ 2077 ms | 退出码 0；新入队 503 `shutting_down`；**已配对的结果仍可领取**（200 + state=matched + room_id） |
+    | 4 Gateway 排空（上限 3 s） | 3112 ~ 3115 ms | 退出码 0；新请求 503 `shutting_down`；已建立 SSE 收到 `stream.closed` + `server_shutdown` |
+  - **两处有意偏离任务单字面**的地方（写在这里，避免被当成漏做）：
+    1. **超时截断只处理 CREATED / WAITING / PLAYING，不动 FINISHING。** 任务单说
+       "对未结束的房间落终态快照并标 ABORTED"，但 FINISHING 的房间**已经有真实胜负**、
+       只是在等落库；把它标成 ABORTED 等于丢掉一个真实结果。那些房间的 `finishing`
+       快照还在库里，下次启动由 TASK-014 的恢复逻辑重新纳入落库重试——所以排空对它们
+       是"推迟"而不是"丢弃"。单元测试
+       `AbortUnfinishedGamesLeavesFinishingRoomAlone` 钉住了这一条。
+    2. **Room 的排空等待条件包含"没有待落库的结果"**，不只"没有未结束的对局"：
+       只等后者会在对局刚结束的那一刻就退出，而结果还停在内存里——那正是
+       TASK-008/014 那条已知限制的形状。
+  - 首轮实测暴露并修掉的两个**实现缺陷**（很容易再犯，因此单列）：
+    1. **排空期间推进线程必须继续跑。** 第一版里 ticker 的循环条件就是信号标志
+       `g_stopping`，信号一到它立刻退出——于是"等待活跃对局结束"等到的是一个**冻结**
+       的对局，15 秒上限必然用满、对局被误标 ABORTED。现在用独立的 `g_ticker_stop`，
+       排空结束后才置位。
+    2. **排空判据满足后还要再推一次 Tick。** 对局进入 FINISHED 之后，终态快照是在
+       **下一次** Tick 才写的（`ShouldSnapshot` 按"阶段变了"判断）；少了这一次，
+       进程会带着一条 `state=playing` 的旧快照退出（实测：`match_results` 已有真实
+       胜者，`rooms.state` 仍是 playing）。
+  - 契约配套：`shutting_down` 必须**端到端**是独立错误码。首轮实测里 Gateway 因为只
+    认识旧的枚举值，把对端的 shutting_down 落进了 default 分支，对外变成 500
+    `match_internal`。现在 Match/Room 两个新错误码都有映射，对外统一是 503
+    `shutting_down`（客户端据此**停止重试**，而不是像 `*_unavailable` 那样退避重试）。
+  - 单元测试：新增 10 个（Room 5 / Match 2 / StreamHub 3），`ctest` **294/294 通过**；
+    格式检查 82 个文件通过。
+  - **连带修改：5 个既有验收脚本**（`scripts/verify-match.sh`、
+    `verify-stream.sh`、`verify-web.sh`、`verify-persistence.sh`、
+    `verify-observability.sh`）。按「改变的依赖或启动方式必须重跑既有脚本」这条纪律重跑
+    `scripts/verify-all.sh`，首轮 **9 个里 5 个失败**，失败项全是同一句
+    `x Room 未在 10 秒内退出`（`verify-stream` 还多一句 Gateway）。原因不是回归，
+    而是产品行为**按要求**变了：Room/Gateway 收到 SIGTERM 后会排空，默认上限 30 秒，
+    而这些脚本的 SIGTERM 只是收尾、期待 10 秒内退出。
+    处理：只给它们启动的服务加 `-drain_timeout_ms 1000`（**保留产品默认 30 秒**，
+    排空语义本身由 `chaos/verify-drain.sh` 用显式值验收两条路径）。重跑
+    `verify-all.sh` **9/9 通过**。
+    顺带记一笔：`verify-stream` 的 Gateway 超时说明**客户端已经消失的 SSE 订阅只能在
+    下一次写（心跳最长 15 秒）时才被发现**，所以 Gateway 的排空可能要为一个"其实没人
+    在听"的订阅等到上限。
+  - 未做：滚动升级与多副本排空（ADR-0003 非目标）；连接的优雅迁移。
 
 ### TASK-027：长稳运行：内存与 FD 稳定性
 

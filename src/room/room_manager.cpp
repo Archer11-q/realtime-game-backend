@@ -169,6 +169,13 @@ CreateOutcome RoomManager::Create(const std::string& match_id,
         match_index_.erase(existing);
     }
 
+    // TASK-026：排空中不再**新建**房间。放在这里而不是函数开头，是为了让
+    // "同一 match_id 的重试"仍然拿到同一个房间（上面的幂等分支先返回）——
+    // 否则 Match 的一次重试会得到 shutting_down，被迫把玩家退回队列。
+    if (shutting_down_) {
+        return CreateOutcome::kShuttingDown;
+    }
+
     std::string room_id = MakeRoomId();
     if (room_id.empty()) {
         return CreateOutcome::kInternal;
@@ -579,6 +586,68 @@ std::size_t RoomManager::PendingResultCount() {
         }
     }
     return count;
+}
+
+// ---------------------------------------------------------------------------
+// TASK-026：排空
+// ---------------------------------------------------------------------------
+
+void RoomManager::BeginShutdown() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    shutting_down_ = true;
+}
+
+bool RoomManager::IsShuttingDown() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return shutting_down_;
+}
+
+std::size_t RoomManager::UnfinishedGameCount() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    std::size_t count = 0;
+    for (const auto& entry : rooms_) {
+        switch (entry.second->phase()) {
+            case RoomPhase::kCreated:
+            case RoomPhase::kWaiting:
+            case RoomPhase::kPlaying:
+                ++count;
+                break;
+            case RoomPhase::kFinishing:
+            case RoomPhase::kFinished:
+            case RoomPhase::kAborted:
+                // FINISHING 已有胜负（只是在等落库），终态更不必等。
+                break;
+        }
+    }
+    return count;
+}
+
+std::size_t RoomManager::AbortUnfinishedGames(std::int64_t now_ms) {
+    std::vector<RoomSnapshotRecord> records;
+    std::size_t aborted = 0;
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& entry : rooms_) {
+            BattleRoom& room = *entry.second;
+            const RoomPhase phase = room.phase();
+            if (phase != RoomPhase::kCreated && phase != RoomPhase::kWaiting &&
+                phase != RoomPhase::kPlaying) {
+                continue;
+            }
+            // Abort 会清空 winner 并置 finish_reason = aborted：没有结果就是没有结果。
+            room.Abort(now_ms);
+            records.push_back(MakeSnapshotRecord(room, now_ms));
+            // 同步快照调度状态：否则下一个 Tick 会以为"还没写过"而再写一份。
+            SnapshotState& state = snapshot_state_[room.match_id()];
+            state.last_write_ms = now_ms;
+            state.last_phase = room.phase();
+            state.written = true;
+            ++aborted;
+        }
+    }
+    // 与 Tick 的规则一致：锁内取快照、锁外写存储（一次 MySQL 超时不能卡住所有房间）。
+    FlushSnapshots(records);
+    return aborted;
 }
 
 }  // namespace rgbt::room

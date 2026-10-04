@@ -54,10 +54,21 @@ DEFINE_string(mysql_database, "realtime_game", "MySQL 库名");
 DEFINE_int32(mysql_timeout_seconds, 3, "MySQL 连接与读写超时（秒）");
 DEFINE_int32(tick_interval_ms, 50, "房间推进线程的调用间隔（毫秒）");
 DEFINE_int32(idle_timeout_s, -1, "连接空闲超时（秒），-1 表示不超时");
+DEFINE_int32(drain_timeout_ms, 30000,
+             "TASK-026：收到停止信号后等待活跃对局结束的上限（毫秒）；"
+             "到点把仍未结束的对局标为 ABORTED（不写对局结果）");
 
 namespace {
 
 std::atomic<bool> g_stopping{false};
+
+/// TASK-026：推进线程的退出标志，**与 g_stopping 分开**。
+///
+/// 为什么不能共用：排空期间对局必须继续推进（等待就是对局在往前走），
+/// 而 g_stopping 在信号处理器里立刻置位。共用的话 ticker 会在收到信号的那一瞬间
+/// 退出，于是"等待活跃对局结束"等到的是一个冻结的对局——必然走到超时截断。
+/// 首轮实测就是这个结果：15 秒上限全部用满，对局被误标 ABORTED。
+std::atomic<bool> g_ticker_stop{false};
 
 void HandleSignal(int /*sig*/) {
     g_stopping.store(true);
@@ -156,7 +167,8 @@ int main(int argc, char* argv[]) {
     // --- 房间推进线程 ---
     const std::int64_t tick_interval_ms = FLAGS_tick_interval_ms > 0 ? FLAGS_tick_interval_ms : 50;
     std::thread ticker([&manager, tick_interval_ms]() {
-        while (!g_stopping.load()) {
+        // TASK-026：用 g_ticker_stop 而不是 g_stopping，这样排空期间对局照常推进。
+        while (!g_ticker_stop.load()) {
             manager.Tick(NowMs());
             ::usleep(static_cast<useconds_t>(tick_interval_ms) * 1000);
         }
@@ -183,6 +195,55 @@ int main(int argc, char* argv[]) {
     std::printf("收到停止信号，开始优雅退出\n");
     std::fflush(stdout);
 
+    // --- TASK-026：排空 ---
+    //
+    // 顺序是「先停止接收新房间 -> 等活跃对局打完 -> 超时才丢弃」：
+    //   1. BeginShutdown() 之后 CreateRoom 一律返回 shutting_down，Match 会把玩家
+    //      退回队列，不会有新对局在这段时间里开始；
+    //   2. **推进线程必须继续跑**：对局的推进与结果落库都在 Tick 里完成，
+    //      先 join 它就等于立刻冻结所有对局；
+    //   3. 等待条件同时包含 FINISHING 的房间：只等"打完"会在对局刚结束时立刻退出，
+    //      结果还停在内存里（这正是 TASK-008/014 那条已知限制的形状）。
+    //      落库失败（MySQL 不可用）时会被超时兜住，而这些房间的 `finishing` 快照
+    //      仍在库里，下次启动由 Restore 重新纳入落库重试——所以超时不会丢结果。
+    const std::int64_t drain_started_ms = NowMs();
+    manager.BeginShutdown();
+    const std::int64_t drain_timeout_ms = FLAGS_drain_timeout_ms > 0 ? FLAGS_drain_timeout_ms : 0;
+    const std::int64_t drain_deadline_ms = drain_started_ms + drain_timeout_ms;
+    rgbt::common::LogInfo("drain_started",
+                          {{"unfinished", std::to_string(manager.UnfinishedGameCount())},
+                           {"pending_results", std::to_string(manager.PendingResultCount())},
+                           {"timeout_ms", std::to_string(drain_timeout_ms)}});
+
+    while ((manager.UnfinishedGameCount() > 0 || manager.PendingResultCount() > 0) &&
+           NowMs() < drain_deadline_ms) {
+        ::usleep(50 * 1000);
+    }
+
+    const std::size_t unfinished = manager.UnfinishedGameCount();
+    if (unfinished > 0) {
+        const std::size_t aborted = manager.AbortUnfinishedGames(NowMs());
+        rgbt::common::LogWarn("drain_timeout_abort",
+                              {{"aborted", std::to_string(aborted)},
+                               {"waited_ms", std::to_string(NowMs() - drain_started_ms)}});
+        std::printf("排空超时：把 %zu 个未结束的对局标为 ABORTED（不写对局结果）\n", aborted);
+    } else {
+        rgbt::common::LogInfo("drain_finished",
+                              {{"waited_ms", std::to_string(NowMs() - drain_started_ms)},
+                               {"pending_results", std::to_string(manager.PendingResultCount())}});
+        std::printf("排空完成：等待 %lld ms，活跃对局已全部结束\n",
+                    static_cast<long long>(NowMs() - drain_started_ms));
+    }
+    std::fflush(stdout);
+
+    // 排空判据满足之后**再推一次 Tick**：对局进入 FINISHED 之后，终态快照是在
+    // 下一次 Tick 才写的（ShouldSnapshot 按"阶段变了"判断）。少了这一次，进程会带着
+    // 一条 state=playing 的旧快照退出——库里那一局看起来还在打（首轮实测就是这个：
+    // match_results 已有真实胜者，rooms.state 仍是 playing）。
+    manager.Tick(NowMs());
+
+    // 排空做完了，才让推进线程退出。
+    g_ticker_stop.store(true);
     // 先停推进线程再停 brpc：反过来的话，正在处理的请求可能访问到已停止的管理器。
     if (ticker.joinable()) {
         ticker.join();

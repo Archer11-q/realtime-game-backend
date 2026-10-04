@@ -61,6 +61,11 @@ enum class CreateOutcome {
     kInvalidArgument,
     /// 房间号生成失败。属于内部错误。
     kInternal,
+    /// TASK-026：服务正在排空，**不再新建房间**。
+    ///
+    /// 注意：**已存在**的 match_id 仍按幂等成功返回（见 Create 的实现）——
+    /// 排空期间让一次重试拿到"服务退出中"而丢掉已经建好的房间，是错的。
+    kShuttingDown,
 };
 
 /// 查询对局结果的结果。
@@ -182,6 +187,32 @@ public:
     ///        让"停机期间的帧被丢弃"这条边界能被单元测试精确验证。
     [[nodiscard]] RestoreReport Restore(std::int64_t now_ms);
 
+    /// @brief 进入排空（TASK-026）。**之后 Create 不再新建房间。**
+    ///
+    /// 为什么由 Room 自己拒绝，而不是让 Match 提前知道：Room 才是房间的权威所有者，
+    /// "还能不能开新房间"是它的状态；让上游各存一份副本就会出现两个真相
+    /// （docs/01-architecture.md 第 5 节的状态归属原则）。
+    void BeginShutdown();
+
+    /// @brief 是否已进入排空。
+    [[nodiscard]] bool IsShuttingDown() const;
+
+    /// @brief 仍在推进、**还没有终局**的房间数（CREATED / WAITING / PLAYING）。
+    ///
+    /// **不含 FINISHING**：那个状态的对局已经分出胜负，只是在等结果落库，
+    /// 它不阻塞排空，也**绝不能**被当作"没打完"处理（见 AbortUnfinishedGames）。
+    [[nodiscard]] std::size_t UnfinishedGameCount() const;
+
+    /// @brief 把仍在推进的房间标为 ABORTED，并各落一次终态快照（TASK-026）。
+    ///
+    /// **不写 match_results、不伪造胜负**：这些对局没有结果，写一行平局或随便一个
+    /// 胜者都是编造。已 FINISHING 的房间**不在本方法的范围内**——它们的结果是真的，
+    /// 只是还没落库；标成 ABORTED 等于丢掉一个真实结果。那些房间的 `finishing`
+    /// 快照还在库里，下次启动会被 TASK-014 的恢复逻辑重新纳入落库重试。
+    ///
+    /// @return 被标记为 ABORTED 的房间数。
+    std::size_t AbortUnfinishedGames(std::int64_t now_ms);
+
     /// @brief 查询帧号大于 since_frame 的历史快照（TASK-017）。
     ///
     /// 返回的 `snapshots` 保证帧号严格递增且不重复（由 `BattleRoom::SnapshotsAfter`
@@ -288,6 +319,8 @@ private:
     std::unordered_map<std::string, SnapshotState> snapshot_state_;
     std::uint64_t snapshot_write_count_ = 0;
     std::uint64_t snapshot_failure_count_ = 0;
+    /// TASK-026：是否已进入排空。置位后 Create 不再新建房间。
+    bool shutting_down_ = false;
 };
 
 }  // namespace rgbt::room

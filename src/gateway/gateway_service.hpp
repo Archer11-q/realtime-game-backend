@@ -25,6 +25,7 @@
 #ifndef RGBT_GATEWAY_GATEWAY_SERVICE_HPP
 #define RGBT_GATEWAY_GATEWAY_SERVICE_HPP
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -116,6 +117,14 @@ public:
     /// @brief 当前是否所有依赖都可用。供健康检查使用。
     [[nodiscard]] bool DependenciesHealthy();
 
+    /// @brief 进入排空（TASK-026）：**之后新请求一律被拒绝**。
+    ///
+    /// 由进程入口在收到 SIGTERM 后、关闭服务器之前调用。
+    void BeginShutdown();
+
+    /// @brief 是否已进入排空。
+    [[nodiscard]] bool IsShuttingDown() const;
+
 private:
     /// 写统一的错误体，并返回对应的 HTTP 状态码。
     static std::int32_t FillError(rgbt::gateway::v1::Error* error,
@@ -173,6 +182,27 @@ private:
                                   std::int32_t status_code, const std::string& request_id,
                                   std::int64_t start_us = 0);
 
+    /// @brief 排空中拒绝**新**请求（TASK-026）。
+    ///
+    /// 只挡会改变状态或建立新连接的请求：登录、入队、取消匹配、进房、提交输入、
+    /// SSE 订阅。**读请求继续可用**——排空期间客户端还要能读到自己那一局的状态与
+    /// 结果，否则"优雅退出"对客户端就变成了"服务突然消失"。
+    ///
+    /// @return true 表示已拒绝并写好响应，调用方应立即 return。
+    template<typename Response>
+    bool RejectIfShuttingDown(::google::protobuf::RpcController* controller, Response* response,
+                              const std::string& request_id, std::int64_t start_us) {
+        if (!shutting_down_.load()) {
+            return false;
+        }
+        const std::int32_t status =
+            FillError(response->mutable_error(), rgbt::gateway::v1::ErrorCode::UNAVAILABLE,
+                      "shutting_down", "服务正在排空，暂不接受新请求", request_id);
+        response->set_status_code(status);
+        ApplyHttpStatusAndRecord(controller, status, request_id, start_us);
+        return true;
+    }
+
     /// 真正的记账逻辑。参数用 `google::protobuf::RpcController`（而不是
     /// `brpc::Controller`）是为了让本头文件**不依赖 brpc**：brpc 的头文件对
     /// include 顺序有要求（glog 的导出宏必须在它之前定义），一旦泄漏进这个被广泛
@@ -193,6 +223,8 @@ private:
 
     /// 构造完成标志。构造过程中不该记账，否则会用到尚未就绪的登记表。
     bool metrics_ready_ = false;
+    /// TASK-026：排空标志。由进程入口写入、由 brpc 工作线程读取，因此必须是原子的。
+    std::atomic<bool> shutting_down_{false};
 
     SessionStore* sessions_;
     // 不加 const：接口方法本身不是 const（实现需要查询外部依赖），

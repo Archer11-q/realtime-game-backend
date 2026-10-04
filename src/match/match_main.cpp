@@ -50,6 +50,9 @@ DEFINE_int32(redis_port, 6379, "Redis 端口（队列快照）");
 DEFINE_int32(redis_timeout_ms, 500, "Redis 连接与命令超时（毫秒）");
 DEFINE_string(env_prefix, "dev", "Key 前缀的环境标识，取值示例 dev / test / prod");
 DEFINE_int32(idle_timeout_s, -1, "连接空闲超时（秒），-1 表示不超时");
+DEFINE_int32(shutdown_grace_ms, 1000,
+             "TASK-026：收到停止信号后仍继续服务读取的宽限期（毫秒）；"
+             "这段时间里新入队被拒绝（shutting_down），已配对的结果仍可领取");
 
 namespace {
 
@@ -168,6 +171,26 @@ int main(int argc, char* argv[]) {
 
     std::printf("收到停止信号，开始优雅退出\n");
     std::fflush(stdout);
+
+    // --- TASK-026：排空 ---
+    //
+    // Match 的排空比 Room 轻：**队列里没有对局状态**（那属于 Room），所以不需要
+    // 等谁打完。要做的只有两件事：
+    //   1. 立刻停止接受新入队（Enqueue 返回 shutting_down）；
+    //   2. 留一段可配的宽限期继续服务读取，让"已配对的结果仍可领取"这句话真的
+    //      成立——否则进程在收到信号的那一刻就退出，玩家会在拿到房间号之前
+    //      被夺走那一局，那比"拒绝新请求"更糟。
+    // 默认 1 秒：足够让客户端观察到一个"拒绝入队 + 仍能读状态"的窗口，
+    // 又不至于让退出明显变慢。
+    const std::int64_t grace_ms = FLAGS_shutdown_grace_ms > 0 ? FLAGS_shutdown_grace_ms : 0;
+    queue.BeginShutdown();
+    rgbt::common::LogInfo("drain_started",
+                          {{"mode", "grace"}, {"grace_ms", std::to_string(grace_ms)}});
+    if (grace_ms > 0) {
+        ::usleep(static_cast<useconds_t>(grace_ms) * 1000);
+    }
+    rgbt::common::LogInfo("drain_finished", {{"grace_ms", std::to_string(grace_ms)}});
+
     server.Stop(0);
     server.Join();
     std::printf("已优雅退出\n");
