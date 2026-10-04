@@ -212,6 +212,58 @@ TEST(MetricsTest, NegativeObservationIsClampedToZero) {
     EXPECT_NE(text.find("rgbt_test_neg_seconds_count 1"), std::string::npos);
 }
 
+TEST(MetricsTest, CustomBoundsAreUsedWhenProvided) {
+    // TASK-022：HTTP 端点用 SLO 线做桶（P95 < 100 ms、P99 < 250 ms），因为默认桶
+    // 把那两条线放进了同一个桶里，读不出"达标了吗"。这条用例锁住"自定义边界真的生效"。
+    MetricsRegistry registry;
+    registry.Observe("rgbt_test_custom_seconds", "自定义桶", 0.06, {0.05, 0.1, 0.25});
+    const std::string text = registry.TextExposure();
+    // 0.06 落在 (0.05, 0.1] 这个桶 → 累计到 le="0.1" 才是 1。
+    EXPECT_NE(text.find("rgbt_test_custom_seconds_bucket{le=\"0.05\"} 0"), std::string::npos);
+    EXPECT_NE(text.find("rgbt_test_custom_seconds_bucket{le=\"0.1\"} 1"), std::string::npos);
+    EXPECT_NE(text.find("rgbt_test_custom_seconds_bucket{le=\"0.25\"} 1"), std::string::npos);
+    // 默认桶里的边界不该出现（出现说明自定义边界被忽略了）。
+    EXPECT_EQ(text.find("rgbt_test_custom_seconds_bucket{le=\"0.025\"}"), std::string::npos);
+}
+
+TEST(MetricsTest, CustomBoundsOnlyApplyOnFirstRegistration) {
+    // 边界"只认第一次"：否则同一个指标的桶刻度会在运行中变化，前后两段读数不可比，
+    // 而 Prometheus 侧看到的是同一时间序列被换了刻度——那种错没人会当场发现。
+    MetricsRegistry registry;
+    registry.Observe("rgbt_test_fixed_seconds", "首注桶", 0.06, {0.05, 0.1});
+    registry.Observe("rgbt_test_fixed_seconds", "首注桶", 0.06, {0.001, 0.002});
+    const std::string text = registry.TextExposure();
+    EXPECT_NE(text.find("rgbt_test_fixed_seconds_bucket{le=\"0.1\"} 2"), std::string::npos);
+    EXPECT_EQ(text.find("rgbt_test_fixed_seconds_bucket{le=\"0.002\"}"), std::string::npos);
+}
+
+TEST(MetricsTest, HistogramSupportsLabels) {
+    // TASK-022：延迟直方图必须带 `path`，否则只能说"所有端点混在一起的 P95"，
+    // 回答不了"哪个端点慢"。这里锁住两条：
+    //   1. 不同标签是**各自独立**的直方图（不是累进同一条序列）；
+    //   2. `le` 与自定义标签合并在同一组花括号里——写成 `name{path="x"}_bucket{le=...}`
+    //      会被 Prometheus 判为非法样本，而那种错在本地看不出来。
+    MetricsRegistry registry;
+    registry.Observe("rgbt_test_labeled_seconds", "带标签", 0.06, {0.05, 0.1}, {{"path", "/a"}});
+    registry.Observe("rgbt_test_labeled_seconds", "带标签", 0.06, {0.05, 0.1}, {{"path", "/b"}});
+
+    const std::string text = registry.TextExposure();
+    EXPECT_NE(text.find("rgbt_test_labeled_seconds_bucket{path=\"/a\",le=\"0.1\"} 1"),
+              std::string::npos);
+    EXPECT_NE(text.find("rgbt_test_labeled_seconds_bucket{path=\"/b\",le=\"0.1\"} 1"),
+              std::string::npos);
+    EXPECT_NE(text.find("rgbt_test_labeled_seconds_count{path=\"/a\"} 1"), std::string::npos);
+    EXPECT_NE(text.find("rgbt_test_labeled_seconds_count{path=\"/b\"} 1"), std::string::npos);
+    // 两个标签各一次观测，因此 `+Inf` 也各自是 1（合并就会变成 2）。
+    EXPECT_NE(text.find("rgbt_test_labeled_seconds_bucket{path=\"/a\",le=\"+Inf\"} 1"),
+              std::string::npos);
+    // HELP/TYPE 只写一次。
+    const std::size_t first = text.find("# TYPE rgbt_test_labeled_seconds histogram");
+    ASSERT_NE(first, std::string::npos);
+    EXPECT_EQ(text.find("# TYPE rgbt_test_labeled_seconds histogram", first + 1),
+              std::string::npos);
+}
+
 // ---------------------------------------------------------------------------
 // 文本格式
 // ---------------------------------------------------------------------------

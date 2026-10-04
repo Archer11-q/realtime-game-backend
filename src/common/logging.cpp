@@ -67,6 +67,12 @@ std::int64_t SystemNowMs() {
         .count();
 }
 
+std::int64_t SystemNowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 void AppendField(std::string* line, std::string_view key, std::string_view value) {
     line->push_back(' ');
     line->append(key);
@@ -168,6 +174,10 @@ std::string FormatLogLine(const LogRecord& record) {
 void SetServiceName(std::string name) {
     const std::lock_guard<std::mutex> lock(g_mutex);
     g_service_name = std::move(name);
+}
+
+std::int64_t NowUs() {
+    return SystemNowUs();
 }
 
 std::string ServiceName() {

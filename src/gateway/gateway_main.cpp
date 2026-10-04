@@ -44,6 +44,7 @@
 #include "redis_session_store.hpp"
 #include "room_client.hpp"
 #include "stream_hub.hpp"
+#include "test_credentials.hpp"
 
 // 默认端口与 .env.example 的 GATEWAY_HTTP_PORT 保持一致（8080）。
 // 本地 8080 可能被其它开发服务占用，端口冲突时网关会启动失败，而请求会被打到
@@ -78,6 +79,11 @@ DEFINE_string(room_host, "127.0.0.1", "Room/Battle Service 主机");
 DEFINE_int32(room_port, 8083, "Room/Battle Service 端口");
 DEFINE_int32(room_timeout_ms, 500, "调用 Room/Battle Service 的超时（毫秒）");
 DEFINE_int32(idle_timeout_s, -1, "连接空闲超时（秒），-1 表示不超时");
+// TASK-022：压测用的合成测试账号（`bench-00000` .. `bench-99999`，固定口令）。
+// **默认关闭**：只有并发容量测试才需要 N 个互不相同的玩家，而内置的 3 个启用
+// 身份做不到。用显式开关而不是"总是识认"，是为了让生产路径的行为不受影响，
+// 同时让"这次运行允许了合成账号"在启动日志里可见。理由详见 test_credentials.hpp。
+DEFINE_bool(enable_bench_accounts, false, "识认压测合成账号 bench-NNNNN（仅容量测试使用）");
 
 namespace {
 
@@ -95,6 +101,9 @@ int main(int argc, char* argv[]) {
     // TASK-018：结构化日志的 service 字段。必须在任何日志之前设置，
     // 否则进程启动阶段（最容易出问题的那一段）的日志会缺服务名。
     rgbt::common::SetServiceName("gateway");
+
+    // TASK-022：压测合成账号。必须在服务开始处理登录之前设置。
+    rgbt::gateway::EnableSyntheticBenchAccounts(FLAGS_enable_bench_accounts);
 
     const std::string env_prefix = FLAGS_env_prefix;
 
@@ -231,6 +240,8 @@ int main(int argc, char* argv[]) {
     std::printf("  Room(房间): %s:%d (%s)\n", FLAGS_room_host.c_str(), FLAGS_room_port,
                 room->IsHealthy() ? "已配置" : "地址不合法");
     std::printf("  Key 前缀: %s:gateway:\n", env_prefix.c_str());
+    std::printf("  压测合成账号(bench-NNNNN): %s\n",
+                rgbt::gateway::SyntheticBenchAccountsEnabled() ? "已启用（容量测试）" : "未启用");
     std::printf("  进程号: %d\n", static_cast<int>(::getpid()));
     std::fflush(stdout);
 

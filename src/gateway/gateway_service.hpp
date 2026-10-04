@@ -152,7 +152,8 @@ private:
                                    rgbt::gateway::v1::Error* error,
                                    const char* not_found_reason = "room_not_found");
 
-    /// 设置 HTTP 状态码、记一次指标、并输出一条 `request_done`（TASK-021）。
+    /// 设置 HTTP 状态码、记一次指标、输出一条 `request_done`（TASK-021）、
+    /// 并记录处理耗时（TASK-022）。
     ///
     /// 处理函数一律调用本函数而不是 `ApplyHttpStatus`，这样"漏记账"就不可能发生
     /// ——这是选它做收敛点的理由：新增接口时忘了写日志或指标不会有任何报错，
@@ -165,8 +166,12 @@ private:
     ///
     /// @param request_id 这次请求的关联 id（trace）。为空时不输出 `trace=` 字段
     ///        （宁缺勿假，见 logging.hpp）——**不生成一个伪 id**。
+    /// @param start_us 本次请求处理开始的时刻（`rgbt::common::NowUs()`），由各处理
+    ///        函数在入口取一次。**0 表示调用方没计时**，此时不观测延迟。
+    ///        为什么必须由调用方传：brpc 服务端拿不到请求开始时间，理由见实现处注释。
     void ApplyHttpStatusAndRecord(::google::protobuf::RpcController* controller,
-                                  std::int32_t status_code, const std::string& request_id);
+                                  std::int32_t status_code, const std::string& request_id,
+                                  std::int64_t start_us = 0);
 
     /// 真正的记账逻辑。参数用 `google::protobuf::RpcController`（而不是
     /// `brpc::Controller`）是为了让本头文件**不依赖 brpc**：brpc 的头文件对
@@ -181,6 +186,10 @@ private:
     /// 而"这次请求结束了"这件事对所有接口都要记。
     void RecordRequestDone(::google::protobuf::RpcController* controller, std::int32_t status_code,
                            const std::string& request_id) noexcept;
+
+    /// 记录处理耗时（TASK-022）。`start_us <= 0` 时不观测。
+    void RecordHttpLatency(::google::protobuf::RpcController* controller,
+                           std::int64_t start_us) noexcept;
 
     /// 构造完成标志。构造过程中不该记账，否则会用到尚未就绪的登记表。
     bool metrics_ready_ = false;

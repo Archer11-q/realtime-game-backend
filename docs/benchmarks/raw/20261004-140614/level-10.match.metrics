@@ -1,0 +1,13 @@
+# HELP rgbt_match_events_total Match 的事件计数，按事件类型分组
+# TYPE rgbt_match_events_total counter
+rgbt_match_events_total{event="canceled"} 0
+rgbt_match_events_total{event="enqueued"} 20
+rgbt_match_events_total{event="paired"} 5
+rgbt_match_events_total{event="rejected"} 10
+# HELP rgbt_match_queue_length Match 队列当前等待配对的玩家数
+# TYPE rgbt_match_queue_length gauge
+rgbt_match_queue_length 0
+# HELP rgbt_queue_snapshot_total Match 队列快照写入次数，按结果分组
+# TYPE rgbt_queue_snapshot_total gauge
+rgbt_queue_snapshot_total{outcome="failed"} 0
+rgbt_queue_snapshot_total{outcome="ok"} 10

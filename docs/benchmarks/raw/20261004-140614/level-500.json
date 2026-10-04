@@ -1,0 +1,94 @@
+{
+  "started_at_epoch": 1791094500.958,
+  "finished_at_epoch": 1791094561.958,
+  "wall_seconds": 61.0,
+  "players": 500,
+  "counters": {
+    "attacks_failed": 373,
+    "attacks_ok": 4755,
+    "attacks_sent": 5128,
+    "enqueue_failed": 183,
+    "enqueue_ok": 1000,
+    "games_finished": 500,
+    "join_ok": 500,
+    "login_ok": 500,
+    "pair_timeout": 500,
+    "paired": 500,
+    "rooms_entered": 500,
+    "stale_result_skipped": 38223,
+    "stream_opened": 500
+  },
+  "stream_events": {
+    "room.finished": 500,
+    "room.state": 18162,
+    "session.ready": 500,
+    "stream.reset": 598
+  },
+  "stream_resets": {
+    "id_current": 598
+  },
+  "finish_reasons": {
+    "hp_zero": 500
+  },
+  "attack_rejections": {
+    "room_already_finished": 128,
+    "room_not_playing": 245
+  },
+  "http_status": {
+    "/api/v1/login:200": 500,
+    "/api/v1/matches/current:200": 38723,
+    "/api/v1/matches:200": 1000,
+    "/api/v1/matches:503": 183,
+    "/api/v1/rooms/input:200": 4755,
+    "/api/v1/rooms/input:400": 245,
+    "/api/v1/rooms/input:409": 128,
+    "/api/v1/rooms/join:200": 500
+  },
+  "exceptions": {},
+  "latency_ms": {
+    "attack": {
+      "count": 5128,
+      "min": 0.69,
+      "p50": 1.374,
+      "p90": 4.715,
+      "p95": 11.907,
+      "p99": 35.083,
+      "max": 50.491,
+      "mean": 3.027
+    },
+    "login": {
+      "count": 500,
+      "min": 90.452,
+      "p50": 294.642,
+      "p90": 467.334,
+      "p95": 492.294,
+      "p99": 509.503,
+      "max": 513.455,
+      "mean": 295.077
+    },
+    "match_poll": {
+      "count": 38723,
+      "min": 0.645,
+      "p50": 1.507,
+      "p90": 3.176,
+      "p95": 4.671,
+      "p99": 22.463,
+      "max": 344.927,
+      "mean": 2.753
+    }
+  },
+  "label": "players-500",
+  "config": {
+    "players": 500,
+    "gateway": "127.0.0.1:8080",
+    "duration": 60.0,
+    "attack_interval": 2.0,
+    "poll_interval": 0.5,
+    "timeout": 10.0,
+    "connections_per_bot": 2,
+    "recycle": true,
+    "recycle_gap": 1.0,
+    "hostname": "Archer",
+    "python": "3.14.4"
+  }
+}

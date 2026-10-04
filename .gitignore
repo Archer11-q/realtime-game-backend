@@ -84,3 +84,13 @@ redis-dump-*.rdb
 # 规则保留为防御措施，防止该目录被重新创建后误提交。
 interview-notes/
 
+# Python 字节码缓存（TASK-022 起 bench/loadgen.py 是 Python）
+# 它由解释器自动生成，属于运行产物，不该进版本库。
+__pycache__/
+*.pyc
+
+# 注意：`docs/benchmarks/raw/` **要进版本库**，故此处不加忽略规则。
+# Phase 5 的验收标准是"任一性能或可靠性数字均能回溯原始记录"
+# （docs/02-roadmap.md 第 8 节），把原始数据排除在外会让那条标准无法兑现。
+# 单次全套约 0.2 MB（6 档 × 每档几十 KB 的 JSON 与指标快照），可以接受。
+

@@ -108,6 +108,18 @@ void SetServiceName(std::string name);
 /// 当前服务名（未设置时为空字符串）。仅供测试与排障使用。
 [[nodiscard]] std::string ServiceName();
 
+/// 当前时刻（Unix 微秒，`system_clock`，TASK-022）。
+///
+/// 为什么放在这个模块：它与日志时间戳**必须同源**。日志用 `system_clock` 的
+/// 毫秒，若计时改用 `steady_clock`，那么"日志里说请求在 T 时刻结束"与
+/// "这个请求耗时 3 ms"就来自两个不同的时基——时钟跳变时两者会互相矛盾，
+/// 而排障时正是要靠它们对齐。同一个时钟、只换分辨率，逻辑上只有一个时间轴。
+///
+/// 精度说明：这是**系统时钟的微秒分辨率**，不是单调时钟。它能满足毫秒级耗时统计
+/// （本项目的 SLO 是 P95 < 100 ms），但 NTP 回拨期间会出现负耗时——调用方
+/// （见 `GatewayServiceImpl::RecordHttpLatency`）必须显式丢弃这种观测。
+[[nodiscard]] std::int64_t NowUs();
+
 /// 写一条日志到 stderr。
 ///
 /// 与今天的 `fprintf(stderr, ...)` 行为一致：**不抛异常、不影响调用方**。

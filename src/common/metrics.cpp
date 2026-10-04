@@ -177,10 +177,26 @@ void MetricsRegistry::Gauge(std::string_view name, std::string_view help,
 }
 
 void MetricsRegistry::Observe(std::string_view name, std::string_view help, double value) {
+    Observe(name, help, value, {}, {});
+}
+
+void MetricsRegistry::Observe(std::string_view name, std::string_view help, double value,
+                              std::initializer_list<double> bounds) {
+    Observe(name, help, value, bounds, {});
+}
+
+void MetricsRegistry::Observe(std::string_view name, std::string_view help, double value,
+                              std::initializer_list<double> bounds,
+                              std::initializer_list<MetricLabel> labels) {
+    std::vector<double> requested(bounds.begin(), bounds.end());
+    std::vector<MetricLabel> label_list(labels.begin(), labels.end());
     const std::lock_guard<std::mutex> lock(mutex_);
     Histogram* target = nullptr;
     for (Histogram& histogram : histograms_) {
-        if (histogram.name == name) {
+        // 与 counter/gauge 一致的判据：**名字与标签都相同**才算同一个直方图。
+        // 只比名字会让带不同 path 的观测全部累进第一条时间序列——那样
+        // `histogram_quantile` 会给出一个谁也不对应的分位数，而且不报任何错。
+        if (histogram.name == name && LabelsEqual(histogram.labels, label_list)) {
             target = &histogram;
             break;
         }
@@ -189,10 +205,15 @@ void MetricsRegistry::Observe(std::string_view name, std::string_view help, doub
         Histogram histogram;
         histogram.name = std::string(name);
         histogram.help = std::string(help);
+        histogram.labels = std::move(label_list);
         // **必须把桶边界存下来**：只记计数的话，`Observe` 就无从判断一次观测落在
         // 哪个桶里。漏了这一行的表现是"每个桶都等于观测次数，而 `+Inf` 却正确"
         // （`+Inf` 取自 count）——实测踩到，被 HistogramBucketsAreCumulative 抓到。
-        histogram.bounds = DefaultBounds();
+        //
+        // TASK-022：允许调用方给自定义边界（HTTP 端点用 SLO 线做桶）；没给就用默认。
+        // **只认第一次**——第二次给不同边界会被忽略，否则同一指标的桶刻度会在运行中
+        // 变化，历史读数就不可比了。
+        histogram.bounds = requested.empty() ? DefaultBounds() : requested;
         histogram.bucket_counts.assign(histogram.bounds.size(), 0);
         histograms_.push_back(std::move(histogram));
         target = &histograms_.back();
@@ -230,6 +251,7 @@ std::string MetricsRegistry::TextExposure() {
     struct HistogramSample {
         std::string name;
         std::string help;
+        std::vector<MetricLabel> labels;
         std::vector<double> bounds;
         std::vector<std::uint64_t> bucket_counts;
         std::uint64_t count = 0;
@@ -250,9 +272,9 @@ std::string MetricsRegistry::TextExposure() {
             gauges.push_back(GaugeSample{entry.name, entry.help, entry.labels, entry.read});
         }
         for (const Histogram& histogram : histograms_) {
-            histograms.push_back(HistogramSample{histogram.name, histogram.help, histogram.bounds,
-                                                 histogram.bucket_counts, histogram.count,
-                                                 histogram.sum});
+            histograms.push_back(HistogramSample{histogram.name, histogram.help, histogram.labels,
+                                                 histogram.bounds, histogram.bucket_counts,
+                                                 histogram.count, histogram.sum});
         }
     }
 
@@ -297,18 +319,31 @@ std::string MetricsRegistry::TextExposure() {
         out << sample.name << RenderLabels(sample.labels) << ' ' << value << '\n';
     }
     for (const HistogramSample& sample : histograms) {
-        out << "# HELP " << sample.name << ' ' << sample.help << '\n';
-        out << "# TYPE " << sample.name << " histogram\n";
+        if (sample.name != last_name) {
+            out << "# HELP " << sample.name << ' ' << sample.help << '\n';
+            out << "# TYPE " << sample.name << " histogram\n";
+            last_name = sample.name;
+        }
+        // 桶与 sum/count 都必须带上自定义标签（TASK-022 的 `path`），并且 `le`
+        // 要与它们**合并在同一组花括号里**。写成两个花括号
+        // （`name{path="x"}_bucket{le="0.1"}`）会被 Prometheus 直接判为非法样本。
+        const auto label_text = [&sample](const char* extra_key, const std::string& extra_value) {
+            std::vector<MetricLabel> merged = sample.labels;
+            merged.push_back(MetricLabel{extra_key, extra_value});
+            return RenderLabels(merged);
+        };
         // 累计桶：`le` 是"小于等于该上界"的累计计数，这是 Prometheus 的约定。
         std::uint64_t cumulative = 0;
         for (std::size_t i = 0; i < sample.bounds.size(); ++i) {
             cumulative += sample.bucket_counts[i];
-            out << sample.name << "_bucket{le=\"" << RenderNumber(sample.bounds[i]) << "\"} "
-                << cumulative << '\n';
+            out << sample.name << "_bucket" << label_text("le", RenderNumber(sample.bounds[i]))
+                << ' ' << cumulative << '\n';
         }
-        out << sample.name << "_bucket{le=\"+Inf\"} " << sample.count << '\n';
-        out << sample.name << "_sum " << RenderNumber(sample.sum) << '\n';
-        out << sample.name << "_count " << sample.count << '\n';
+        out << sample.name << "_bucket" << label_text("le", "+Inf") << ' ' << sample.count << '\n';
+        out << sample.name << "_sum" << RenderLabels(sample.labels) << ' '
+            << RenderNumber(sample.sum) << '\n';
+        out << sample.name << "_count" << RenderLabels(sample.labels) << ' ' << sample.count
+            << '\n';
     }
     return out.str();
 }

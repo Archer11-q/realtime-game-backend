@@ -1,0 +1,58 @@
+{
+  "started_at_epoch": 1791094186.552,
+  "finished_at_epoch": 1791094247.358,
+  "wall_seconds": 60.806,
+  "players": 1,
+  "counters": {
+    "enqueue_ok": 1,
+    "login_ok": 1,
+    "pair_timeout": 1,
+    "stale_result_skipped": 120
+  },
+  "stream_events": {},
+  "stream_resets": {},
+  "finish_reasons": {},
+  "attack_rejections": {},
+  "http_status": {
+    "/api/v1/login:200": 1,
+    "/api/v1/matches/current:200": 120,
+    "/api/v1/matches:200": 1
+  },
+  "exceptions": {},
+  "latency_ms": {
+    "login": {
+      "count": 1,
+      "min": 3.135,
+      "p50": 3.135,
+      "p90": 3.135,
+      "p95": 3.135,
+      "p99": 3.135,
+      "max": 3.135,
+      "mean": 3.135
+    },
+    "match_poll": {
+      "count": 120,
+      "min": 1.088,
+      "p50": 1.684,
+      "p90": 1.917,
+      "p95": 2.059,
+      "p99": 2.386,
+      "max": 2.508,
+      "mean": 1.713
+    }
+  },
+  "label": "players-1",
+  "config": {
+    "players": 1,
+    "gateway": "127.0.0.1:8080",
+    "duration": 60.0,
+    "attack_interval": 2.0,
+    "poll_interval": 0.5,
+    "timeout": 10.0,
+    "connections_per_bot": 2,
+    "recycle": true,
+    "recycle_gap": 1.0,
+    "hostname": "Archer",
+    "python": "3.14.4"
+  }
+}
