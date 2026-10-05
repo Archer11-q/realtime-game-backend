@@ -4730,3 +4730,54 @@ x  room_id 不一致：alice=[r-9mFL9o_vJIFBrk-3NEO2SCTH] bob=[]
 已恢复到与 TASK-035 之前一致，同时保留高负载下"分配不阻塞请求线程"的收益。
 
 原始输出：`.run/demo-run3.log`、`.run/va-after-fp.log`、`.run/vc-after-fp.log`
+
+
+## TASK-032 实施记录（2026-10-05）：Runbook（故障处置与排查手册）
+
+**交付物**：新增 `docs/09-runbook.md`（编号接现有文档序列），覆盖任务单点名的九类故障
+（Redis 不可用、MySQL 不可用、Room/Battle 崩溃、Match 崩溃、Gateway 崩溃、连接风暴与
+连接被拒、优雅退出与排空、长稳资源趋势、SSE 订阅生命周期异常）外加一节「入队延迟排查」
+（TASK-035 的七次否证）。每节统一六段：**症状（怎么发现）→ 影响范围 → 处置命令 →
+恢复到什么程度 → 已知边界（哪些不恢复）→ 相关指标与日志字段**。
+
+**怎么重现**：一律引用 `scripts/demo.sh` 的九个步骤号（步骤 7 默认只打印已实测结论摘要、
+`--full` 才真跑依赖注入，单跑实测 793 s），不另写一套命令；演示之外的命令给统一入口
+`scripts/verify-chaos.sh` 与各脚本的**真实参数表**（核对过源码，不编造开关）。
+
+**数字纪律**：每个数字都带出处（任务单「实施结果」/ devlog「实施记录」/ raw 目录）；
+「设计意图」与「实测行为」分开标注（例如 Redis「挂起」只有设计推断、从未单独实测）；
+单列 12 条「已知不恢复」的场景；如实记录四类故障注入**没有 raw 归档**的追溯缺口
+（只有容量与长稳有 `docs/benchmarks/raw/`）。
+
+**分工落实**：`06-operations.md` 第 5 节改为指向 `09-runbook.md`——它原先只是 Phase 1
+占位（写着「以下场景在实现对应能力后补全具体命令」），其中「已结束但未落库的对局重启会
+丢失」已被 TASK-014 实测推翻；`docs/README.md` 阅读顺序加入 `09-runbook.md`
+（序号 10，TASKS/devlog 顺延为 12/13）。
+
+**新增实测发现两条**（写文档时从源码与原始数据核实，已记入 `docs/TASKS.md` Backlog）：
+1. `rgbt_result_persist_total` 与 `rgbt_room_events_total` 在 `include/common/metrics.hpp`
+   第 263/266 行**已定义但没有登记**（`src/` 下无使用点）→ 结果落库重试没有指标出口，
+   只能用 `rgbt_rooms{phase="finishing"}` 与日志 `result_persist_failed`。
+2. `rgbt_match_events_total{event="paired"}` 在压载下读数为 0
+   （`docs/benchmarks/raw/20261005-212008/`：该指标 0 而 `room_allocate ok=250`、
+   压载端自报 `paired=500`）。根因在 `src/match/match_service.cpp` 第 215~224 行：
+   TASK-035 方案 A 之后只有「入队这一次调用内当场配对」才计数，分配 worker 路径不计数；
+   低负载走空闲快路径仍计数，所以 `verify-observability.sh` 的单次验收看不出来。
+
+**状态修正**：TASK-031 从「待确认」更正为「已完成并实测通过」——演示脚本 `7f45c5f` 与
+空闲快路径修复 `6d5f359` 均已合入 `main`，devlog 已有两轮计时与最终重跑结论。写 Runbook
+时发现引用一个「待确认」的演示入口自相矛盾，这是 TASK-034 一致性核对项目的提前落地。
+
+**验收**：
+
+| 命令 | 结果 |
+|---|---|
+| `bash scripts/verify-chaos.sh --only dependency-down,process-crash` | **2/2 通过，耗时 849 s**（依赖不可用四通道 + 进程崩溃四场景；输出 `.run/chaos-dependency-down.log`、`.run/chaos-process-crash.log`） |
+| `bash scripts/demo.sh --list` | 九步与 Runbook §0.2 一致 |
+
+Runbook 引用的命令逐条核对过参数（五个 chaos 脚本、`verify-reconnect.sh`、
+`verify-chaos.sh`、`verify-all.sh`、`demo.sh`）；长稳 30 分钟与容量 60 秒/档按仓库既有
+实测记录引用、不在本任务重复执行（文档任务的验收命令只要求走两节，已执行；长稳与容量的
+复跑属于 TASK-033）。
+
+**未做（非范围）**：不做告警规则（没有告警系统）；不写通用运维教程；不引入新工具。
