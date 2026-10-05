@@ -135,7 +135,9 @@ room_bin="build/$preset/bin/rgbt_room"
 match_bin="build/$preset/bin/rgbt_match"
 gw_bin="build/$preset/bin/rgbt_gateway"
 
-"$room_bin" -port "$room_port" -env_prefix dev \
+# `-drain_timeout_ms 1000`：本脚本的 SIGTERM 只是收尾，**保留产品默认 30 秒**。
+# 排空语义本身由 chaos/verify-drain.sh 用显式值验收（TASK-026/029 的一致性）。
+"$room_bin" -port "$room_port" -env_prefix dev -drain_timeout_ms 1000 \
   -mysql_host "$MYSQL_HOST" -mysql_port "$MYSQL_PORT" \
   -mysql_user "$MYSQL_USER" -mysql_password "$MYSQL_PASSWORD" \
   -mysql_database "$MYSQL_DATABASE" >/tmp/reconnect-room.out 2>&1 &
