@@ -89,7 +89,7 @@ Match Service   Room/Battle Service   ← 房间权威状态（10 Hz）、快照
 | 客户端通信 | HTTP + SSE（服务端推送） | 浏览器登录、状态推送和实时消息 |
 | 数据存储 | Redis + MySQL | 会话、缓存、玩家档案和对局结果 |
 | 前端演示 | Vue 3 + TypeScript + Vite + Canvas | 可视化和端到端演示 |
-| 可观测性 | Prometheus + Grafana + OpenTelemetry | 指标、日志、链路和面板 |
+| 可观测性 | Prometheus + Grafana；trace 用 `request_id` 贯通结构化日志 | 指标、面板、日志和链路（**不引入 OTLP collector**，见 TASK-021） |
 | 工程质量 | GoogleTest、ASan、TSan、UBSan | 测试、内存和并发检查 |
 | 部署 | Docker Compose、GitHub Actions | 本地集成环境和持续集成 |
 
@@ -121,8 +121,8 @@ Match Service   Room/Battle Service   ← 房间权威状态（10 Hz）、快照
 
 ## 当前状态
 
-**Phase 0 ~ Phase 5 的任务已全部交付、实测并提交**。Phase 5（工程收口，
-TASK-030 ~ TASK-034）于 2026-10-05/06 完成：
+**全部迭代任务（TASK-000 ~ TASK-034，覆盖 Phase 0 ~ Phase 5）已交付、实测并提交**。
+Phase 5（工程收口，TASK-030 ~ TASK-034）于 2026-10-05/06 完成：
 
 - TASK-030：错误路径补结构化日志（503 在日志里可查）；
 - TASK-031：`scripts/demo.sh` 15 分钟完整演示（实测 7/7、321 s）；
@@ -150,9 +150,17 @@ TASK-030/031 已合入 `main`；TASK-032/033/034 在 `feat/phase-5` 上待项目
   端点；同一个 `request_id` 贯通 Gateway → Match → Room；Prometheus + Grafana
   面板，含按端点的延迟分位数。
 - **容量基线**：`scripts/bench.sh` 六档（1/10/50/100/500/1000 连接）压测，
-  首份报告与原始数据见 [容量基线报告](docs/benchmarks/README.md)。
+  首份报告与最终报告（含 TASK-033 全档复跑与可追溯性核对表）见
+  [容量基线报告](docs/benchmarks/README.md)，原始数据在
+  `docs/benchmarks/raw/`。
+- **故障注入与排空**：六个故障场景（依赖不可用 / 进程崩溃 / 优雅退出排空 /
+  连接风暴 / 断线重连 / 长稳）均有可重复执行的注入脚本与实测数字，
+  统一入口 `scripts/verify-chaos.sh`，处置步骤见
+  [运行手册](docs/09-runbook.md)。
+- **文档一致性**：`scripts/check-docs.sh` 机检（文件引用 / 脚本清单 / 阶段与任务状态）。
 - Redis 与 MySQL 通过 Docker Compose 启动，含健康检查与数据卷。
-- 依赖不可用路径均返回明确错误码（503 / 409 / 404）且恢复后无需重启服务。
+- 依赖不可用路径均返回明确错误码（503 / 409 / 404）且恢复后无需重启服务
+  （TASK-030 之后 503 在日志里可查）。
 - CI 覆盖三个构建预设与代码格式检查。
 
 ## 快速开始
@@ -258,6 +266,19 @@ realtime-game-backend/
 - Grafana 展示连接数、QPS、延迟、错误率、房间数和重连次数。
 - 形成可复现压测基线、故障注入结果、架构文档和 Runbook。
 - 能解释每个技术选择的替代方案，**包括为什么不做 Kafka、etcd 和多实例**。
+
+**完成标准逐条核对（2026-10-06，全部满足）**：
+
+| 完成标准 | 满足情况 | 依据 |
+|---|---|---|
+| 两个浏览器完成登录、匹配、进入房间和一场最小对战 | ✅ | `scripts/demo.sh` 步骤 1~4；`scripts/verify-all.sh` 9/9 通过 |
+| 断线后在宽限期内恢复会话和房间位置 | ✅ | TASK-016；`scripts/verify-reconnect.sh`（30 s 宽限、期内暂停推进、缺口 0 帧） |
+| 业务进程 `kill -9` 后恢复关键状态、重复写入不产生重复结果 | ✅ | TASK-014/015；`chaos/verify-process-crash.sh`（丢 1~4 帧、上界 10 帧；`match_results` 恰好 1 行） |
+| Redis/MySQL 不可用返回明确错误（不写假成功）、恢复后无需重启 | ✅ | TASK-023/030；`chaos/verify-dependency-down.sh`（503 + `event=request_failed` 日志可查） |
+| 优雅退出：SIGTERM 后排空活跃对局 | ✅ | TASK-026；`chaos/verify-drain.sh`（排空完 8.2 s / 超时截断不伪造胜负） |
+| Grafana 展示连接数、QPS、延迟、错误率、房间数和重连次数 | ✅ | TASK-020；`deploy/compose/docker-compose.observability.yml` + 8 块面板 |
+| 可复现压测基线、故障注入结果、架构文档和 Runbook | ✅ | `docs/benchmarks/README.md`（最终报告 + 可追溯性核对表）、`docs/09-runbook.md` |
+| 能解释每个技术选择的替代方案和代价 | ✅ | ADR-0001 ~ 0004（含 TASK-034 回顾）、README「明确的非目标」 |
 
 具体阶段性验收见 [验收标准](docs/04-quality-and-observability.md) 和
 [路线图](docs/02-roadmap.md)。
