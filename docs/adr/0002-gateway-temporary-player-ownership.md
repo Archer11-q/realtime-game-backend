@@ -113,3 +113,12 @@ TASK-006 需要建立 `players` 表并让玩家档案具备真实读写，以验
 新增 ADR 并将本 ADR 状态改为「已替代」。
 
 **不要再**为 Player/State 服务或 Settlement 服务创建 proto、目录或进程入口。
+
+
+## 回顾（TASK-034 收口时补充）
+
+**代价**：Gateway 直接读 `players` 表，是「数据所有权」规则里唯一已知的直读例外
+（读路径封装在 `PlayerReader` 接口后，不拼 SQL）；Gateway 因此多一个 MySQL 依赖。
+**什么时候该重新考虑**：ADR-0003 已取消原退出条件 1（Player/State 不实现）；
+若出现第二个需要读 `players` 的服务（退出条件 2），必须新增 ADR 重新评估所有权，
+不能继续扩散直读。

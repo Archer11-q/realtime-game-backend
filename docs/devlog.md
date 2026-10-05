@@ -4850,3 +4850,54 @@ Match 的快照写入，TASK-035 的方案 A 与空闲快路径又改了配对�
 
 **未做（非范围）**：不做新优化（剩余瓶颈只记录）；不做 24 小时以上长稳；不改压测脚本的
 判定口径。
+
+
+## TASK-034 实施记录（2026-10-06）：README / 架构图 / ADR 回顾与文档一致性核对
+
+**交付物**：
+
+1. **README.md**
+   - 当前状态更新为 **Phase 0 ~ Phase 5 全部完成**（TASK-030 ~ TASK-034）；
+   - 目标架构图增强：明确 HTTP（上行）与 SSE（下行）分工、Redis/MySQL 数据所有权、
+     `request_id` 贯通与 Runbook 指针；
+   - 快速开始指向 `scripts/demo.sh`（TASK-031 的演示入口），并修掉过期的
+     「verify-all.sh 实测 142 秒」（实测约 239 s）；
+   - 文档阅读顺序补全：Runbook / 容量报告 / ADR 索引 +「30 分钟入门路径」。
+
+2. **ADR 回顾**：ADR-0001 ~ 0004 各补一段「代价是什么、什么时候该重新考虑」
+   （收口时新增，不新增 ADR、不撤销任何 ADR）。
+
+3. **新增 `scripts/check-docs.sh`**（可机检的一致性核对），检查项：
+   - C1 markdown 引用的相对文件/目录存在（排除 `build/`、`web/node_modules/`、
+     `docs/benchmarks/raw/`、`.run/`）；
+   - C2 / C3 `scripts/verify-all.sh` 与 `scripts/verify-chaos.sh` 列出的脚本都存在；
+   - C4 Phase 5 收口状态一致：README / CLAUDE / roadmap / TASKS 四处都有 Phase 5，
+     且 `docs/TASKS.md` 无遗留「待确认」任务；
+   - C5 新文档已入索引（`09-runbook.md`、`benchmarks/README.md`）；
+   - C6 关键脚本 `bash -n` 语法。
+
+4. **顺带修正的过期状态**（一致性核对发现，均以 git 与既有文档为准）：
+   - TASK-014 / 015 / 016 从「已实现，待审阅」更正为「已完成」（它们早已经
+     PR #11 ~ #13 合并，头部状态行也早已写明）；
+   - CLAUDE.md「当前阶段」、roadmap 顶部进度行与 §8、TASKS.md 头部状态全部更新为
+     Phase 5 已完成；
+   - `docs/04-quality-and-observability.md` 第 5 节补回 SLO 数值的权威出处
+     （p95 < 100 ms、p99 < 250 ms）——TASK-033 最终报告点名的缺口；
+   - `docs/README.md` 阅读顺序补 `benchmarks/README.md`，维护规则补 `check-docs.sh`。
+
+**check-docs.sh 的自我验证（验收要求「必须能在故意改坏一处状态时失败」）**：
+把 TASK-034 状态故意改回「待确认」→ `bash scripts/check-docs.sh` **退出码 1**，
+报 `docs/TASKS.md 仍有「状态：**待确认**」的任务`；还原后退出码 0。
+（同时修掉了实现过程中的一个真 bug：第一版 C1 的 grep 漏了 `-o`，把整行当链接，
+误报了一处——已修。）
+
+**验收**：
+| 命令 | 结果 |
+|---|---|
+| `bash scripts/check-docs.sh` | **退出码 0，全部通过**（C1 核对 117 个链接） |
+| 故意改坏状态 → `check-docs.sh` | **退出码 1**（能抓到） |
+| `bash scripts/verify-all.sh` | **9/9 通过（232 s）** |
+
+**未做（非范围）**：不重写已有文档；不改任何结论性数字；不为了好看删除历史记录；
+`check-docs.sh` 暂未并入 `verify-all.sh`（保持独立命令，避免快速门禁被文档规则拖慢，
+如需要可后续评估并入）。
