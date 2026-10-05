@@ -1,0 +1,3 @@
+  rgbt_http_request_seconds{path=/api/v1/login}  count=1  p50=3.75ms  p90=4.75ms  p95=4.88ms  p99=4.98ms  sum=0.003s
+  rgbt_http_request_seconds{path=/api/v1/matches}  count=1  p50=3.75ms  p90=4.75ms  p95=4.88ms  p99=4.98ms  sum=0.003s
+  rgbt_http_request_seconds{path=/api/v1/matches/current}  count=120  p50=0.74ms  p90=2.04ms  p95=2.27ms  p99=2.45ms  sum=0.115s

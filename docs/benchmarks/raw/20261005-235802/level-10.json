@@ -1,0 +1,83 @@
+{
+  "started_at_epoch": 1791215969.182,
+  "finished_at_epoch": 1791216030.15,
+  "wall_seconds": 60.968,
+  "players": 10,
+  "counters": {
+    "attacks_ok": 100,
+    "attacks_sent": 100,
+    "enqueue_ok": 20,
+    "games_finished": 10,
+    "join_ok": 10,
+    "login_ok": 10,
+    "pair_timeout": 10,
+    "paired": 10,
+    "rooms_entered": 10,
+    "stale_result_skipped": 820,
+    "stream_opened": 10
+  },
+  "stream_events": {
+    "room.finished": 10,
+    "room.state": 1710,
+    "session.ready": 10
+  },
+  "stream_resets": {},
+  "finish_reasons": {
+    "hp_zero": 10
+  },
+  "attack_rejections": {},
+  "http_status": {
+    "/api/v1/login:200": 10,
+    "/api/v1/matches/current:200": 830,
+    "/api/v1/matches:200": 20,
+    "/api/v1/rooms/input:200": 100,
+    "/api/v1/rooms/join:200": 10
+  },
+  "exceptions": {},
+  "latency_ms": {
+    "attack": {
+      "count": 100,
+      "min": 0.838,
+      "p50": 1.834,
+      "p90": 2.595,
+      "p95": 3.004,
+      "p99": 3.208,
+      "max": 3.208,
+      "mean": 1.896
+    },
+    "login": {
+      "count": 10,
+      "min": 5.43,
+      "p50": 10.785,
+      "p90": 14.743,
+      "p95": 14.743,
+      "p99": 14.743,
+      "max": 14.743,
+      "mean": 10.077
+    },
+    "match_poll": {
+      "count": 830,
+      "min": 0.728,
+      "p50": 2.185,
+      "p90": 3.038,
+      "p95": 3.41,
+      "p99": 4.195,
+      "max": 5.776,
+      "mean": 2.236
+    }
+  },
+  "label": "players-10",
+  "config": {
+    "players": 10,
+    "gateway": "127.0.0.1:8080",
+    "duration": 60.0,
+    "attack_interval": 2.0,
+    "poll_interval": 0.5,
+    "timeout": 10.0,
+    "connections_per_bot": 2,
+    "recycle": true,
+    "recycle_gap": 1.0,
+    "hostname": "Archer",
+    "python": "3.14.4"
+  }
+}

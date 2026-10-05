@@ -1,0 +1,91 @@
+{
+  "started_at_epoch": 1791216405.43,
+  "finished_at_epoch": 1791216466.431,
+  "wall_seconds": 61.001,
+  "players": 1000,
+  "counters": {
+    "attacks_failed": 1802,
+    "attacks_ok": 9768,
+    "attacks_sent": 11570,
+    "enqueue_failed": 3,
+    "enqueue_ok": 2000,
+    "games_finished": 1000,
+    "join_ok": 1000,
+    "login_ok": 1000,
+    "pair_timeout": 1000,
+    "paired": 1000,
+    "rooms_entered": 1000,
+    "stale_result_skipped": 68025,
+    "stream_opened": 1000
+  },
+  "stream_events": {
+    "room.finished": 1000,
+    "room.state": 10809,
+    "session.ready": 1000
+  },
+  "stream_resets": {},
+  "finish_reasons": {
+    "hp_zero": 1000
+  },
+  "attack_rejections": {
+    "room_already_finished": 1570,
+    "room_not_playing": 232
+  },
+  "http_status": {
+    "/api/v1/login:200": 1000,
+    "/api/v1/matches/current:200": 69025,
+    "/api/v1/matches:200": 2000,
+    "/api/v1/matches:503": 3,
+    "/api/v1/rooms/input:200": 9768,
+    "/api/v1/rooms/input:400": 232,
+    "/api/v1/rooms/input:409": 1570,
+    "/api/v1/rooms/join:200": 1000
+  },
+  "exceptions": {},
+  "latency_ms": {
+    "attack": {
+      "count": 11570,
+      "min": 0.733,
+      "p50": 2.168,
+      "p90": 50.4,
+      "p95": 168.84,
+      "p99": 322.503,
+      "max": 350.075,
+      "mean": 23.032
+    },
+    "login": {
+      "count": 1000,
+      "min": 216.923,
+      "p50": 672.573,
+      "p90": 1073.295,
+      "p95": 1122.657,
+      "p99": 1161.218,
+      "max": 1170.36,
+      "mean": 679.605
+    },
+    "match_poll": {
+      "count": 69025,
+      "min": 0.753,
+      "p50": 2.303,
+      "p90": 7.842,
+      "p95": 14.44,
+      "p99": 140.968,
+      "max": 371.883,
+      "mean": 6.914
+    }
+  },
+  "label": "players-1000",
+  "config": {
+    "players": 1000,
+    "gateway": "127.0.0.1:8080",
+    "duration": 60.0,
+    "attack_interval": 2.0,
+    "poll_interval": 0.5,
+    "timeout": 10.0,
+    "connections_per_bot": 2,
+    "recycle": true,
+    "recycle_gap": 1.0,
+    "hostname": "Archer",
+    "python": "3.14.4"
+  }
+}
