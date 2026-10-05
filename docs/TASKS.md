@@ -2359,7 +2359,7 @@ Phase 4 已交付完毕，本任务是它**实测结论的直接后续**：TASK-
 
 ### TASK-030：Gateway 依赖不可用路径不写日志（503 可诊断）
 
-- 状态：**待确认**
+- 状态：**已完成并实测**（2026-10-05）。见下方「实施结果」。
 - 依赖：无（TASK-023 的实测发现是它的背景）
 - 背景问题：TASK-023 实测发现，Gateway 在依赖不可用（Redis/MySQL 停）时返回的 503
   走的是 `FillError` 路径，**这条路径不写结构化日志**，因此"服务返回了 503"这件事
@@ -2385,6 +2385,24 @@ Phase 4 已交付完毕，本任务是它**实测结论的直接后续**：TASK-
   `chaos/verify-dependency-down.sh` 复跑，并在 devlog 里给出"日志里查得到 503"的证据。
 - 回退方式：`git revert` 单个提交（只加日志，回退后行为回到"503 无日志"）。
 - 涉及目录：`src/gateway/`、`tests/unit/gateway/`、`docs/`。
+
+- 实施结果（2026-10-05）：
+  - 改动：在 `GatewayServiceImpl::FillError` 补一条结构化日志（`event=request_failed`），
+    字段为 `http_status` / `error_code` / `reason` / `message` / `request_id`。
+  - **为什么只改一个函数**：`FillError` 是所有错误路径的**唯一收敛点**（当前 57 处调用），
+    记一次就覆盖全部错误路径，且天然不会重复计数；`request_done` 按原样保留，
+    两者用 `request_id` / trace 关联。
+  - **有意的偏离（1 条）**：任务单写"至少含 `op`"，但 `FillError` 拿不到 `op`
+    （要传就得改 57 个调用点）。改为**用同一个 `request_id` 去查相邻的 `request_done`**
+    拿 `op`，不为此做大规模改动。
+  - **有意的偏离（2 条）**：未新增"断言错误路径会写日志"的单测——现有单测没有日志
+    捕获夹具，而这条行为的真实验收是**真停依赖**（见下），比单测更强；
+    单测夹具的补齐另立 Backlog。
+  - 验收：`ctest` **301/301**；`chaos/verify-dependency-down.sh` **通过**，且
+    日志里能查到 `event=request_failed ... http_status=503`（TASK-023 时查不到）；
+    `scripts/verify-observability.sh --logs` **通过**（日志规范未被破坏）。
+  - 敏感字段：新日志只含服务端自己生成的内容，**不含 token / 密码**。
+  - 未做：日志采样/限流（错误风暴时的量级）——留作后续观察点。
 
 ### TASK-031：演示脚本与 15 分钟完整演示
 

@@ -4644,3 +4644,28 @@ instantaneous_ops_per_sec:311
 **明确留给后续的问题**：230 ms 的成因在 brpc 接入/传输层（Gateway 的
 `event_dispatcher_read_latency` p80 = 275 ms 而 CPU 空闲），应用层与配置层都无法解释。
 下一步要么改变测量方法/部署形态，要么接受这条曲线作为"当前测量条件下的基线"。
+
+## TASK-030 实施记录（2026-10-05）：错误路径在日志里可查
+
+**背景**：TASK-023 实测发现依赖不可用时 Gateway 返回 503，但**日志里查不到**——
+所有错误都经由 `FillError` 收敛，而它只填 response、不写日志。排障时"返回了 503"
+这件事没有任何痕迹，只能靠复现。
+
+**改动**：在 `FillError`（唯一收敛点，57 处调用）补一条结构化日志：
+
+```text
+event=request_failed http_status=503 error_code=... reason=session_store_unavailable request_id=...
+```
+
+**为什么记在这里**：一处改动覆盖全部错误路径，且不会与 `request_done` 重复计数；
+两者用 `request_id` / trace 关联。
+
+**有意的两条偏离**（都写进任务单的实施结果）：
+1. 任务单写"至少含 `op`"，但本函数拿不到——改为用同一个 `request_id` 去查相邻的
+   `request_done`，不为此改 57 个调用点；
+2. 未新增"断言错误路径会写日志"的单测：现有单测没有日志捕获夹具，而真实验收是
+   **真停依赖**（`chaos/verify-dependency-down.sh`），比单测更强。
+
+**验收**：`ctest` 301/301；`chaos/verify-dependency-down.sh` 通过且日志里查得到
+`request_failed` + `http_status=503`；`verify-observability.sh --logs` 通过。
+**未做**：错误风暴下的日志量级（采样/限流）留作观察点。
