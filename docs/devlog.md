@@ -3979,9 +3979,13 @@ SSE 连接数也重新稳定在 50。
    视角的「实施结果」，没有 `docs/08-verification-checklist.md` 第 6 步要求的
    "验收结果 + 验收人"。
 3. **长稳的泄漏上界未知**：修复后只验到 30 分钟（任务单上限 1 小时未用满）。
-4. **重跑纪律的真空**：`chaos/` 的 5 个脚本与 `scripts/verify-reconnect.sh`
-   **不在 `verify-all.sh` 里**，因此改了产品代码也不会被自动抓到。TASK-029 改了
-   `src/gateway/stream_hub.*` 之后的补跑结果见本节下方「TASK-029 之后的重跑」。
+4. **重跑纪律的真空（已有一个具体受害者）**：`chaos/` 的 5 个脚本与
+   `scripts/verify-reconnect.sh` **不在 `verify-all.sh` 里**，因此改了产品代码也不会
+   被自动抓到。本轮补跑六个脚本时，`verify-reconnect.sh` 果然失败了——原因是
+   **TASK-026 当时漏改它**（该脚本自己拉起 Room，却没有 `-drain_timeout_ms 1000`，
+   于是"Room 未在 10 秒内退出"）。已补上并复跑通过，详见下方
+   「TASK-029 之后的重跑结果」。**结构性问题仍未解决**：是否把它们纳入
+   `verify-all.sh` 需要项目所有者决定（roadmap 第 7.1 节第 3 条）。
 5. **存量缺陷**（都有证据、Phase 4 未修，**不是缺口而是已知风险**）：
    MySQL 不可用使同一局从基线 4.1~16.7 秒变成观测 755 秒；Gateway 的依赖不可用
    路径不写日志（503 在日志里查不到）；500 档位入队 P95 842 ms vs SLO 100 ms
@@ -3996,3 +4000,50 @@ TASK-029 改的是 `src/gateway/gateway_service.cpp` 与 `stream_hub.*`，属于
 `verify-process-crash.sh`、`verify-drain.sh`、`verify-connection-storm.sh` 与
 `verify-reconnect.sh` 各一次，结果见 `docs/devlog.md` 的
 「TASK-029 之后的重跑结果」一节。
+
+## TASK-029 之后的重跑结果（2026-10-04）
+
+**为什么要单独记这一节**：TASK-029 改的是 `src/gateway/`（产品代码），按本项目纪律
+"改变了服务的依赖或启动方式就必须重跑受影响的既有验收脚本"。但 `chaos/` 下的 5 个
+故障注入脚本与 `scripts/verify-reconnect.sh` **不在 `scripts/verify-all.sh` 里**，
+不会被自动抓到——这正是「Phase 4 退出标准对照表」未闭合项第 4 条记的那条
+"重跑纪律的真空"。本轮把这六个脚本全部补跑了一遍。
+
+| 脚本 | 结果 |
+|---|---|
+| `scripts/verify-all.sh`（9 个既有验收脚本） | **通过**（退出码 0，256 秒） |
+| `chaos/verify-dependency-down.sh` | **通过** |
+| `chaos/verify-process-crash.sh` | **通过** |
+| `chaos/verify-drain.sh` | **通过** |
+| `chaos/verify-connection-storm.sh` | **通过** |
+| `scripts/verify-reconnect.sh` | 首次**失败**（`Room 未在 10 秒内退出`）→ 修脚本后**通过** |
+
+脚本与日志：`.run/rerun29.sh`、`.run/rerun29*.log`（`.run/` 不入库）。
+
+### 那次失败：不是 TASK-029 的回归，而是"重跑真空"的第一个受害者
+
+`verify-reconnect.sh` 第 8 节（优雅退出）报 `Room 未在 10 秒内退出`。
+**同一轮里第 7 节（推送连续性与补发）的断言全部通过**，包括 TASK-029 直接影响的几条：
+
+* 「首次订阅不发 `stream.reset`，直接推当前状态」——这正是修复后的行为；
+* 「窗口内补发，没有发 `stream.reset`」「补发从缺口第一帧开始（id=21）」
+  「补发覆盖到缺口末端（id=40）」；
+* 「id 超前 → `stream.reset`（reason=`id_ahead`）」「非法 `Last-Event-ID` →
+  `id_malformed`」。
+
+真正的原因是 **TASK-026 给 Room 加了排空语义**（默认上限 30 秒），而本脚本的 SIGTERM
+只是收尾、期待 10 秒内退出。TASK-026 当时给 5 个脚本补了 `-drain_timeout_ms 1000`，
+**唯独漏了 `verify-reconnect.sh`**——因为它不在 `verify-all.sh` 里，任何常规重跑
+都覆盖不到它。本轮已补上同一行（**保留产品默认 30 秒**；排空语义本身由
+`chaos/verify-drain.sh` 用显式值验收），补跑后该脚本通过（TASK-016 与 TASK-017
+两组语义全部通过）。
+
+### 这一轮证明了什么
+
+1. **TASK-029 的改动没有破坏这六条链路**：依赖不可用、崩溃恢复、优雅退出与排空
+   （依赖 `stream.closed`）、连接风暴、断线重连与补发（依赖 `Last-Event-ID`）——
+   后两条正是本次改动直接相邻的路径。
+2. **"重跑纪律的真空"不是假设，它已经有了一个具体受害者**：TASK-026 漏改
+   `verify-reconnect.sh`，此后不会被任何自动化发现，直到这次手工补跑。
+   因此 roadmap 第 7.1 节把它列为推进前应先决定的事项
+   （是否把这些脚本纳入 `verify-all.sh`；若不纳入，把原因写进脚本头部注释）。
