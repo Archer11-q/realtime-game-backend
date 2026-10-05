@@ -1,0 +1,2 @@
+level	players	wall_s	login_ok	paired	stream_opened	attacks_ok	games_finished	exceptions	http_req_per_s	room_rpc_per_s	frames_per_s	snapshot_per_s	gw_rss_mb
+500	500	60.941	500	500	500	4980	500	0	768.0	540.9	740.0	233.7	59.7

@@ -1,0 +1,4 @@
+service	rss_kb	threads
+gateway	61092	21
+match	41520	21
+room	54012	21
