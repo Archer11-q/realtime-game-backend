@@ -4522,3 +4522,59 @@ CPU 与运行队列，用**同一命令**重测 500 档位。
 1. 压载期间跑 `redis-cli --latency`（以及 `INFO stats` 的
    `latency_percentiles_usec_*`）看 P95/P99；
 2. 给 Gateway 的请求路径加分段：**会话解析** / RPC / 响应组装，与 Match 侧同一手法。
+
+## TASK-035 第六、七步：Redis 与日志 I/O 也被否证（2026-10-05）
+
+第五步之后，剩下两条"handler 内、RPC 之外"的候选：**Redis 会话查询**与
+**结构化日志写出**。两条都用同一命令做了对照。
+
+### 第六步：Redis 很快
+
+压载中途抓 `INFO commandstats` / `INFO latencystats` / `--latency`：
+
+```text
+cmdstat_hmget:calls=356547,usec_per_call=4.40      （会话查询就是 hmget）
+cmdstat_exec :calls=121,   usec_per_call=81.12     （快照的 MULTI/EXEC 写）
+latency_percentiles_usec_hmget:p50=3.007,p99=23.039,p99.9=44.031
+latency_percentiles_usec_exec :p50=20.095,p99=495.615,p99.9=1146.879
+instantaneous_ops_per_sec:311
+--latency 采样：平均 0.15 ms、最大 1 ms
+```
+
+**Redis 侧最多贡献 ~1 ms**（p99.9 最大的 EXEC 也只有 1.1 ms），无法解释那 85 ms。
+
+### 第七步：日志 I/O 也不是
+
+把 bench.sh 里三个服务的输出从"写归档文件"改成"写 `/dev/null`"（只改夹具、随后恢复），
+同一命令复测：
+
+| 指标 | 基线 | 日志写 /dev/null |
+|---|---|---|
+| 入队 p95 | 229.86 ~ 232.01 ms | **232.23 ms** |
+| 入队 p99 | 245.79 ~ 246.40 ms | 246.45 ms |
+| Gateway→Match RPC 段最大 | 145 ~ 240 ms | 158 ms |
+
+**没有变化**。`bench.sh` 已恢复原样，工作树干净。
+
+### 至此已否证六个假设
+
+| # | 假设 | 结果 |
+|---|---|---|
+| 1 | Match 处理路径慢（同步等 Room） | ❌ handler 80 → 6 ms，端到端不动 |
+| 2 | 宿主机 CPU 竞争 | ❌ 80% 空闲 |
+| 3 | 监控栈抢占 | ❌ p95 不变 |
+| 4 | brpc 分发器/线程数不足 | ❌ 调大后更差 |
+| 5 | Redis 会话查询慢 | ❌ p99.9 = 44 µs |
+| 6 | 结构化日志写 I/O 慢 | ❌ 写 /dev/null 后 p95 不变 |
+
+### 残余区间的精确形状
+
+现在能量出来的最大单项是 **Gateway→Match RPC 段**（最大 145 ~ 240 ms），
+而它的对端处理只花 **6 ~ 9 ms**。也就是说这一段的耗时**几乎全在 brpc 层**：
+客户端单连接的收发/复用、或服务端接入。这与第三步观察到的
+`event_dispatcher_read_latency`（Gateway p80 = 275 ms、Match p999 = 24.6 s）互相印证。
+
+**下一个（也是最后一个便宜的）候选**：Gateway→Match 的**单连接**
+（`brpc_match_client.cpp` 注释写着"Phase 1 只有 Gateway 一个调用方，不需要连接池"）。
+5 万次调用共用一条 TCP 连接时，brpc 的连接级收发可能成为串行点。
+验证方式：把连接池调大做对照（配置级改动，可回滚）。

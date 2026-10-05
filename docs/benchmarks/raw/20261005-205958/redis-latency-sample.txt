@@ -1,0 +1,47 @@
+=== Redis 命令级统计（INFO commandstats：calls / usec / usec_per_call）===
+cmdstat_get:calls=5394,usec=7471,usec_per_call=1.39,rejected_calls=0,failed_calls=0
+cmdstat_exec:calls=121,usec=9815,usec_per_call=81.12,rejected_calls=0,failed_calls=0
+cmdstat_hmget:calls=356547,usec=1567203,usec_per_call=4.40,rejected_calls=0,failed_calls=0
+cmdstat_multi:calls=121,usec=221,usec_per_call=1.83,rejected_calls=0,failed_calls=0
+cmdstat_exists:calls=1,usec=5,usec_per_call=5.00,rejected_calls=0,failed_calls=0
+cmdstat_scan:calls=971,usec=6997,usec_per_call=7.21,rejected_calls=0,failed_calls=0
+cmdstat_rpush:calls=16666,usec=6213,usec_per_call=0.37,rejected_calls=0,failed_calls=0
+cmdstat_llen:calls=7,usec=38,usec_per_call=5.43,rejected_calls=0,failed_calls=0
+cmdstat_expire:calls=5383,usec=17593,usec_per_call=3.27,rejected_calls=0,failed_calls=0
+cmdstat_set:calls=5383,usec=23672,usec_per_call=4.40,rejected_calls=0,failed_calls=0
+cmdstat_info:calls=6,usec=262,usec_per_call=43.67,rejected_calls=0,failed_calls=0
+cmdstat_del:calls=9918,usec=84932,usec_per_call=8.56,rejected_calls=0,failed_calls=0
+cmdstat_config|get:calls=2,usec=42,usec_per_call=21.00,rejected_calls=0,failed_calls=0
+cmdstat_hset:calls=5383,usec=33484,usec_per_call=6.22,rejected_calls=0,failed_calls=0
+cmdstat_lrange:calls=36,usec=412,usec_per_call=11.44,rejected_calls=0,failed_calls=0
+cmdstat_ping:calls=3920,usec=6158,usec_per_call=1.57,rejected_calls=0,failed_calls=0
+
+=== Redis 延迟分位（INFO latencystats）===
+# Latencystats
+latency_percentiles_usec_get:p50=1.003,p99=5.023,p99.9=20.095
+latency_percentiles_usec_exec:p50=20.095,p99=495.615,p99.9=1146.879
+latency_percentiles_usec_hmget:p50=3.007,p99=23.039,p99.9=44.031
+latency_percentiles_usec_multi:p50=2.007,p99=4.015,p99.9=7.007
+latency_percentiles_usec_exists:p50=5.023,p99=5.023,p99.9=5.023
+latency_percentiles_usec_scan:p50=6.015,p99=22.015,p99.9=352.255
+latency_percentiles_usec_rpush:p50=0.001,p99=4.015,p99.9=24.063
+latency_percentiles_usec_llen:p50=5.023,p99=9.023,p99.9=9.023
+latency_percentiles_usec_expire:p50=3.007,p99=11.007,p99.9=39.167
+latency_percentiles_usec_set:p50=4.015,p99=20.095,p99.9=79.359
+latency_percentiles_usec_info:p50=11.007,p99=4915.199,p99.9=4915.199
+latency_percentiles_usec_del:p50=8.031,p99=16.063,p99.9=52.223
+latency_percentiles_usec_config|get:p50=3.007,p99=39.167,p99.9=39.167
+latency_percentiles_usec_hset:p50=5.023,p99=33.023,p99.9=114.175
+latency_percentiles_usec_lrange:p50=5.023,p99=118.271,p99.9=118.271
+latency_percentiles_usec_ping:p50=2.007,p99=3.007,p99.9=7.007
+
+=== Redis 概览（INFO stats 关键行）===
+total_commands_processed:410139
+instantaneous_ops_per_sec:311
+rejected_connections:0
+expired_keys:0
+keyspace_hits:356847
+keyspace_misses:5416
+
+=== Redis 即时延迟采样（--latency，约 5 秒）===
+0 1 0.15 99
