@@ -216,6 +216,24 @@ inline constexpr double kHttpLatencyBucketBounds[] = {0.001, 0.0025, 0.005, 0.01
 /// 当前 SSE 连接数（gauge）。
 inline constexpr const char* kMetricSseConnections = "rgbt_sse_connections";
 
+/// TASK-029：订阅生命周期计数（定位"订阅泄漏"用）。
+///
+/// 为什么需要它们：`rgbt_sse_connections` 只给"净结果"，看不出"谁该被回收却没有
+/// 被回收"。这四个量一起看就能指认：
+///   建立数 - 因写失败回收数 - 其它回收数 != 当前连接数  -> 有人在攒；
+///   `skipped_no_write` 增长 -> 有订阅在某轮**一次写都没尝试**（写失败发现不了它）；
+///   `oldest_age_ms` 一直涨 -> 泄漏的直接证据（健康状态下它应接近心跳间隔）。
+inline constexpr const char* kMetricSseSubscriptionsCreatedTotal =
+    "rgbt_sse_subscriptions_created_total";
+inline constexpr const char* kMetricSseClosedWriteFailedTotal =
+    "rgbt_sse_subscriptions_closed_write_failed_total";
+inline constexpr const char* kMetricSseClosedOtherTotal =
+    "rgbt_sse_subscriptions_closed_other_total";
+inline constexpr const char* kMetricSseSkippedNoWriteTotal =
+    "rgbt_sse_subscriptions_skipped_no_write_total";
+inline constexpr const char* kMetricSseOldestSubscriptionAgeMs =
+    "rgbt_sse_oldest_subscription_age_ms";
+
 /// 累计补发出去的推送帧数。
 ///
 /// 名字里**没有** `_total`：Prometheus 的惯例是 `_total` 表示 counter，而本进程

@@ -276,6 +276,7 @@ SubscriptionReport StreamHub::Subscribe(std::string player_id, std::string room_
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         const std::uint64_t id = next_id_++;
+        ++created_total_;  // TASK-029：订阅建立
         report.id = id;
         Subscription subscription;
         subscription.id = id;
@@ -353,6 +354,7 @@ void StreamHub::Unsubscribe(std::uint64_t id) {
         player_id = it->second.player_id;
         request_id = it->second.request_id;
         subscriptions_.erase(it);
+        ++closed_other_total_;  // TASK-029：显式取消（不是写失败）
     }
     // TASK-016：连接已经结束，上报"断线"让 Room 进入宽限期。
     // 注意这也覆盖 Gateway 主动断开（优雅退出）的情况——那是事实。
@@ -382,9 +384,23 @@ void StreamHub::Tick(std::int64_t now_ms) {
     std::vector<BackfillTarget> need_backfill;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
+        // TASK-029：Subscribe 拿不到 now_ms，因此新订阅在第一次参与 Tick 时补上
+        // 创建时刻——"最老订阅年龄"就是靠它算的。
+        for (auto& entry : subscriptions_) {
+            if (entry.second.created_ms == 0) {
+                entry.second.created_ms = now_ms;
+                // TASK-029：心跳基准也要一起设成"现在"。`last_heartbeat_ms` 的初值 0
+                // 表示"从未"，直接拿去比较会让新订阅在第一轮就被判成心跳到期——
+                // 在补发 pending 的路径上会多发一条心跳、打乱"补发 → 实时"的顺序
+                // （实测被 StreamHubTest.BackfillsMissingFramesInOrderWithIds 抓到）。
+                entry.second.last_heartbeat_ms = now_ms;
+            }
+        }
         for (const auto& entry : subscriptions_) {
             const Subscription& sub = entry.second;
             if (sub.sink == nullptr) {
+                // TASK-029：没有出口的订阅**永远不可能**通过写失败被发现。
+                ++skipped_no_write_total_;
                 continue;
             }
             // TASK-017：需要补发的订阅这一轮只做补发，**不参与实时推送**。
@@ -402,6 +418,23 @@ void StreamHub::Tick(std::int64_t now_ms) {
                 need_backfill.push_back(BackfillTarget{sub.id, sub.sink, sub.room_id,
                                                        sub.request_id, sub.backfill_from,
                                                        sub.backfill_malformed});
+                // TASK-029 修复点：补发 pending 的订阅**仍然必须有心跳**。
+                //
+                // 原实现这里无条件 continue：这一轮它既不推状态、也不发心跳。
+                // 万一对端此时已经关闭，写失败就永远不会被发现——订阅连同它的 socket
+                // 一起永久留在表里。长稳实测的症状正是如此：订阅数 50 -> 160、
+                // Gateway fd 114 -> 254，且客户端全部离开后仍残留 150 条。
+                // 心跳不是状态推送，不会与"补发 → 实时"的分界冲突，可以照发。
+                // **只发心跳，不发 session.ready**：ready 必须等补发结束之后再发，
+                // 提前发会打乱"补发 → 实时"的边界（实测被
+                // StreamHubTest.BackfillsMissingFramesInOrderWithIds 抓到：
+                // 期望 3 帧、实际 4 帧）。心跳不是状态推送，放在补发之前是安全的。
+                if (now_ms - sub.last_heartbeat_ms >= options_.heartbeat_interval_ms) {
+                    need_heartbeat.push_back(SinkRef{sub.id, sub.sink});
+                } else {
+                    // 还没到心跳时刻：这一轮确实一次写都没有。
+                    ++skipped_no_write_total_;
+                }
                 continue;
             }
             by_room[sub.room_id].push_back(SinkRef{sub.id, sub.sink});
@@ -527,6 +560,7 @@ void StreamHub::Tick(std::int64_t now_ms) {
                 // TASK-016：这是**客户端断网**这一最常见路径，同样必须上报 offline
                 // （由 stream_hub_test 的 WriteFailureReportsPlayerOffline 锁定）。
                 // 上了锁，所以只把 id 收集起来，出锁后再做 I/O。
+                ++closed_write_failed_total_;  // TASK-029：写失败这条正常路径
                 gone.emplace_back(it->second.room_id, it->second.player_id);
                 gone_request_ids.push_back(it->second.request_id);
                 std::shared_ptr<EventSink> sink = it->second.sink;
@@ -844,6 +878,43 @@ std::size_t StreamHub::CloseAllWithEvent(const std::string& reason) {
         }
     }
     return taken.size();
+}
+
+// TASK-029：订阅生命周期计数器的读取端。
+std::uint64_t StreamHub::SubscriptionsCreated() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return created_total_;
+}
+
+std::uint64_t StreamHub::SubscriptionsClosedByWriteFailure() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return closed_write_failed_total_;
+}
+
+std::uint64_t StreamHub::SubscriptionsClosedOtherwise() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return closed_other_total_;
+}
+
+std::uint64_t StreamHub::SkippedNoWriteSubscriptions() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return skipped_no_write_total_;
+}
+
+std::int64_t StreamHub::OldestSubscriptionAgeMs(std::int64_t now_ms) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    std::int64_t oldest = 0;
+    bool found = false;
+    for (const auto& entry : subscriptions_) {
+        if (entry.second.created_ms == 0) {
+            continue;
+        }
+        if (!found || entry.second.created_ms < oldest) {
+            oldest = entry.second.created_ms;
+            found = true;
+        }
+    }
+    return found ? (now_ms - oldest) : 0;
 }
 
 std::size_t StreamHub::ConnectionCount() {

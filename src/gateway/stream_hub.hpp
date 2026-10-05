@@ -196,6 +196,18 @@ public:
     /// 端到端脚本里只能靠计时碰运气去触发，而这个计数可以由单元测试精确断言。
     [[nodiscard]] std::uint64_t BackfilledFrameCount();
 
+    /// TASK-029：订阅生命周期计数。定位"订阅泄漏"用。
+    ///
+    /// 为什么需要它们：`ConnectionCount()` 只给"净结果"，看不出"谁该被回收却
+    /// 没有被回收"。有了"建立数 / 因写失败回收数 / 其它回收数 / 一次写都没尝试过
+    /// 的订阅数"，泄漏的那部分就能被指认出来。
+    [[nodiscard]] std::uint64_t SubscriptionsCreated();
+    [[nodiscard]] std::uint64_t SubscriptionsClosedByWriteFailure();
+    [[nodiscard]] std::uint64_t SubscriptionsClosedOtherwise();
+    [[nodiscard]] std::uint64_t SkippedNoWriteSubscriptions();
+    /// @brief 最老订阅的年龄（毫秒）。没有订阅时返回 0。
+    [[nodiscard]] std::int64_t OldestSubscriptionAgeMs(std::int64_t now_ms);
+
     /// @brief 按原因统计累计发出的 `stream.reset` 次数（TASK-017）。
     ///
     /// 为什么按原因分开而不是只给一个总数：「窗口外」说明客户端落后得比缓冲还多，
@@ -223,6 +235,9 @@ private:
         std::string request_id;
         std::shared_ptr<EventSink> sink;
         std::int64_t last_heartbeat_ms = 0;
+        /// TASK-029：这条订阅第一次参与 Tick 的时刻，用来算"最老订阅的年龄"。
+        /// 订阅泄漏最直接的证据就是这个数字一直涨。
+        std::int64_t created_ms = 0;
         /// session.ready 是否已发送。放在 Tick 里发而不是 Subscribe 里发：
         /// Subscribe 运行在 brpc 的请求处理中，那时响应还没提交，
         /// 写出去的数据要等 done 之后才会以 chunked 形式发出（见 brpc 文档）。
@@ -335,6 +350,11 @@ private:
     std::atomic<bool> stopping_{false};
     /// TASK-026：排空标志。置位后不再登记新订阅。
     std::atomic<bool> draining_{false};
+    /// TASK-029：订阅生命周期计数。全部在 mutex_ 保护下自增。
+    std::uint64_t created_total_ = 0;
+    std::uint64_t closed_write_failed_total_ = 0;
+    std::uint64_t closed_other_total_ = 0;
+    std::uint64_t skipped_no_write_total_ = 0;
 };
 
 }  // namespace rgbt::gateway

@@ -1990,7 +1990,8 @@ Phase 4 已交付完毕，本任务是它**实测结论的直接后续**：TASK-
 
 ### TASK-029：修复 Gateway 的 SSE 订阅泄漏（长稳实测发现）
 
-- 状态：**待确认**（任务单先写清范围与验收，确认后开工）
+- 状态：**已完成并实测通过**（2026-10-04）。根因已定位、已修、已加回归用例；
+  8 分钟回归与 30 分钟最终验收都通过（见下方「实施结果」）。
 - 依赖：TASK-027（发现它）、TASK-026（排空改造过 `StreamHub`）、TASK-019（指标框架）
 - 背景问题（**已有实测证据，不是推测**）：`bash chaos/verify-soak.sh --duration 1800
   --players 50`（30 分钟 / 50 玩家 / 每 60 秒主动断开 20%）实测：
@@ -2046,6 +2047,87 @@ Phase 4 已交付完毕，本任务是它**实测结论的直接后续**：TASK-
 - 回退方式：`git revert` 本任务的提交（产品改动集中在 `src/gateway/stream_hub.*`
   与指标登记处）。
 - 涉及目录：`src/gateway/`、`tests/unit/gateway/`、`chaos/`、`docs/`。
+
+- 实施结果（2026-10-04）：
+
+  **第 1 步 区分实验（先做，不改产品代码）**：给 `chaos/verify-soak.sh` 增加
+  "压载端自己持有的 socket 数"一列，压载中与"服务端订阅数"对账。
+  实测：**服务端订阅数 50 -> 73（静默期仍 53），客户端 fd 全程 108 -> 107 基本平坦**。
+  结论：**缺陷在产品侧**——服务端保留了订阅，而客户端并没有漏掉 socket。
+  这一步同时排除了"夹具泄漏"这条歧路。
+
+  **根因（已定位）**：`ParseLastEventId` 在**没有** `Last-Event-ID` 头时返回
+  `value = 0`，而服务层把这个 0 直接赋给 `std::optional<std::int64_t>`
+  （`subscribe_options.last_event_id = last_event_id.value;`）——`optional` 被
+  engage，于是**每个"首次订阅"都被当成"从帧 0 补发"**。而在取不到房间状态的房间上
+  （对局 60 秒结束、房间被回收），`BackfillSubscription` 会一直返回 pending，那条
+  订阅此后**一次写都不会发生**。SSE 下服务端只能靠"写失败"发现对端已关闭，
+  于是订阅连同它的 socket 一起永久留下。
+  （这也解释了为什么单条订阅、以及同一房间 15 轮"断连 + 立即重订阅"都复现不出来：
+  那两种情况房间是健康的，补发一轮就完成。）
+
+  **修复（`src/gateway/`）**：
+  1. `LastEventIdHeader` 增加 `present` 字段，**只有头真的出现过才 engage
+     `optional`**——恢复"缺头 = 第一次订阅"的既有设计意图（这是根因修复）；
+  2. `StreamHub::Tick` 的补发 pending 分支**不再完全跳过写入**：到达心跳间隔时照发
+     心跳（**不发 `session.ready`**，那会打乱"补发 → 实时"的边界，实测被
+     `BackfillsMissingFramesInOrderWithIds` 抓到）。这是防御：即使补发因别的原因长期
+     pending，订阅也仍有机会通过写失败被发现；
+  3. 新订阅创建时把心跳基准设为"现在"（`last_heartbeat_ms` 的初值 0 表示"从未"，
+     直接比较会让新订阅在第一轮就被判成心跳到期）。
+
+  **可观测性（永久保留）**：`StreamHub` 新增订阅生命周期计数并接到 `/metrics`：
+  `rgbt_sse_subscriptions_created_total`、`..._closed_write_failed_total`、
+  `..._closed_other_total`、`..._skipped_no_write_total`（某一轮零写入的订阅数，累计）、
+  `rgbt_sse_oldest_subscription_age_ms`（最老订阅年龄）。已有的
+  `rgbt_sse_connections` 只给"净结果"，看不出"谁该被回收却没有被回收"。
+
+  **修复后暴露的另外两件事（都已在本次一并修掉）**：
+  1. **探针的洞**：`chaos/soak_churn.py` 的 `on_event` 把事件名丢掉了，
+     `room.finished` 到了也不结束读取（`bench/loadgen.py` 的客户端是会结束并换局的）。
+     后果：对局 60 秒一结束，客户端就抱着一条再无事件的连接，**50 条"自以为连着"、
+     服务端订阅数为 0，整段压载空转**。已按 loadgen 的做法修好（`requeued` 从 0 变成
+     几百，玩家真正在反复打完一局换一局）。
+  2. **判定的洞**：旧判定只有"没有累积"和"静默期回落到 0"两条，压载空转时**两条都会
+     通过**，于是会给出一个假的"长稳验收通过"。已加"**压载有效性**"判定：
+     客户端自报的 connected 与服务端订阅数长期对不上（服务端不足其一半）就报失败。
+     这道新判定在空转那轮确实报失败（6/18 个采样），在修好探针之后通过。
+
+  **实测对比**（`bash chaos/verify-soak.sh --duration 480 --players 50
+  --churn-every 30`，8 分钟 / 50 玩家 / 每 30 秒断开 10 条）：
+
+  | 指标 | 修复前 | 修复后（且探针/判定补齐后） |
+  |---|---|---|
+  | SSE 连接数 | 峰值 73、静默期结束 **53** | **全程 50**、静默期结束 **0** |
+  | `skipped_no_write`（累计） | **146,374** | **0** |
+  | 最老订阅年龄 | 315,000 ms 且持续增长 | 峰值 84 s（对局换房所致），静默期归 0 |
+  | Gateway fd | 末值 67 | 末值 **14** |
+  | 换局/重连 | 只断不换局（`requeued=0`） | 断开并重连 150 次、**换局 308 次** |
+  | 判定 | 失败 2 项 | **0 项失败** |
+
+  **回归用例**：`StreamHubTest.PendingBackfillStillGetsHeartbeatSoDeadPeersAreDetected`
+  ——补发一直失败时订阅仍必须定期被写、写失败必须被回收。**已实测它在修复前失败**
+  （临时去掉补发分支的心跳后，该用例 3 处断言失败：零写入、订阅未回收、未关闭）。
+
+  **验收命令与结果**：
+  ```bash
+  ctest --test-dir build/brpc-debug --output-on-failure   # 295/295 通过（新增 1 条）
+  bash chaos/verify-soak.sh --duration 480 --players 50   # 8 分钟回归，0 项失败
+  bash chaos/verify-soak.sh --duration 1800 --players 50  # 30 分钟最终验收
+  bash scripts/verify-stream.sh                           # SSE 既有语义回归
+  ```
+  30 分钟最终验收读数：SSE 峰值 50、静默期结束 0、
+  `skipped` 累计 0、最老订阅年龄峰值 82001 ms、
+  断连/重连 29 个周期、换局 1450 次、
+  判定 **0 项失败**（`skipped` 全程为 0）。原始数据：`docs/benchmarks/raw/soak-20261004-task029-final/`。
+
+  **一个必须记住的教训**：这一轮里"修复后 8 分钟通过"曾经是**假通过**——压载已经空转，
+  而判定看不见。所以**长稳这类测试必须自带"负载真的在压"的判据**，否则它会安静地
+  变成一台只会打印"通过"的机器。
+
+  **遗留**：根因所在的**服务层拼装**没有单元测试（`ParseLastEventId` 在匿名命名空间里，
+  而单元测试驱动的是 `StreamHub`），目前由长稳回归锁定（`skipped` 必须为 0）。
+  要单元级覆盖需要把它提成可测单元，属于后续重构。
 
 ## Backlog：后续待办
 
