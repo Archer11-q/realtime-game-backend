@@ -466,9 +466,20 @@ bool MatchQueue::RunPairingRound(std::int64_t now_ms) {
         return false;
     }
 
-    // TASK-035：worker 在跑就把这批交给它，请求线程立刻返回（不再阻塞在 Room 上）。
-    // 队列满的情况在上面已经挡掉了，因此这里不会走"取出再退回"。
-    if (allocation_worker_running_) {
+    // TASK-035 修订（修 TASK-031 抓到的可见行为回归）：**worker 空闲时就地内联分配**。
+    //
+    // 为什么：方案 A 让所有分配都走 worker 之后，`Enqueue` 返回与"配对结果可见"之间
+    // 出现了一个短暂的 `queued`（分配中）窗口，`scripts/verify-match.sh` 因此连续两轮
+    // 失败（它假设入队后立即 matched）。空闲时 worker 队列为空，交给它纯属多绕一圈
+    // （一次线程唤醒 + 一次加锁），不如就地做完——内联分配在 Room 健康时只要几毫秒。
+    //
+    // 只有 worker **忙**（队列非空）时才交给它：那正是需要异步来避免请求线程排队的时候。
+    bool worker_busy = false;
+    {
+        const std::lock_guard<std::mutex> lock(allocation_mutex_);
+        worker_busy = allocation_worker_running_ && !allocation_queue_.empty();
+    }
+    if (worker_busy) {
         HandOffToWorker(groups, now_ms);
         return true;
     }
