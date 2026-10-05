@@ -313,9 +313,14 @@ TEST_F(MatchQueueRestoreTest, RestoreOnUnavailableStoreRestoresNothing) {
 // 写入
 // ---------------------------------------------------------------------------
 
-TEST_F(MatchQueueRestoreTest, EnqueueWritesSnapshot) {
+TEST_F(MatchQueueRestoreTest, EnqueueWritesSnapshotOnNextTick) {
+    // TASK-028：入队只在请求路径上打"待写"标记，**一个字节都不写 Redis**。
     ASSERT_EQ(queue_->Enqueue("p-0001", "req-1", kT0), EnqueueOutcome::kQueued);
-    EXPECT_GE(store_.save_calls, 1);
+    EXPECT_EQ(store_.save_calls, 0) << "请求路径不该写快照";
+    EXPECT_TRUE(queue_->SnapshotPending());
+
+    queue_->Tick(kT0 + 1000);  // 越过合并窗口
+    EXPECT_EQ(store_.save_calls, 1);
     EXPECT_TRUE(store_.LastSnapshotHasQueued("p-0001"));
 }
 
@@ -335,6 +340,7 @@ TEST_F(MatchQueueRestoreTest, PollingWithoutStateChangeDoesNotWriteSnapshots) {
 TEST_F(MatchQueueRestoreTest, PairingWritesMatchedResultIntoSnapshot) {
     ASSERT_EQ(queue_->Enqueue("p-0001", "req-1", kT0), EnqueueOutcome::kQueued);
     ASSERT_EQ(queue_->Enqueue("p-0002", "req-2", kT0), EnqueueOutcome::kQueued);
+    queue_->Tick(kT0 + 1000);  // TASK-028：写入由 Tick 合并执行
 
     ASSERT_FALSE(store_.saved.empty());
     const MatchQueueSnapshot& snapshot = store_.saved.back();
@@ -348,9 +354,14 @@ TEST_F(MatchQueueRestoreTest, PairingWritesMatchedResultIntoSnapshot) {
 
 TEST_F(MatchQueueRestoreTest, CancelWritesSnapshot) {
     ASSERT_EQ(queue_->Enqueue("p-0001", "req-1", kT0), EnqueueOutcome::kQueued);
+    queue_->Tick(kT0);
     const int before_cancel = store_.save_calls;
 
+    // 注意时间：队列的排队超时是 1000 ms，取消必须发生在超时之前（否则宿清会先把它
+    // 淘汰掉，Cancel 变成幂等的"不在队列中"）。刷写的时间可以另算。
     EXPECT_TRUE(queue_->Cancel("p-0001", kT0 + 10));
+    EXPECT_EQ(store_.save_calls, before_cancel) << "取消也只在请求路径打标记";
+    queue_->Tick(kT0 + 1000);
     EXPECT_GT(store_.save_calls, before_cancel);
     EXPECT_FALSE(store_.LastSnapshotHasQueued("p-0001"));
 }
@@ -365,7 +376,12 @@ TEST_F(MatchQueueRestoreTest, SaveFailureDoesNotBlockEnqueueOrPairing) {
     const MatchStatusSnapshot status = queue_->GetStatus("p-0001", kT0);
     EXPECT_EQ(status.state, MatchStatusSnapshot::State::kMatched);
     EXPECT_FALSE(status.room_id.empty());
+
+    queue_->Tick(kT0 + 1000);
     EXPECT_GT(store_.save_calls, 0);  // 确实尝试过写，只是失败了
+    EXPECT_EQ(queue_->SnapshotWriteCount(), 0U);
+    EXPECT_EQ(queue_->SnapshotFailureCount(), 1U) << "失败必须被计数（降级可见）";
+    EXPECT_FALSE(queue_->SnapshotPending()) << "失败后不重试：策略是丢弃";
 }
 
 TEST_F(MatchQueueRestoreTest, AllocatingEntriesAreSnapshottedAsQueued) {
@@ -373,14 +389,16 @@ TEST_F(MatchQueueRestoreTest, AllocatingEntriesAreSnapshottedAsQueued) {
     // 同一用例顺带验证另一半规则：**已登记取消意图的条目不写**——客户端的取消
     // 已经答复成功，重启后让它重新出现在队列里会与那个答复矛盾。
     //
-    // 抓法：让分配器在 Allocate 内部取消同组的另一个玩家。取消会写一次快照，
-    // 而那一刻这一组正好处于「分配中」。
+    // TASK-028 之后抓法要改一处前提：写入不再由"取消"顺带触发，而是由主线程的
+    // Tick 驱动——而 Tick **可能正好落在分配过程中**。因此用例在分配回调里显式驱动
+    // 一次 Tick，检验那个时刻的快照把"分配中"写成了排队中（决策 4）。
     ASSERT_EQ(queue_->Enqueue("p-0003", "req-3", kT0), EnqueueOutcome::kQueued);
 
     std::vector<MatchQueueSnapshot> during_allocate;
     allocator_.on_allocate = [this, &during_allocate]() {
         const std::size_t before = store_.saved.size();
         queue_->Cancel("p-0003", kT0 + 1);
+        queue_->Tick(kT0 + 2);  // 模拟刷写正好落在分配过程中
         for (std::size_t i = before; i < store_.saved.size(); ++i) {
             during_allocate.push_back(store_.saved[i]);
         }
@@ -394,6 +412,81 @@ TEST_F(MatchQueueRestoreTest, AllocatingEntriesAreSnapshottedAsQueued) {
     EXPECT_EQ(snapshot.queued[0].player_id, "p-0001");
     EXPECT_EQ(snapshot.queued[0].kind, SnapshotEntryKind::kQueued);
     EXPECT_TRUE(snapshot.matched.empty());
+}
+
+// ---------------------------------------------------------------------------
+// TASK-028：请求路径只打标记，写入由 Tick 合并执行
+// ---------------------------------------------------------------------------
+
+TEST_F(MatchQueueRestoreTest, MergesChangesInsideTheWindowIntoOneWrite) {
+    // 合并窗口内的多次变化只落地**一份最新**快照——这正是"每秒 276 次全量写"降下来的
+    // 原因，也是入队 p95 从 840 ms 掉下来的原因。
+    ASSERT_EQ(queue_->Enqueue("p-0001", "req-1", kT0), EnqueueOutcome::kQueued);
+    queue_->Tick(kT0);  // 第一次没有"上次写入"可比，因此立刻写
+    ASSERT_EQ(store_.save_calls, 1);
+
+    // 窗口内继续变化：p-0002 与 p-0003 会配成一对。
+    ASSERT_EQ(queue_->Enqueue("p-0002", "req-2", kT0 + 10), EnqueueOutcome::kQueued);
+    ASSERT_EQ(queue_->Enqueue("p-0003", "req-3", kT0 + 20), EnqueueOutcome::kQueued);
+
+    queue_->Tick(kT0 + 50);  // 默认窗口 100 ms，此刻仍在窗口内
+    EXPECT_EQ(store_.save_calls, 1) << "窗口内的变化不该各自触发一次写入";
+    EXPECT_GT(queue_->SnapshotMergedCount(), 0U) << "被合并掉的变化数必须可见";
+    EXPECT_TRUE(queue_->SnapshotPending());
+
+    queue_->Tick(kT0 + 200);  // 越过窗口
+    EXPECT_EQ(store_.save_calls, 2);
+    EXPECT_FALSE(queue_->SnapshotPending());
+}
+
+TEST_F(MatchQueueRestoreTest, ZeroMergeIntervalWritesOnEveryTick) {
+    // 关掉合并时要退回"每次 Tick 都写"的行为，便于对照与排障。
+    queue_->SetSnapshotMergeIntervalMs(0);
+
+    ASSERT_EQ(queue_->Enqueue("p-0001", "req-1", kT0), EnqueueOutcome::kQueued);
+    queue_->Tick(kT0);
+    EXPECT_EQ(store_.save_calls, 1);
+
+    ASSERT_EQ(queue_->Enqueue("p-0002", "req-2", kT0), EnqueueOutcome::kQueued);
+    queue_->Tick(kT0);  // 同一毫秒也要写
+    EXPECT_EQ(store_.save_calls, 2);
+}
+
+TEST_F(MatchQueueRestoreTest, FinalFlushWritesLastChangeBeforeShutdown) {
+    // 关机契约：**排空返回之前，最后一次变化必须已经落盘**。异步写入不能把
+    // "丢最后一次变化"从"进程被 kill -9"扩大到"正常 SIGTERM 也会丢"。
+    queue_->SetSnapshotMergeIntervalMs(10 * 1000);  // 窗口拉长到 10 秒
+
+    // 先制造一次写入（第一次 Tick 总会写：还没有"上次写入"可比）。
+    ASSERT_EQ(queue_->Enqueue("p-0001", "req-1", kT0), EnqueueOutcome::kQueued);
+    queue_->Tick(kT0);
+    ASSERT_EQ(store_.save_calls, 1);
+
+    // 窗口内再变化一次：这次 Tick **不该**写。
+    ASSERT_EQ(queue_->Enqueue("p-0002", "req-2", kT0 + 1), EnqueueOutcome::kQueued);
+    queue_->Tick(kT0 + 2);
+    EXPECT_EQ(store_.save_calls, 1) << "窗口没到，Tick 不该写";
+    EXPECT_TRUE(queue_->SnapshotPending());
+
+    // 关机前的最终刷写忽略窗口：**排空返回之前最后一次变化必须落盘**。
+    EXPECT_TRUE(queue_->FlushSnapshotNow(kT0 + 3));
+    EXPECT_EQ(store_.save_calls, 2);
+    ASSERT_FALSE(store_.saved.empty());
+    EXPECT_EQ(store_.saved.back().matched.size(), 1U) << "最后一次变化（配对）必须落地";
+
+    EXPECT_FALSE(queue_->FlushSnapshotNow(kT0 + 4)) << "没有变化就不该写";
+    EXPECT_EQ(store_.save_calls, 2);
+}
+
+TEST_F(MatchQueueRestoreTest, SnapshotLagReportsHowLongAChangeHasWaited) {
+    // 待写滞后是"有变化一直没落地"的唯一直接证据：健康时应小于合并窗口。
+    ASSERT_EQ(queue_->Enqueue("p-0001", "req-1", kT0), EnqueueOutcome::kQueued);
+    EXPECT_TRUE(queue_->SnapshotPending());
+    EXPECT_EQ(queue_->SnapshotLagMs(kT0 + 30), 30U);
+
+    queue_->Tick(kT0 + 1000);
+    EXPECT_FALSE(queue_->SnapshotPending());
+    EXPECT_EQ(queue_->SnapshotLagMs(kT0 + 1030), 0U);
 }
 
 TEST_F(MatchQueueRestoreTest, NoStoreMeansNoRestoreAndNoWrite) {

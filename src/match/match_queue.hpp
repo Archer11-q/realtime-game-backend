@@ -207,6 +207,45 @@ public:
     [[nodiscard]] std::uint64_t SnapshotWriteCount() const;
     [[nodiscard]] std::uint64_t SnapshotFailureCount() const;
 
+    /// TASK-028：被合并掉的变化数（"本来要写 N 次、实际写了 1 次"的证据）。
+    [[nodiscard]] std::uint64_t SnapshotMergedCount() const;
+    /// TASK-028：当前是否有未落地的变化。
+    [[nodiscard]] bool SnapshotPending() const;
+    /// TASK-028：待写变化已经等了多久（毫秒；没有待写时为 0）。
+    [[nodiscard]] std::uint64_t SnapshotLagMs(std::int64_t now_ms) const;
+    /// TASK-028：最近一次写入耗时（毫秒）。用来回答"单次写本身有多贵"。
+    [[nodiscard]] std::uint64_t SnapshotWriteMs() const;
+    /// TASK-028：`Tick` 被调用的次数（驱动循环的存活证据）。
+    [[nodiscard]] std::uint64_t SnapshotTickCount() const;
+    /// TASK-028 收尾诊断：房间分配的次数、失败次数、最近一次与最大耗时（毫秒）。
+    [[nodiscard]] std::uint64_t RoomAllocateCount() const;
+    [[nodiscard]] std::uint64_t RoomAllocateFailedCount() const;
+    [[nodiscard]] std::uint64_t RoomAllocateMs() const;
+    [[nodiscard]] std::uint64_t RoomAllocateMaxMs() const;
+
+    /// @brief 标记"队列状态已变化"。**请求路径上只做这一步，不打任何 I/O。**
+    ///
+    /// TASK-028：原实现在请求路径上直接写快照，并用 `snapshot_order_mutex_` 把
+    /// 「取快照 + 写 Redis」整体串行化，于是每一次状态变化都要排在前一次 Redis 写
+    /// 之后。500 档位实测：入队 p95 **840.68 ms**、每秒 **276 次**全量写、
+    /// 15% 的入队因超过 Gateway 的 500 ms 超时被映射成 503。
+    /// 现在请求路径只置一个"待写"标志（持 `mutex_` 极短时间，锁内无 I/O）。
+    void MarkSnapshotDirty(std::int64_t now_ms);
+
+    /// @brief 合并刷写：有待写变化、且距上次写入超过合并窗口时，写一份**最新**快照。
+    ///
+    /// 由 Match 主线程的循环驱动（也由单元测试直接驱动，因此行为可确定复现）。
+    /// 合并是安全的：快照是**整份重写**，窗口内的中间态没有独立价值；代价是崩溃时
+    /// 最多丢一个窗口内的变化，边界写在 `docs/05-api-and-data.md`。
+    void Tick(std::int64_t now_ms);
+
+    /// @brief 立即写一份快照（关机前调用），**忽略合并窗口**。
+    /// @return true 表示确实写了一次（有待写变化）。
+    bool FlushSnapshotNow(std::int64_t now_ms);
+
+    /// @brief 设置合并窗口（毫秒）。0 表示不合并（每次 Tick 都写）。
+    void SetSnapshotMergeIntervalMs(std::int64_t merge_interval_ms);
+
     /// @brief 当前处于房间分配中的人数。仅供测试与可观测性使用。
     [[nodiscard]] std::size_t AllocatingCount();
 
@@ -276,16 +315,8 @@ private:
     /// room_id，因此退回比丢弃安全（TASK-015 决策 4）。
     [[nodiscard]] MatchQueueSnapshot MakeSnapshotLocked() const;
 
-    /// @brief 把当前内存状态写进快照存储。**不持有任何锁即可调用。**
-    ///
-    /// 为什么不直接在状态变更处写：本项目明确避免"持锁做 I/O"——一次 Redis
-    /// 超时会把整个队列卡住。因此这里的做法是**锁内取副本、锁外写**。
-    ///
-    /// 但只做到这一点还不够：两个线程可能各自取到较早的快照 S1 与较晚的快照 S2，
-    /// 却按 S2 → S1 的顺序写入，把队列**写回退**。因此用 `snapshot_order_mutex_`
-    /// 把「取快照 + 写快照」整体串行化，锁序固定为
-    /// `snapshot_order_mutex_ → mutex_`（反向不存在，因此不会死锁）。
-    void PersistSnapshot();
+    /// 快照的标记与刷写见 public 段的 `MarkSnapshotDirty` / `Tick` /
+    /// `FlushSnapshotNow`（TASK-028：请求路径只打标记，写入由主线程合并执行）。
 
     RoomAllocator* allocator_;
     MatchQueueStore* store_;
@@ -303,9 +334,28 @@ private:
     std::size_t max_queue_size_;
 
     mutable std::mutex mutex_;
-    /// 串行化「取快照 + 写快照」这一对操作，防止旧快照后写把队列写回退。
-    /// 锁序固定为 snapshot_order_mutex_ -> mutex_（见 PersistSnapshot 的说明）。
-    mutable std::mutex snapshot_order_mutex_;
+    /// TASK-028：是否有未落地的变化。**由 `mutex_` 保护**（置位/清位都在锁内，
+    /// 锁内不做 I/O），因此请求路径不会因为持久化而排队。
+    bool snapshot_dirty_ = false;
+    /// 待写标志最初被置位的时刻（用于计算滞后）。
+    std::int64_t snapshot_dirty_since_ms_ = 0;
+    /// TASK-028：合并窗口（毫秒）。窗口内的多次变化只落地一份最新快照。
+    std::int64_t snapshot_merge_interval_ms_ = 100;
+    /// 最近一次写入（无论成败）的时刻。原子：指标线程会读。
+    std::atomic<std::int64_t> last_snapshot_write_ms_{0};
+    /// 最近一次写入耗时（毫秒）。
+    std::atomic<std::uint64_t> snapshot_write_ms_{0};
+    /// 被合并掉的变化数。
+    std::atomic<std::uint64_t> snapshot_merged_count_{0};
+    /// TASK-028：`Tick` 被调用的次数。用来区分"驱动循环没跑"与"跑了但没写"——
+    /// 这是异步写入最难排查的失败模式之一。
+    std::atomic<std::uint64_t> snapshot_tick_count_{0};
+    /// TASK-028 收尾诊断：Match→Room 的房间分配（CreateRoom）次数 / 最近与最大耗时 /
+    /// 失败次数。用来回答"快照不再是瓶颈之后，剩下的时间花在哪"。
+    std::atomic<std::uint64_t> room_allocate_count_{0};
+    std::atomic<std::uint64_t> room_allocate_failed_count_{0};
+    std::atomic<std::uint64_t> room_allocate_ms_{0};
+    std::atomic<std::uint64_t> room_allocate_max_ms_{0};
     /// FIFO 顺序的 player_id。只保存仍在排队中的玩家（分配中的不在其中）。
     std::deque<std::string> queue_;
     /// 玩家 -> 状态。**以 player_id 为键**，这是「同一玩家不会重复出现在两个有效

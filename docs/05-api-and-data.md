@@ -291,7 +291,7 @@ Gateway 据此向 Room 补发缺失的帧：
 |---|---|---|---|
 | `<env>:gateway:session:<token>` | Hash | Gateway | 会话，带 TTL |
 | `<env>:gateway:idem:login:<request_id>` | String | Gateway | 登录幂等映射，带 TTL |
-| `<env>:match:queue` | List | Match | 匹配队列快照（TASK-015），**无 TTL**：它是"整份替换"的旁路快照，由写入端每次覆盖 |
+| `<env>:match:queue` | List | Match | 匹配队列快照（TASK-015），**无 TTL**：它是"整份替换"的旁路快照，由写入端覆盖。**TASK-028 起改为合并写入**：请求路径只标记"待写"，由 Match 主线程按 `-snapshot_merge_interval_ms`（默认 **100 ms**）合并刷写，窗口内多次状态变化只落地一份最新快照；因此崩溃时最多丢**一个窗口内**的排队变化（原语义是"每次状态变化立即写"）。关机时排空返回之前会做一次最终刷写 |
 
 `<env>:match:queue` 的语义（TASK-015）：
 

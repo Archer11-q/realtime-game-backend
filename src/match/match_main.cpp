@@ -50,6 +50,9 @@ DEFINE_int32(redis_port, 6379, "Redis 端口（队列快照）");
 DEFINE_int32(redis_timeout_ms, 500, "Redis 连接与命令超时（毫秒）");
 DEFINE_string(env_prefix, "dev", "Key 前缀的环境标识，取值示例 dev / test / prod");
 DEFINE_int32(idle_timeout_s, -1, "连接空闲超时（秒），-1 表示不超时");
+DEFINE_int32(snapshot_merge_interval_ms, 100,
+             "TASK-028：队列快照的合并窗口（毫秒）。窗口内的多次状态变化只落地一份"
+             "最新快照；0 表示不合并。崩溃时最多丢一个窗口内的变化");
 DEFINE_int32(shutdown_grace_ms, 1000,
              "TASK-026：收到停止信号后仍继续服务读取的宽限期（毫秒）；"
              "这段时间里新入队被拒绝（shutting_down），已配对的结果仍可领取");
@@ -105,6 +108,9 @@ int main(int argc, char* argv[]) {
                                   FLAGS_match_result_ttl_seconds * 1000LL,
                                   static_cast<std::size_t>(FLAGS_match_max_queue_size),
                                   &queue_store);
+
+    // TASK-028：快照合并窗口由开关决定（默认 100 ms）。
+    queue.SetSnapshotMergeIntervalMs(FLAGS_snapshot_merge_interval_ms);
 
     // 恢复必须在**开始接受请求之前**完成：否则一个刚入队的玩家要与一个
     // 尚未恢复的队列竞争，队列里可能已经有他的旧记录。
@@ -165,8 +171,14 @@ int main(int argc, char* argv[]) {
     ::signal(SIGINT, HandleSignal);
     ::signal(SIGTERM, HandleSignal);
 
+    // TASK-028：这个循环原来只是"睡 100 ms 等信号"，现在顺便承担**快照合并刷写**。
+    // 不新起线程：主线程本来就空转，用它做刷写既省一个线程，也让"写者唯一"这件事
+    // 在结构上成立（因此原来的顺序锁可以删掉）。20 ms 一跳，以便小于 100 ms 的
+    // 合并窗口也能被尊重。
+    constexpr int kTickIntervalUs = 20 * 1000;
     while (!g_stopping.load()) {
-        ::usleep(100 * 1000);
+        ::usleep(kTickIntervalUs);
+        queue.Tick(rgbt::common::NowUs() / 1000);
     }
 
     std::printf("收到停止信号，开始优雅退出\n");
@@ -186,10 +198,22 @@ int main(int argc, char* argv[]) {
     queue.BeginShutdown();
     rgbt::common::LogInfo("drain_started",
                           {{"mode", "grace"}, {"grace_ms", std::to_string(grace_ms)}});
-    if (grace_ms > 0) {
-        ::usleep(static_cast<useconds_t>(grace_ms) * 1000);
+    // 宽限期内仍然要刷写：这段时间里 GetStatus 的清算/配对重试照样会改变状态，
+    // 如果只是睡过去，那些变化就要等到关机前的最后一次刷写才落地（缺了中间态）。
+    for (std::int64_t elapsed = 0; elapsed < grace_ms; elapsed += 20) {
+        ::usleep(20 * 1000);
+        queue.Tick(rgbt::common::NowUs() / 1000);
     }
     rgbt::common::LogInfo("drain_finished", {{"grace_ms", std::to_string(grace_ms)}});
+
+    // TASK-028：关机前的**最终刷写**。放在宽限期之后、server.Stop 之前——
+    // 排空返回时"最后一次变化已落盘"这句话必须真的成立，否则异步写入会把
+    // "丢最后一次变化"从"进程被 kill"扩大到"正常 SIGTERM 也会丢"。
+    const bool flushed = queue.FlushSnapshotNow(rgbt::common::NowUs() / 1000);
+    rgbt::common::LogInfo("queue_snapshot_final_flush",
+                          {{"written", flushed ? "true" : "false"},
+                           {"merged_total", std::to_string(queue.SnapshotMergedCount())},
+                           {"policy", "关机前必须落盘最后一次变化"}});
 
     server.Stop(0);
     server.Join();
