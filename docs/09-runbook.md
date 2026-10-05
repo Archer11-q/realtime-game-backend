@@ -122,13 +122,13 @@ bash scripts/bench.sh --level 500 --duration 60             # 容量
 >    `include/common/metrics.hpp` 第 263/266 行**已定义，但没有登记**（`src/` 下没有使用
 >    点）。后果：**结果落库重试没有指标出口**，只能用 `rgbt_rooms{phase="finishing"}`
 >    与日志 `result_persist_failed` 代替。
-> 2. `rgbt_match_events_total{event="paired"}` 在压载下读数为 **0**，而同一次压载里
->    `rgbt_match_room_allocate_total{outcome="ok"}=250`、压载端自报 `paired=500`
->    （原始数据 `docs/benchmarks/raw/20261005-212008/`）。原因是 TASK-035 方案 A 把配对
->    移进分配 worker 之后，只有"入队这一次调用内当场配对"才计数
->    （`src/match/match_service.cpp` 第 215~224 行）；**低负载走空闲快路径时仍会计数**，
->    所以单次验收（`verify-observability.sh`）看不出来。**不要用它做负载下的配对判据**，
->    用 `rgbt_match_room_allocate_total`。两条都已记入 `docs/TASKS.md` 的 Backlog。
+> 2. `rgbt_match_events_total{event="paired"}` **只是「入队这一次调用内当场配对」的
+>    子集计数**（`src/match/match_service.cpp` 第 215~224 行）：TASK-035 方案 A 之后配对
+>    可能发生在分配 worker 里，那种路径不计数。实测：V2 版本压载下读数为 **0**
+>    （`docs/benchmarks/raw/20261005-212008/`），V3（空闲快路径）下为 **204 / 500** 与
+>    **418 / 1000**（`raw/20261005-235802/`），而真实配对数（`room_allocate ok`）是
+>    250 / 500——**永远低于真实配对数，不要拿它做负载下的配对判据**，用
+>    `rgbt_match_room_allocate_total`。已记入 `docs/TASKS.md` 的 Backlog。
 
 事件名（`event=`）常用值：`request_done`、`request_failed`、`match_enqueued`、
 `match_enqueue_ok`、`match_enqueue_failed`、`match_enqueue_rejected`、
@@ -995,8 +995,11 @@ TASK-029 任务单、`docs/benchmarks/raw/soak-20261004-1810/` 与 `…-task029-
    **崩溃最多丢一个合并窗口（默认 100 ms）内的队列变化**；正常关机由 `FlushSnapshotNow`
    保证"排空返回前最后一次变化已落盘"。
 6. **数字要带版本**：上述数字分别测于 TASK-028 之前/之后与 TASK-035 期间的不同提交；
-   引用时**必须写明是哪一版**。特别是 `feat/phase-5` 上"分配 worker 空闲快路径"那次修订
-   之后**没有再跑过 500 档位容量**——最新的容量数字属于修订前的代码版本。
+   引用时**必须写明是哪一版**。
+   **（TASK-033 已补上 V3 复跑）**：`feat/phase-5` 的空闲快路径版本已由 TASK-033 用
+   `bash scripts/bench.sh` 全 6 档复跑，500 档入队 p95 = 230.77 ms（与 V2 同区间），
+   原始数据 `docs/benchmarks/raw/20261005-235802/`，详见 `docs/benchmarks/README.md`
+   的「最终报告」。
 7. **两处引用时要知道的偏差**：文字口径里的"RPC 段 142 ~ 240 ms / 对端 6 ~ 11 ms"是
    **prose 合成区间**，逐轮原始值里 `enqueue` 段最小是 **141**、对端最大是 **81**；
    第 2 步的 80% 空闲/运行队列 1.3 **只有 devlog 文字、无 raw 归档**（`.run/` 不入库）。
@@ -1037,7 +1040,7 @@ bash scripts/bench.sh --level 1000 --duration 60    # 不退化（记录前后�
 | 8 | **连接风暴** | **没有显式限流**，拒绝边界就是进程 fd 上限；客户端看到的是**超时**而不是错误码 | §7 |
 | 9 | **长稳泄漏上界** | 只验到 **30 分钟**（脚本上限 1 小时未用满）——"通过"不等于"永不泄漏" | §9 |
 | 10 | **结果落库重试的可观测性** | `rgbt_result_persist_total` **未登记**，没有指标出口；只能用 `rgbt_rooms{phase="finishing"}` 与日志 `result_persist_failed` | §0.5 |
-| 11 | **负载下的配对计数** | `rgbt_match_events_total{event="paired"}` 读数为 0（TASK-035 之后）；不要用它做判据，用 `rgbt_match_room_allocate_total` | §0.5 |
+| 11 | **负载下的配对计数** | `rgbt_match_events_total{event="paired"}` 只是「入队当场配对」的子集（V2 压载下为 0、V3 下为 204/418，真实配对数 250/500）；不要用它做判据，用 `rgbt_match_room_allocate_total` | §0.5 |
 | 12 | **跨节点故障迁移 / 多副本排空 / 事件持久化重放** | **非目标**（ADR-0003），不是"暂未实现" | [ADR-0003](adr/0003-scope-reduction.md) |
 | 13 | **并发缺陷门禁** | TSan 实测 **21 条报告全部落在 brpc 内部**（vcpkg 的 brpc 未用 TSan 插桩），对本项目代码**不具指向性**；并发缺陷目前只能靠 A/B 复现、ASan 与直接现象 | `docs/TASKS.md` Backlog |
 | 14 | **共享依赖的释放顺序** | 三个服务共用同一个 Redis 与同一个 MySQL：**不要用 `docker stop` 来验证单条依赖通道**（会先打掉鉴权，测错对象），必须走 `chaos/relay.py` 的网络层隔离 | §1、§2；TASK-015/TASK-023 各踩一次 |
