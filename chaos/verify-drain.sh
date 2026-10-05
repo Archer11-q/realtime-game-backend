@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 #
+# ⚠ 本脚本**不在** `scripts/verify-all.sh` 里（故障注入 / 长稳 / 重连这一类会占标准
+#   端口、停依赖或跑很久，不适合放进快速门禁）。**改动 `src/` 下的产品代码之后，
+#   请跑 `bash scripts/verify-chaos.sh`** —— 那是这一类脚本的统一入口。
+#   为什么必须写这一句：TASK-026 曾漏改本类里的一个脚本（它不在任何统一入口里，
+#   于是回归躺了整整一个任务周期才被 TASK-029 的补跑发现），详见
+#   `docs/devlog.md` 的「TASK-029 之后的重跑结果」。
+#
 # chaos/verify-drain.sh - TASK-026：优雅退出与排空
 #
 # Phase 4 的退出标准要求"优雅退出：收到 SIGTERM 后停止接收新房间、等待活跃对局结束"。
