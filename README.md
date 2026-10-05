@@ -53,30 +53,31 @@
 
 ```text
 浏览器演示页 / 机器人客户端
-             |
-       HTTP + SSE
-             |
-       Gateway Service          ← 会话、鉴权、路由、限流
-             |
-      brpc + Protobuf
-             |
-   +---------+----------+
-   |                    |
-Match Service     Room/Battle Service   ← 房间状态、快照、对局结果
-   |                    |
-   +---------+----------+
-             |
-        Redis / MySQL
-
-Redis：会话、缓存、短期状态
-MySQL：players（Gateway 拥有）、match_results（Room/Battle 拥有）
+        │
+        │  HTTP（上行：登录 / 匹配 / 进房 / 提交攻击）
+        │  SSE（下行：GET /api/v1/stream，room.state 推送 + Last-Event-ID 补发）
+        ▼
+ Gateway Service          ← 会话（Redis）、鉴权、路由、SSE 订阅
+        │
+   brpc + Protobuf（同步调用，request_id 贯通 Gateway → Match → Room）
+        │
+   ┌────┴─────┐
+   ▼          ▼
+Match Service   Room/Battle Service   ← 房间权威状态（10 Hz）、快照、对局结果
+   │          │
+   └────┬─────┘
+        ▼
+ Redis（Gateway 会话 / Match 队列快照，旁路）
+ MySQL（players 档案[Gateway 只读] / rooms 快照 + match_results[Room 幂等写入]）
 ```
 
 **不实现**：Kafka、etcd、Player/State 服务、Settlement 服务、多实例、Kubernetes。
-跨服务协作只走 brpc 同步调用；对局结果由 Room/Battle 同步幂等写入，不走异步链路。
+跨服务协作只走 brpc 同步调用；对局结果由 Room 结束流程同步幂等写入，不走异步链路。
+浏览器推送用 SSE 而不用 WebSocket 的理由见
+[ADR-0004](docs/adr/0004-sse-instead-of-websocket.md)。
 
 详细边界见 [架构设计](docs/01-architecture.md)，迭代依据见
-[迭代路线图](docs/02-roadmap.md)。
+[迭代路线图](docs/02-roadmap.md)，故障处置见 [运行手册](docs/09-runbook.md)。
 
 ## 技术基线
 
@@ -120,13 +121,19 @@ MySQL：players（Gateway 拥有）、match_results（Room/Battle 拥有）
 
 ## 当前状态
 
-**Phase 0 ~ Phase 4 的任务已全部交付、实测并合并到 `main`**（Phase 4 于
-2026-10-04 完成：TASK-023 ~ TASK-027 五个故障注入与可靠性任务，外加随后立项并
-完成的 TASK-029——它修掉了长稳实测发现的 SSE 订阅泄漏）。
+**Phase 0 ~ Phase 5 的任务已全部交付、实测并提交**。Phase 5（工程收口，
+TASK-030 ~ TASK-034）于 2026-10-05/06 完成：
 
-**Phase 4 的退出判定与是否推进 Phase 5（工程收口）待项目所有者裁决**：
-逐条对照表见 `docs/devlog.md`，推进评估见 `docs/02-roadmap.md` 第 7.1 节。
-另有一个独立任务 TASK-028（把匹配队列快照写入移出请求路径）已立项、待确认开工。
+- TASK-030：错误路径补结构化日志（503 在日志里可查）；
+- TASK-031：`scripts/demo.sh` 15 分钟完整演示（实测 7/7、321 s）；
+- TASK-032：`docs/09-runbook.md` 故障处置与排查手册；
+- TASK-033：最终容量报告与故障注入结果汇总（含 V3 全档复跑与可追溯性核对表）；
+- TASK-034：README / 架构图 / ADR 回顾与 `scripts/check-docs.sh` 文档一致性核对。
+
+TASK-030/031 已合入 `main`；TASK-032/033/034 在 `feat/phase-5` 上待项目所有者
+验收合并。Phase 5 的退出标准逐条对照见 `docs/TASKS.md` 的「Phase 5 验收结果」。
+另有一个不属于任何阶段的独立任务 TASK-028 已部分完成（快照异步化合入），
+其量化目标的剩余部分转由 TASK-035 承接并以「重新界定」收口。
 
 已完成的能力：
 
@@ -151,10 +158,12 @@ MySQL：players（Gateway 拥有）、match_results（Room/Battle 拥有）
 ## 快速开始
 
 ```bash
-bash scripts/dev-up.sh      # 一条命令起齐：依赖 + 三个服务 + 前端
+bash scripts/demo.sh        # 15 分钟完整演示（TASK-031；实测 7/7 自动环节、321 s < 15 分钟）
+bash scripts/verify-all.sh  # 快速门禁：9 个端到端验收脚本（实测约 239 s）
+bash scripts/verify-chaos.sh # 故障注入统一入口（依赖不可用 / 进程崩溃 / 排空 / 风暴 / 重连）
+bash scripts/check-docs.sh  # 文档一致性核对（TASK-034）
+bash scripts/dev-up.sh      # 手动起齐：依赖 + 三个服务 + 前端
 # 浏览器打开 http://127.0.0.1:5173，两个标签页分别登录 alice / bob
-
-bash scripts/verify-all.sh  # 跑完整套端到端验收（实测 142 秒）
 bash scripts/dev-down.sh    # 停干净（加 --with-docker 连容器一起停）
 ```
 
@@ -218,6 +227,12 @@ realtime-game-backend/
 5. [迭代路线图](docs/02-roadmap.md)
 6. [范围裁剪 ADR-0003](docs/adr/0003-scope-reduction.md)（**必读：定义了不做什么**）
 7. [当前任务](docs/TASKS.md)
+8. [运行手册](docs/09-runbook.md)（排障时先看它：症状 → 处置 → 恢复到什么程度 → 哪些不恢复）
+9. [容量与故障注入报告](docs/benchmarks/README.md)（性能与可靠性数字的权威出处）
+10. [ADR 索引](docs/adr/README.md)
+
+**30 分钟入门路径**：README → 文档索引 → 架构设计 → ADR-0003（不做什么）→
+跑一次 `bash scripts/demo.sh` → 按需翻 Runbook。
 
 ## 开发与验收方式
 

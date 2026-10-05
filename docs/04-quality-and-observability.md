@@ -150,7 +150,16 @@ collector（这是项目所有者 2026-10-02 确认的决策）。做法是**共
 
 ## 5. SLO 和容量目标
 
-初始目标见项目章程。调整目标必须满足：
+**当前有效数值（本文是权威出处；此前散落在 `docs/TASKS.md` 与 `docs/devlog.md`）**：
+
+- 入队 `POST /api/v1/matches`：**P95 < 100 ms、P99 < 250 ms**
+  （HTTP 耗时直方图的桶边界取 SLO 线 50/100/250 ms）。
+  实测现状：500 档位 p95 ≈ 230 ms，**未达标**，成因在 brpc 接入/传输层
+  （TASK-028/035 与 `docs/benchmarks/README.md` 最终报告）。
+- 其余端点暂无 SLO：连接数上限没有 SLO（实测边界是进程 fd，见 `09-runbook.md`）；
+  `rooms/join` / `/stream` 的尾部在 TASK-033 复跑中变慢，SLO 待定。
+
+调整目标必须满足：
 
 - 有正式 ADR。
 - 说明原目标无法达到的技术原因。

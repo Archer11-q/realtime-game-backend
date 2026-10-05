@@ -1,7 +1,9 @@
 # 当前任务
 
-> 状态：**Phase 1 与 Phase 2 均已完成并合并到 `main`；Phase 3 的 5 个任务
-> 全部完成，等待项目所有者按退出标准验收。**
+> 状态：**Phase 1 ~ Phase 5 的任务已全部完成并实测通过**。Phase 5（工程收口）的
+> TASK-030 ~ TASK-034 于 2026-10-05/06 完成（TASK-030/031 已合入 `main`；
+> TASK-032/033/034 在 `feat/phase-5` 上待项目所有者验收合并）。
+> Phase 5 的退出标准逐条对照见本文档「Phase 5 验收结果」一节。
 > `main` 已包含 **TASK-000 ~ TASK-017**：TASK-013 ~ TASK-016 分别经
 > PR #10 ~ #13 合并；**TASK-017 经 PR #15 合并（merge commit `a61495a7`，
 > 2026-10-02）**。
@@ -869,7 +871,7 @@ Phase 2 要还的历史欠账（此前各任务明确标注为 "Phase 2" 的）�
 
 ### TASK-014：房间重启恢复与恢复边界
 
-- 状态：**已实现，待项目所有者审阅与验收**（2026-10-02）。
+- 状态：**已完成**（2026-10-02 实现；经 PR #11 合并到 `main`）。
   按 [03-development-workflow.md](03-development-workflow.md) 第 9 节的
   分支粒度，本任务是 `feat/phase-2` 上的**单个提交**（提交信息带任务号），
   不单独建分支。
@@ -938,7 +940,7 @@ Phase 2 要还的历史欠账（此前各任务明确标注为 "Phase 2" 的）�
 
 ### TASK-015：匹配队列的 Redis 快照与重启恢复
 
-- 状态：**已实现，待项目所有者审阅与验收**（2026-10-02）
+- 状态：**已完成**（2026-10-02 实现；经 PR #12 合并到 `main`）
 - 背景问题：TASK-007 的已知限制原文——「**Match 重启即丢失排队状态**」。
   排队中的玩家会突然变成 `idle`，且没有任何解释。
 - 本次目标：Match 的排队状态写入 Redis，重启后重建。
@@ -1023,7 +1025,7 @@ Phase 2 要还的历史欠账（此前各任务明确标注为 "Phase 2" 的）�
 
 ### TASK-016：断线重连与宽限期
 
-- 状态：**已实现，待项目所有者审阅与验收**（2026-10-02）。
+- 状态：**已完成**（2026-10-02 实现；经 PR #13 合并到 `main`）。
   按第 9 节的分支粒度，本任务是 `feat/phase-2` 上的**单个提交**。
 - 背景问题：`disconnected` 此前**没有任何实际语义**——TASK-008 的 `connected`
   字段只表达"是否已加入房间"，网络断开根本不被感知。对局中刷新页面或断网，
@@ -2571,7 +2573,7 @@ Phase 4 已交付完毕，本任务是它**实测结论的直接后续**：TASK-
 
 ### TASK-034：README / 架构图 / ADR 回顾与文档一致性核对
 
-- 状态：**待确认**
+- 状态：**已完成并实测通过**（2026-10-06）。见下方「实施结果」与「Phase 5 验收结果」。
 - 依赖：TASK-031 ~ TASK-033
 - 背景问题：roadmap 的退出标准要求"能解释每个技术选择的替代方案和代价，包括为什么
   不做 Kafka、etcd 和多实例"。ADR-0001 ~ ADR-0004 与 README 已经覆盖了主要取舍，
@@ -2600,6 +2602,39 @@ Phase 4 已交付完毕，本任务是它**实测结论的直接后续**：TASK-
   确认它报失败，再改回来（这条与 TASK-029 的回归用例同一个要求）。
 - 回退方式：`git revert`（文档 + 一个检查脚本）。
 - 涉及目录：`README.md`、`docs/`、`scripts/`。
+
+- 实施结果（2026-10-06）——完整经过见 `docs/devlog.md` 的「TASK-034 实施记录」：
+  - **README**：当前状态更新为 Phase 5 已完成；目标架构图增强（HTTP/SSE 上下行分工、
+    数据所有权、Runbook 指针）；快速开始指向 `scripts/demo.sh`（并修掉过期的
+    「实测 142 秒」）；文档阅读顺序补全（Runbook / benchmarks / ADR 索引 + 30 分钟
+    入门路径）。
+  - **ADR 回顾**：ADR-0001 ~ 0004 各补一段「代价是什么、什么时候该重新考虑」。
+  - **新增 `scripts/check-docs.sh`**：可机检的一致性检查（markdown 文件引用存在、
+    `verify-all.sh` / `verify-chaos.sh` 脚本清单、Phase 5 收口状态一致、新文档已入
+    索引、关键脚本语法）。**已证明它能抓到坏状态**：把 TASK-034 状态故意改回
+    「待确认」时它报失败（退出码 1），改回后通过。
+  - **顺带修正的过期状态**：TASK-014/015/016 从「已实现，待审阅」更正为「已完成」
+    （它们早已经 PR #11 ~ #13 合并）；CLAUDE.md 当前阶段、roadmap 顶部进度行与
+    §8、TASKS.md 头部状态、docs/04 的 SLO 数值权威出处。
+  - 验收：`bash scripts/check-docs.sh` 退出码 0；`bash scripts/verify-all.sh`
+    **9/9 通过**（结果见 devlog）。
+
+
+## Phase 5 验收结果（2026-10-06）
+
+| 任务 | 交付物 | 执行者实测 | 项目所有者验收 |
+|---|---|---|---|
+| TASK-030 | Gateway 错误路径补结构化日志（`event=request_failed`，503 可查） | 通过（`ctest` 301/301、`chaos/verify-dependency-down.sh` 通过、日志查得到 503） | 待验收 |
+| TASK-031 | `scripts/demo.sh` 15 分钟演示（实测 7/7、321 s）+ 空闲快路径修复（`6d5f359`） | 通过（`demo.sh` 7/7、`verify-all.sh` 9/9、`verify-chaos.sh` 5/5、`ctest` 301/301） | 待验收 |
+| TASK-032 | `docs/09-runbook.md` 故障处置与排查手册 | 通过（`verify-chaos.sh --only dependency-down,process-crash` 2/2、849 s） | 待验收 |
+| TASK-033 | 最终容量报告 + V3 全档复跑（`raw/20261005-235802/`）+ 可追溯性核对表 | 通过（`bench.sh` 6 档、`verify-all.sh` 9/9、`verify-chaos.sh` 5/5） | 待验收 |
+| TASK-034 | README / 架构图 / ADR 回顾 + `scripts/check-docs.sh` | 通过（`check-docs.sh` 退出码 0 且能抓到坏状态、`verify-all.sh` 9/9） | 待验收 |
+
+Phase 5 的四条退出标准逐条对照见 `docs/02-roadmap.md` 第 8 节。
+
+**与 main 的关系**：TASK-030（merge `4823487`）、TASK-031（merge `5f5f47f`）
+已合入 `main`；TASK-032（`ca86e41`）、TASK-033（`820a0c5`）、TASK-034（本文档所在
+提交）在 `feat/phase-5` 上，待项目所有者逐条验收后按阶段纪律合入 `main`。
 
 ## Backlog：后续待办
 
