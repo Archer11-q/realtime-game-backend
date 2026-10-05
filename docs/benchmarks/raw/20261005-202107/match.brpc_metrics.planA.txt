@@ -1,0 +1,344 @@
+# HELP bthread_count
+# TYPE bthread_count gauge
+bthread_count 5
+# HELP bthread_count_0
+# TYPE bthread_count_0 gauge
+bthread_count_0 5
+# HELP bthread_key_count
+# TYPE bthread_key_count gauge
+bthread_key_count 0
+# HELP bthread_keytable_count
+# TYPE bthread_keytable_count gauge
+bthread_keytable_count 0
+# HELP bthread_keytable_memory
+# TYPE bthread_keytable_memory gauge
+bthread_keytable_memory 0
+# HELP bthread_signal_second
+# TYPE bthread_signal_second gauge
+bthread_signal_second 167
+# HELP bthread_stack_count
+# TYPE bthread_stack_count gauge
+bthread_stack_count 21
+# HELP bthread_switch_second
+# TYPE bthread_switch_second gauge
+bthread_switch_second 350
+# HELP bthread_timer_scheduled_second
+# TYPE bthread_timer_scheduled_second gauge
+bthread_timer_scheduled_second 28
+# HELP bthread_timer_triggered_second
+# TYPE bthread_timer_triggered_second gauge
+bthread_timer_triggered_second 3
+# HELP bthread_timer_usage
+# TYPE bthread_timer_usage gauge
+bthread_timer_usage 0.000116286
+# HELP bthread_worker_count
+# TYPE bthread_worker_count gauge
+bthread_worker_count 17
+# HELP bthread_worker_count_0
+# TYPE bthread_worker_count_0 gauge
+bthread_worker_count_0 17
+# HELP bthread_worker_usage
+# TYPE bthread_worker_usage gauge
+bthread_worker_usage 1.00011
+# HELP bthread_worker_usage_0
+# TYPE bthread_worker_usage_0 gauge
+bthread_worker_usage_0 1.00011
+# HELP bvar_dump_interval
+# TYPE bvar_dump_interval gauge
+bvar_dump_interval 10
+# HELP bvar_sampler_collector_usage
+# TYPE bvar_sampler_collector_usage gauge
+bvar_sampler_collector_usage 0.000422855
+# HELP event_dispatcher_read_count
+# TYPE event_dispatcher_read_count gauge
+event_dispatcher_read_count 956
+# HELP event_dispatcher_read_latency
+# TYPE event_dispatcher_read_latency gauge
+event_dispatcher_read_latency 99105
+# HELP event_dispatcher_read_latency_80
+# TYPE event_dispatcher_read_latency_80 gauge
+event_dispatcher_read_latency_80 44962
+# HELP event_dispatcher_read_latency_90
+# TYPE event_dispatcher_read_latency_90 gauge
+event_dispatcher_read_latency_90 49868
+# HELP event_dispatcher_read_latency_99
+# TYPE event_dispatcher_read_latency_99 gauge
+event_dispatcher_read_latency_99 358333
+# HELP event_dispatcher_read_latency_999
+# TYPE event_dispatcher_read_latency_999 gauge
+event_dispatcher_read_latency_999 24568991
+# HELP event_dispatcher_read_latency_9999
+# TYPE event_dispatcher_read_latency_9999 gauge
+event_dispatcher_read_latency_9999 24568991
+# HELP event_dispatcher_read_max_latency
+# TYPE event_dispatcher_read_max_latency gauge
+event_dispatcher_read_max_latency 24568991
+# HELP event_dispatcher_read_qps
+# TYPE event_dispatcher_read_qps gauge
+event_dispatcher_read_qps 94
+# HELP event_dispatcher_write_count
+# TYPE event_dispatcher_write_count gauge
+event_dispatcher_write_count 1
+# HELP event_dispatcher_write_latency
+# TYPE event_dispatcher_write_latency gauge
+event_dispatcher_write_latency 142267
+# HELP event_dispatcher_write_latency_80
+# TYPE event_dispatcher_write_latency_80 gauge
+event_dispatcher_write_latency_80 142267
+# HELP event_dispatcher_write_latency_90
+# TYPE event_dispatcher_write_latency_90 gauge
+event_dispatcher_write_latency_90 142267
+# HELP event_dispatcher_write_latency_99
+# TYPE event_dispatcher_write_latency_99 gauge
+event_dispatcher_write_latency_99 142267
+# HELP event_dispatcher_write_latency_999
+# TYPE event_dispatcher_write_latency_999 gauge
+event_dispatcher_write_latency_999 142267
+# HELP event_dispatcher_write_latency_9999
+# TYPE event_dispatcher_write_latency_9999 gauge
+event_dispatcher_write_latency_9999 142267
+# HELP event_dispatcher_write_max_latency
+# TYPE event_dispatcher_write_max_latency gauge
+event_dispatcher_write_max_latency 142267
+# HELP event_dispatcher_write_qps
+# TYPE event_dispatcher_write_qps gauge
+event_dispatcher_write_qps 0
+# HELP iobuf_block_count
+# TYPE iobuf_block_count gauge
+iobuf_block_count 24
+# HELP iobuf_block_count_hit_tls_threshold
+# TYPE iobuf_block_count_hit_tls_threshold gauge
+iobuf_block_count_hit_tls_threshold 0
+# HELP iobuf_block_memory
+# TYPE iobuf_block_memory gauge
+iobuf_block_memory 24
+# HELP iobuf_newbigview_second
+# TYPE iobuf_newbigview_second gauge
+iobuf_newbigview_second 2
+# HELP pgrp
+# TYPE pgrp gauge
+pgrp 400577
+# HELP pid
+# TYPE pid gauge
+pid 401593
+# HELP ppid
+# TYPE ppid gauge
+ppid 400643
+# HELP process_context_switches_involuntary_second
+# TYPE process_context_switches_involuntary_second gauge
+process_context_switches_involuntary_second 1
+# HELP process_context_switches_voluntary_second
+# TYPE process_context_switches_voluntary_second gauge
+process_context_switches_voluntary_second 494
+# HELP process_cpu_usage
+# TYPE process_cpu_usage gauge
+process_cpu_usage 0.032
+# HELP process_cpu_usage_system
+# TYPE process_cpu_usage_system gauge
+process_cpu_usage_system 0.017
+# HELP process_cpu_usage_user
+# TYPE process_cpu_usage_user gauge
+process_cpu_usage_user 0.015
+# HELP process_disk_read_bytes_second
+# TYPE process_disk_read_bytes_second gauge
+process_disk_read_bytes_second 0
+# HELP process_disk_write_bytes_second
+# TYPE process_disk_write_bytes_second gauge
+process_disk_write_bytes_second 0
+# HELP process_faults_major
+# TYPE process_faults_major gauge
+process_faults_major 0
+# HELP process_faults_minor_second
+# TYPE process_faults_minor_second gauge
+process_faults_minor_second 67
+# HELP process_fd_count
+# TYPE process_fd_count gauge
+process_fd_count 14
+# HELP process_inblocks_second
+# TYPE process_inblocks_second gauge
+process_inblocks_second 0
+# HELP process_io_read_bytes_second
+# TYPE process_io_read_bytes_second gauge
+process_io_read_bytes_second 0
+# HELP process_io_read_second
+# TYPE process_io_read_second gauge
+process_io_read_second 0
+# HELP process_io_write_bytes_second
+# TYPE process_io_write_bytes_second gauge
+process_io_write_bytes_second 0
+# HELP process_io_write_second
+# TYPE process_io_write_second gauge
+process_io_write_second 0
+# HELP process_memory_data_and_stack
+# TYPE process_memory_data_and_stack gauge
+process_memory_data_and_stack 221839360
+# HELP process_memory_resident
+# TYPE process_memory_resident gauge
+process_memory_resident 40677376
+# HELP process_memory_shared
+# TYPE process_memory_shared gauge
+process_memory_shared 21864448
+# HELP process_memory_text
+# TYPE process_memory_text gauge
+process_memory_text 17022976
+# HELP process_memory_virtual
+# TYPE process_memory_virtual gauge
+process_memory_virtual 1592745984
+# HELP process_nice
+# TYPE process_nice gauge
+process_nice 0
+# HELP process_outblocks_second
+# TYPE process_outblocks_second gauge
+process_outblocks_second 0
+# HELP process_priority
+# TYPE process_priority gauge
+process_priority 20
+# HELP process_thread_count
+# TYPE process_thread_count gauge
+process_thread_count 21
+# HELP process_uptime
+# TYPE process_uptime gauge
+process_uptime 14.872187
+# HELP rpc_channel_connection_count
+# TYPE rpc_channel_connection_count gauge
+rpc_channel_connection_count 1
+# HELP rpc_controller_count
+# TYPE rpc_controller_count gauge
+rpc_controller_count 1
+# HELP rpc_event_thread_second
+# TYPE rpc_event_thread_second gauge
+rpc_event_thread_second 94
+# HELP rpc_health_check_count
+# TYPE rpc_health_check_count gauge
+rpc_health_check_count 0
+# HELP rpc_keepwrite_second
+# TYPE rpc_keepwrite_second gauge
+rpc_keepwrite_second 6
+# HELP rpc_server_8082_concurrency
+# TYPE rpc_server_8082_concurrency gauge
+rpc_server_8082_concurrency 0
+# HELP rpc_server_8082_eps
+# TYPE rpc_server_8082_eps gauge
+rpc_server_8082_eps 0
+# HELP rpc_server_8082_error
+# TYPE rpc_server_8082_error gauge
+rpc_server_8082_error 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_cancel_match_concurrency
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_cancel_match_concurrency gauge
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match_concurrency 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_cancel_match_eps
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_cancel_match_eps gauge
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match_eps 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_cancel_match_error
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_cancel_match_error gauge
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match_error 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_cancel_match
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_cancel_match summary
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match{quantile="0.8"} 0
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match{quantile="0.9"} 0
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match{quantile="0.99"} 0
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match{quantile="0.999"} 0
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match{quantile="0.9999"} 0
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match{quantile="1"} 0
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match{quantile="avg"} 0
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match_sum 0
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match_count 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_cancel_match_qps
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_cancel_match_qps gauge
+rpc_server_8082_rgbt_match_v1_match_service_cancel_match_qps 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_concurrency
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_concurrency gauge
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_concurrency 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_eps
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_eps gauge
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_eps 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_error
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_error gauge
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_error 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_enqueue_match
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_enqueue_match summary
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match{quantile="0.8"} 39389
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match{quantile="0.9"} 46044
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match{quantile="0.99"} 53443
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match{quantile="0.999"} 57426
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match{quantile="0.9999"} 57426
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match{quantile="1"} 57426
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match{quantile="avg"} 23769
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_sum 11884500
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_count 500
+# HELP rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_qps
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_qps gauge
+rpc_server_8082_rgbt_match_v1_match_service_enqueue_match_qps 50
+# HELP rpc_server_8082_rgbt_match_v1_match_service_get_match_status_concurrency
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_get_match_status_concurrency gauge
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status_concurrency 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_get_match_status_eps
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_get_match_status_eps gauge
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status_eps 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_get_match_status_error
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_get_match_status_error gauge
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status_error 0
+# HELP rpc_server_8082_rgbt_match_v1_match_service_get_match_status
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_get_match_status summary
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status{quantile="0.8"} 214
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status{quantile="0.9"} 7206
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status{quantile="0.99"} 19360
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status{quantile="0.999"} 24556
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status{quantile="0.9999"} 24556
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status{quantile="1"} 24556
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status{quantile="avg"} 2005
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status_sum 1662145
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status_count 829
+# HELP rpc_server_8082_rgbt_match_v1_match_service_get_match_status_qps
+# TYPE rpc_server_8082_rgbt_match_v1_match_service_get_match_status_qps gauge
+rpc_server_8082_rgbt_match_v1_match_service_get_match_status_qps 83
+# HELP rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_concurrency
+# TYPE rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_concurrency gauge
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_concurrency 0
+# HELP rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_eps
+# TYPE rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_eps gauge
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_eps 0
+# HELP rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_error
+# TYPE rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_error gauge
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_error 0
+# HELP rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape
+# TYPE rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape summary
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape{quantile="0.8"} 301
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape{quantile="0.9"} 301
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape{quantile="0.99"} 301
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape{quantile="0.999"} 301
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape{quantile="0.9999"} 301
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape{quantile="1"} 301
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape{quantile="avg"} 281
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_sum 843
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_count 3
+# HELP rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_qps
+# TYPE rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_qps gauge
+rpc_server_8082_rgbt_metrics_v1_metrics_service_scrape_qps 1
+# HELP rpc_server_8082_uptime
+# TYPE rpc_server_8082_uptime gauge
+rpc_server_8082_uptime 14.803805
+# HELP rpc_socket_count
+# TYPE rpc_socket_count gauge
+rpc_socket_count 5
+# HELP rpc_waitepollout_count
+# TYPE rpc_waitepollout_count gauge
+rpc_waitepollout_count 0
+# HELP rpc_waitepollout_second
+# TYPE rpc_waitepollout_second gauge
+rpc_waitepollout_second 0
+# HELP rpcz_sampling_ratio
+# TYPE rpcz_sampling_ratio gauge
+rpcz_sampling_ratio 1.000
+# HELP system_core_count
+# TYPE system_core_count gauge
+system_core_count 16
+# HELP system_loadavg_15m
+# TYPE system_loadavg_15m gauge
+system_loadavg_15m 0.090
+# HELP system_loadavg_1m
+# TYPE system_loadavg_1m gauge
+system_loadavg_1m 0.120
+# HELP system_loadavg_5m
+# TYPE system_loadavg_5m gauge
+system_loadavg_5m 0.110
