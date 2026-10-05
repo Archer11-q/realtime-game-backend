@@ -298,6 +298,13 @@ inline constexpr const char* kMetricMatchRoomAllocateMaxMs = "rgbt_match_room_al
 /// 内部小、外部大 => 慢在 brpc 与排队；内部大 => 慢在 Match 的逻辑。
 inline constexpr const char* kMetricMatchStageMaxMs = "rgbt_match_stage_max_ms";
 
+/// TASK-035：Gateway 侧「服务间调用」这一段的最大耗时（毫秒）。标签：`op`。
+///
+/// 用途：把 Gateway 观察到的端到端耗时（`rgbt_http_request_seconds`）拆成
+/// "RPC 中"与"RPC 前后"。若这一段就接近端到端，而 Match 的处理函数很小，
+/// 那么差额落在**对端的分发排队**上——这正是本轮要证实的机制。
+inline constexpr const char* kMetricGatewayMatchRpcMaxMs = "rgbt_gateway_match_rpc_max_ms";
+
 }  // namespace rgbt::common
 
 #endif  // RGBT_COMMON_METRICS_HPP

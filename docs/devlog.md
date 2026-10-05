@@ -4245,3 +4245,57 @@ Phase 5 的 TASK-033（最终容量报告）依赖 TASK-028 与 TASK-035 两者�
    · 调 brpc 服务端并发与连接池（Gateway 侧 Match 客户端目前是**单连接**，
      见 `brpc_match_client.cpp` 的注释"Phase 1 只有 Gateway 一个调用方，不需要连接池"）；
    · 让入队不再"每次必然跑一轮配对"（只在下一次轮到该玩家时配对）。
+
+## TASK-035 第二步：差额落在"Match 侧接入"，不是它的处理逻辑（2026-10-05）
+
+按任务单"先测量后改"，这一步只加观测：Gateway 侧把**服务间调用**单独计时
+（`rgbt_gateway_match_rpc_max_ms{op}`），并在压载中途抓 Match 的 brpc 原生指标
+（`/brpc_metrics`、`/vars`——brpc 自带，不需要我们造）。
+
+### 实测（500 档位，同一轮）
+
+| 视角 | 入队耗时 |
+|---|---|
+| Gateway **端到端**（p95） | **229.86 ms** |
+| Gateway→Match **RPC 段**（最大值） | **240 ms** ← 几乎全部在这里 |
+| Match **处理函数内部**（最大值） | **80 ms**（其中配对段 78 ms） |
+| Gateway→Match RPC（`get_status`，最大值） | 76 ms |
+
+结论：**Gateway 的 brpc 调用要等最多 240 ms，而 Match 的处理函数只跑 80 ms。**
+差额约 **160 ms 花在"请求到达 Match 的处理函数之前"**——也就是 brpc 的接入/分发
+这一段。分段计时从 handler 内部起算，因此这 160 ms 对 Match 自己的指标完全不可见。
+
+### Match 的 brpc 原生指标给出了直接证据
+
+```text
+event_dispatcher_read_latency      63158   （≈ 63 ms）
+event_dispatcher_read_latency_80   74816   （≈ 75 ms）
+event_dispatcher_read_latency_90   74816
+event_dispatcher_read_latency_99   74816
+event_dispatcher_read_max_latency  74816
+rpc_server_8082_connection_count   3
+rpc_server_8082_concurrency        0
+process_cpu_usage                  0.002   （采样瞬间只有 0.2%）
+```
+
+**`event_dispatcher_read_latency` 的 p80 就是 74.8 ms**：socket 事件从到达被 brpc
+的事件分发器读走，p80 起就要等 ~75 ms。这与"RPC 段 240 ms、handler 80 ms"完全对得上。
+
+同时注意 `process_cpu_usage = 0.002`（采样瞬间 0.2%）：**当时 Match 并不在烧 CPU**。
+所以这不是"算不过来"，而是**事件循环/ bthread 被拖住**。最可能的机制是：
+Match 的请求 bthread 在配对时会**阻塞在 Match→Room 的 `CreateRoom` 调用**上
+（实测单次最长 78 ms），阻塞的 bthread 与事件分发器抢同一批调度资源，
+于是接入侧排队——这也解释了为什么"每次必然触发一轮配对"的入队（229 ms）
+比"很少走配对重试"的轮询（p95 7.96 ms）差这么多。
+
+### 下一步的改法（仍未改代码，等确认）
+
+按证据，最对症的是**让配对不再阻塞 Match 的请求 bthread**：
+1. 把"分配房间"从请求 bthread 挪到独立执行体（专用 bthread/线程或异步回调），
+   请求路径只把该组标为"分配中"并立刻返回；
+2. 或者保留同步配对，但**限制并发分配数**并让其余请求快速失败/稍后重试
+   （避免所有 worker 一起堵在 Room 上）；
+3. 顺带确认 Gateway 侧 Match 客户端是**单连接**（`brpc_match_client.cpp` 注释写着
+   "Phase 1 只有 Gateway 一个调用方，不需要连接池"），这在 650 次调用/秒下值得复测。
+
+这三条的风险差别很大（1 改并发语义、2 改可见行为、3 只调参），需要所有者选定后再动。

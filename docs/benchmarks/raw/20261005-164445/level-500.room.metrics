@@ -1,0 +1,15 @@
+# HELP rgbt_room_frames_advanced_total Room 累计推进的帧数（所有房间帧号之和）
+# TYPE rgbt_room_frames_advanced_total gauge
+rgbt_room_frames_advanced_total 45304
+# HELP rgbt_rooms Room 当前房间数，按生命周期阶段分组
+# TYPE rgbt_rooms gauge
+rgbt_rooms{phase="aborted"} 0
+rgbt_rooms{phase="created"} 0
+rgbt_rooms{phase="finished"} 250
+rgbt_rooms{phase="finishing"} 0
+rgbt_rooms{phase="playing"} 0
+rgbt_rooms{phase="waiting"} 0
+# HELP rgbt_snapshot_write_total Room 快照写入次数，按结果分组
+# TYPE rgbt_snapshot_write_total gauge
+rgbt_snapshot_write_total{outcome="failed"} 0
+rgbt_snapshot_write_total{outcome="ok"} 10750
