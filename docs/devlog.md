@@ -4901,3 +4901,16 @@ Match 的快照写入，TASK-035 的方案 A 与空闲快路径又改了配对�
 **未做（非范围）**：不重写已有文档；不改任何结论性数字；不为了好看删除历史记录；
 `check-docs.sh` 暂未并入 `verify-all.sh`（保持独立命令，避免快速门禁被文档规则拖慢，
 如需要可后续评估并入）。
+
+
+## README 全量同步（2026-10-06，TASK-034 之后的收口）
+
+项目所有者确认全部迭代任务完成后，对 `README.md` 做了一轮全量同步（单独一个提交）：
+- 技术基线表修正可观测性口径：实际是 Prometheus + Grafana + `request_id` 贯通的结构化
+  日志，**不引入 OpenTelemetry SDK / OTLP collector**（TASK-018 ~ TASK-021 的已确认决策）；
+- 当前状态开头显式给出任务范围 **TASK-000 ~ TASK-034（Phase 0 ~ Phase 5）已全部交付、
+  实测并提交**；
+- 「已完成的能力」补齐故障注入与排空、Runbook、`check-docs.sh` 三条；
+- 「完成标准」补**逐条核对表**（8 条全部满足，每条带脚本/文档依据）。
+
+验收：`bash scripts/check-docs.sh` 退出码 0（README 改动后一致性仍通过）。
