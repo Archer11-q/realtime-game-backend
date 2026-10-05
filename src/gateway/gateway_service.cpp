@@ -171,6 +171,23 @@ struct LastEventIdHeader {
 ///
 /// 为什么在这里解析而不是在 StreamHub 里：只有这里能读到 HTTP 头，而 StreamHub
 /// 不依赖 brpc（它要能被单元测试直接驱动）。把 HTTP 细节留在服务层是本项目一贯的分层。
+/// TASK-035：Gateway 侧"服务间调用"这一段的最大耗时（毫秒）。
+///
+/// 用文件内静态量而不是成员：它只服务指标，不需要跟着实例走，也避免为一次诊断性
+/// 观测去改 `GatewayServiceImpl` 的布局。索引：0 = enqueue，1 = get_status。
+std::atomic<std::uint64_t> g_match_rpc_max_ms[2]{};
+
+void NoteMatchRpcMaxMs(std::size_t index, std::int64_t elapsed_us) {
+    if (index >= 2 || elapsed_us <= 0) {
+        return;
+    }
+    const auto value = static_cast<std::uint64_t>(elapsed_us / 1000);
+    std::uint64_t prev = g_match_rpc_max_ms[index].load(std::memory_order_relaxed);
+    while (value > prev && !g_match_rpc_max_ms[index].compare_exchange_weak(
+                               prev, value, std::memory_order_relaxed)) {
+    }
+}
+
 LastEventIdHeader ParseLastEventId(::google::protobuf::RpcController* controller) {
     LastEventIdHeader result;
     auto* cntl = static_cast<brpc::Controller*>(controller);
@@ -469,6 +486,15 @@ GatewayServiceImpl::GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* 
                                                    : kDefaultSessionTtlSeconds) {
     // TASK-019：SSE 相关指标。全部用**回调式 gauge** 读 StreamHub 已有的累计量
     // （理由见本文件顶部关于"单一真相来源"的说明）。
+    // TASK-035：Gateway 侧的服务间调用分段（最大值——SLO 看尾部）。
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricGatewayMatchRpcMaxMs, "Gateway→Match 调用的最大耗时（毫秒）",
+        []() -> std::uint64_t { return g_match_rpc_max_ms[0].load(std::memory_order_relaxed); },
+        {{"op", "enqueue"}});
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricGatewayMatchRpcMaxMs, "Gateway→Match 调用的最大耗时（毫秒）",
+        []() -> std::uint64_t { return g_match_rpc_max_ms[1].load(std::memory_order_relaxed); },
+        {{"op", "get_status"}});
     rgbt::common::Metrics().Gauge(
         rgbt::common::kMetricSseConnections, "当前 SSE 连接数", [this]() -> std::uint64_t {
             return stream_ == nullptr ? 0 : static_cast<std::uint64_t>(stream_->ConnectionCount());
@@ -913,7 +939,9 @@ void GatewayServiceImpl::EnqueueMatch(::google::protobuf::RpcController* control
 
     // player_id 来自会话，请求体里就算带了这个字段也不会被读取。
     MatchSnapshot snapshot;
+    const std::int64_t match_rpc_begin_us = rgbt::common::NowUs();
     const MatchCallStatus call = match_->Enqueue(player_id, request_id, &snapshot);
+    NoteMatchRpcMaxMs(0, rgbt::common::NowUs() - match_rpc_begin_us);
     const std::int32_t status = HandleMatchFailure(call, request_id, &error);
     if (status != 200) {
         // 失败也要记：否则"客户端说入队失败"在 Gateway 侧查不到任何痕迹。
@@ -965,7 +993,9 @@ void GatewayServiceImpl::GetMatchStatus(::google::protobuf::RpcController* contr
     }
 
     MatchSnapshot snapshot;
+    const std::int64_t match_rpc_begin_us = rgbt::common::NowUs();
     const MatchCallStatus call = match_->GetStatus(player_id, &snapshot);
+    NoteMatchRpcMaxMs(1, rgbt::common::NowUs() - match_rpc_begin_us);
     const std::int32_t status = HandleMatchFailure(call, request_id, &error);
     if (status != 200) {
         *response->mutable_error() = error;

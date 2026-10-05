@@ -41,12 +41,14 @@
 #define RGBT_MATCH_MATCH_QUEUE_HPP
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -217,6 +219,36 @@ public:
     [[nodiscard]] std::uint64_t SnapshotWriteMs() const;
     /// TASK-028：`Tick` 被调用的次数（驱动循环的存活证据）。
     [[nodiscard]] std::uint64_t SnapshotTickCount() const;
+    /// TASK-035：请求处理的分段。只用于观测——用来回答"入队 p95 的 230 ms 花在哪"。
+    ///
+    /// 为什么必须分段：TASK-028 的教训是"看起来像瓶颈的地方一测就不是它"。
+    /// 分段之后，"Match 内部处理"与"Gateway 侧看到的耗时"可以直接比：
+    /// 内部很小而外部很大 => 慢在 brpc / 排队；内部就很大 => 慢在 Match 的处理逻辑。
+    enum Stage : int {
+        kStageEnqueueTotal = 0,
+        kStageEnqueuePairing,
+        kStageGetStatusTotal,
+        kStageGetStatusPairing,
+        kStageCount,
+    };
+
+    /// 分段计时器（RAII）：析构时把本段耗时记进最大值。覆盖所有 return 路径。
+    class StageTimer {
+    public:
+        StageTimer(MatchQueue* queue, int stage);
+        ~StageTimer();
+        StageTimer(const StageTimer&) = delete;
+        StageTimer& operator=(const StageTimer&) = delete;
+
+    private:
+        MatchQueue* queue_;
+        int stage_;
+        std::int64_t begin_us_;
+    };
+
+    /// 某一段的最大耗时（毫秒）。用最大值而不是平均值：SLO 看的是尾部。
+    [[nodiscard]] std::uint64_t StageMaxMs(int stage) const;
+
     /// TASK-028 收尾诊断：房间分配的次数、失败次数、最近一次与最大耗时（毫秒）。
     [[nodiscard]] std::uint64_t RoomAllocateCount() const;
     [[nodiscard]] std::uint64_t RoomAllocateFailedCount() const;
@@ -245,6 +277,27 @@ public:
 
     /// @brief 设置合并窗口（毫秒）。0 表示不合并（每次 Tick 都写）。
     void SetSnapshotMergeIntervalMs(std::int64_t merge_interval_ms);
+
+    /// @brief 启动**分配 worker**：把 Match→Room 的 `CreateRoom` 从请求线程挪走。
+    ///
+    /// TASK-035 实测依据：入队端到端 p95 229.86 ms，其中 Gateway→Match RPC 段最大
+    /// 240 ms，而 **Match 处理函数内部最大只有 80 ms**；同期 brpc 的
+    /// `event_dispatcher_read_latency` p80 就是 74.8 ms 而进程 CPU 仅 0.2%
+    /// —— 是"事件循环被阻塞的 bthread 拖住"，阻塞源就是配对时同步等 Room。
+    ///
+    /// 容量检查必须在**取人之前**（见 RunPairingRound）：第一版放在取人之后，
+    /// 满了要走"退回 + 置重试"，与 `RetryPairingIfNeeded` 形成正反馈，
+    /// 实测把 Room 压垮（配对 500 → 240、CreateRoom 最大 11.9 s），已回退。
+    void StartAllocationWorker();
+
+    /// @brief 停止分配 worker 并等待它退出。**必须在最终快照刷写之前调用。**
+    void StopAllocationWorker();
+
+    /// @brief 等待分配队列空。仅供测试与排障。
+    void WaitForIdleAllocations();
+
+    /// @brief 待分配组数（背压是否生效的直接证据）。
+    [[nodiscard]] std::size_t PendingAllocationCount() const;
 
     /// @brief 当前处于房间分配中的人数。仅供测试与可观测性使用。
     [[nodiscard]] std::size_t AllocatingCount();
@@ -356,6 +409,25 @@ private:
     std::atomic<std::uint64_t> room_allocate_failed_count_{0};
     std::atomic<std::uint64_t> room_allocate_ms_{0};
     std::atomic<std::uint64_t> room_allocate_max_ms_{0};
+    /// TASK-035：各分段的最大耗时（毫秒）。
+    std::atomic<std::uint64_t> stage_max_ms_[kStageCount]{};
+
+    /// TASK-035：分配 worker。单个 worker 足够（`CreateRoom` 通常几毫秒），
+    /// 而且**天然保持分配顺序**。
+    void AllocationWorkerLoop();
+    /// 把整批待分配组交给 worker。**不持有 mutex_**。
+    void HandOffToWorker(const std::vector<PendingGroup>& groups, std::int64_t now_ms);
+    /// 分配一个房间并记账。**不持有 mutex_**（阻塞的远程调用）。
+    [[nodiscard]] std::string AllocateRoomFor(const PendingGroup& group);
+
+    mutable std::mutex allocation_mutex_;
+    std::condition_variable allocation_cv_;
+    std::deque<std::pair<PendingGroup, std::int64_t>> allocation_queue_;
+    std::thread allocation_worker_;
+    bool allocation_worker_running_ = false;
+    bool allocation_stop_ = false;
+    /// 待分配队列上限。**满了就不取人**（在取人之前判断）。
+    std::size_t max_pending_allocations_ = 256;
     /// FIFO 顺序的 player_id。只保存仍在排队中的玩家（分配中的不在其中）。
     std::deque<std::string> queue_;
     /// 玩家 -> 状态。**以 player_id 为键**，这是「同一玩家不会重复出现在两个有效

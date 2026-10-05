@@ -318,6 +318,31 @@ std::uint64_t MatchQueue::SnapshotTickCount() const {
     return snapshot_tick_count_.load(std::memory_order_relaxed);
 }
 
+MatchQueue::StageTimer::StageTimer(MatchQueue* queue, int stage)
+    : queue_(queue), stage_(stage), begin_us_(rgbt::common::NowUs()) {}
+
+MatchQueue::StageTimer::~StageTimer() {
+    if (queue_ == nullptr || stage_ < 0 || stage_ >= kStageCount) {
+        return;
+    }
+    const std::int64_t elapsed_ms = (rgbt::common::NowUs() - begin_us_) / 1000;
+    if (elapsed_ms <= 0) {
+        return;
+    }
+    const auto value = static_cast<std::uint64_t>(elapsed_ms);
+    std::uint64_t prev = queue_->stage_max_ms_[stage_].load(std::memory_order_relaxed);
+    while (value > prev && !queue_->stage_max_ms_[stage_].compare_exchange_weak(
+                               prev, value, std::memory_order_relaxed)) {
+    }
+}
+
+std::uint64_t MatchQueue::StageMaxMs(int stage) const {
+    if (stage < 0 || stage >= kStageCount) {
+        return 0;
+    }
+    return stage_max_ms_[stage].load(std::memory_order_relaxed);
+}
+
 std::uint64_t MatchQueue::RoomAllocateCount() const {
     return room_allocate_count_.load(std::memory_order_relaxed);
 }
@@ -344,6 +369,8 @@ std::uint64_t MatchQueue::SnapshotFailureCount() const {
 
 EnqueueOutcome MatchQueue::Enqueue(const std::string& player_id, const std::string& request_id,
                                    std::int64_t now_ms) {
+    // TASK-035：整段计时（RAII，因此连"幂等/拒绝"这些提前 return 的路径也会被量到）。
+    const StageTimer total_timer(this, kStageEnqueueTotal);
     if (player_id.empty() || player_id.size() > kMaxPlayerIdLength || request_id.empty() ||
         request_id.size() > kMaxRequestIdLength) {
         return EnqueueOutcome::kInvalidArgument;
@@ -404,7 +431,12 @@ EnqueueOutcome MatchQueue::Enqueue(const std::string& player_id, const std::stri
 
     // 阶段一（锁内取人）-> 阶段二（锁外分配）-> 阶段三（锁内提交），见
     // RunPairingRound 的注释。
-    const bool paired = RunPairingRound(now_ms);
+    bool paired = false;
+    {
+        // 这一段包含 Match→Room 的房间分配调用，是"RPC 慢"与"排队长"最容易混淆的地方。
+        const StageTimer pairing_timer(this, kStageEnqueuePairing);
+        paired = RunPairingRound(now_ms);
+    }
 
     // 一次标记覆盖本轮的全部变化（入队 / 清算 / 配对）；真正的写入由 Tick 合并执行。
     if (state_changed || paired) {
@@ -414,6 +446,16 @@ EnqueueOutcome MatchQueue::Enqueue(const std::string& player_id, const std::stri
 }
 
 bool MatchQueue::RunPairingRound(std::int64_t now_ms) {
+    // TASK-035 方案 A 的关键：**容量检查放在取人之前**。
+    //
+    // 第一版放在取人之后（人已取出，满了只能退回并置 retry_pairing_），于是
+    // "队列满 → 退回 → 下一轮轮询再取 → 又满"形成正反馈，把 Room 压垮
+    // （实测配对 500 → 240、CreateRoom 最大 11.9 s）。这里满了直接不取人，
+    // 队伍原样留在队列里等下一轮，**不产生任何回退与重试**。
+    if (PendingAllocationCount() >= max_pending_allocations_) {
+        return false;
+    }
+
     std::vector<PendingGroup> groups;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
@@ -422,6 +464,13 @@ bool MatchQueue::RunPairingRound(std::int64_t now_ms) {
     }
     if (groups.empty()) {
         return false;
+    }
+
+    // TASK-035：worker 在跑就把这批交给它，请求线程立刻返回（不再阻塞在 Room 上）。
+    // 队列满的情况在上面已经挡掉了，因此这里不会走"取出再退回"。
+    if (allocation_worker_running_) {
+        HandOffToWorker(groups, now_ms);
+        return true;
     }
 
     // 阶段二：在**锁外**分配房间。这一步会发起 brpc 调用，持锁会让整个队列停顿。
@@ -460,6 +509,114 @@ bool MatchQueue::RunPairingRound(std::int64_t now_ms) {
         CommitGroupLocked(group, room_id, now_ms);
     }
     return true;
+}
+
+void MatchQueue::HandOffToWorker(const std::vector<PendingGroup>& groups, std::int64_t now_ms) {
+    {
+        const std::lock_guard<std::mutex> lock(allocation_mutex_);
+        for (const PendingGroup& group : groups) {
+            allocation_queue_.emplace_back(group, now_ms);
+        }
+    }
+    allocation_cv_.notify_one();
+}
+
+std::string MatchQueue::AllocateRoomFor(const PendingGroup& group) {
+    if (allocator_ == nullptr) {
+        return {};
+    }
+    const std::int64_t allocate_started_us = rgbt::common::NowUs();
+    std::string room_id = allocator_->Allocate(group.match_id, group.player_ids, group.request_id);
+    const std::int64_t allocate_elapsed_ms = (rgbt::common::NowUs() - allocate_started_us) / 1000;
+    const std::uint64_t allocate_ms =
+        static_cast<std::uint64_t>(allocate_elapsed_ms > 0 ? allocate_elapsed_ms : 0);
+    room_allocate_count_.fetch_add(1, std::memory_order_relaxed);
+    room_allocate_ms_.store(allocate_ms, std::memory_order_relaxed);
+    std::uint64_t prev_max = room_allocate_max_ms_.load(std::memory_order_relaxed);
+    while (allocate_ms > prev_max && !room_allocate_max_ms_.compare_exchange_weak(
+                                         prev_max, allocate_ms, std::memory_order_relaxed)) {
+    }
+    if (room_id.empty()) {
+        room_allocate_failed_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return room_id;
+}
+
+void MatchQueue::AllocationWorkerLoop() {
+    while (true) {
+        PendingGroup group;
+        std::int64_t queued_ms = 0;
+        {
+            std::unique_lock<std::mutex> lock(allocation_mutex_);
+            allocation_cv_.wait(
+                lock, [this]() { return allocation_stop_ || !allocation_queue_.empty(); });
+            if (allocation_queue_.empty()) {
+                if (allocation_stop_) {
+                    return;
+                }
+                continue;
+            }
+            group = allocation_queue_.front().first;
+            queued_ms = allocation_queue_.front().second;
+            allocation_queue_.pop_front();
+        }
+        // 锁外做阻塞调用——这正是把分配挪出请求线程的目的。
+        const std::string room_id = AllocateRoomFor(group);
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            CommitGroupLocked(group, room_id, queued_ms);
+        }
+        MarkSnapshotDirty(rgbt::common::NowUs() / 1000);
+        allocation_cv_.notify_all();
+    }
+}
+
+void MatchQueue::StartAllocationWorker() {
+    {
+        const std::lock_guard<std::mutex> lock(allocation_mutex_);
+        if (allocation_worker_running_) {
+            return;
+        }
+        allocation_stop_ = false;
+        allocation_worker_running_ = true;
+    }
+    allocation_worker_ = std::thread([this]() { AllocationWorkerLoop(); });
+    rgbt::common::LogInfo("match_allocation_worker_started",
+                          {{"max_pending", std::to_string(max_pending_allocations_)},
+                           {"reason", "把 Match→Room 的分配移出请求线程（TASK-035）"}});
+}
+
+void MatchQueue::StopAllocationWorker() {
+    {
+        const std::lock_guard<std::mutex> lock(allocation_mutex_);
+        if (!allocation_worker_running_) {
+            return;
+        }
+        allocation_stop_ = true;
+    }
+    allocation_cv_.notify_all();
+    if (allocation_worker_.joinable()) {
+        allocation_worker_.join();
+    }
+    std::size_t left = 0;
+    {
+        const std::lock_guard<std::mutex> lock(allocation_mutex_);
+        allocation_worker_running_ = false;
+        left = allocation_queue_.size();
+    }
+    rgbt::common::LogInfo("match_allocation_worker_stopped",
+                          {{"unfinished", std::to_string(left)},
+                           {"policy", "未完成的组按「排队中」留在快照里，重启后退回队列"}});
+}
+
+void MatchQueue::WaitForIdleAllocations() {
+    std::unique_lock<std::mutex> lock(allocation_mutex_);
+    allocation_cv_.wait(lock, [this]() { return allocation_queue_.empty(); });
+}
+
+std::size_t MatchQueue::PendingAllocationCount() const {
+    const std::lock_guard<std::mutex> lock(allocation_mutex_);
+    return allocation_queue_.size();
 }
 
 bool MatchQueue::RetryPairingIfNeeded(std::int64_t now_ms) {
@@ -507,6 +664,7 @@ bool MatchQueue::Cancel(const std::string& player_id, std::int64_t now_ms) {
 }
 
 MatchStatusSnapshot MatchQueue::GetStatus(const std::string& player_id, std::int64_t now_ms) {
+    const StageTimer total_timer(this, kStageGetStatusTotal);
     MatchStatusSnapshot snapshot;
     bool state_changed = false;
     {
@@ -521,7 +679,11 @@ MatchStatusSnapshot MatchQueue::GetStatus(const std::string& player_id, std::int
     // 返回的是重试**之前**的快照：这一次调用可能把玩家从 queued 变成 matched，
     // 但那是本次调用产生的新事实，下一次轮询才应该看到。假装它已经发生会让调用方
     // 拿到一个与本次请求无关的状态。
-    const bool paired = RetryPairingIfNeeded(now_ms);
+    bool paired = false;
+    {
+        const StageTimer pairing_timer(this, kStageGetStatusPairing);
+        paired = RetryPairingIfNeeded(now_ms);
+    }
 
     // 清算（超时淘汰、结果过期）与配对都会改变状态，因此这两条路径都要标记待写。
     // 反过来说：仅仅"查了一次状态"不会产生变化，轮询不会变成写放大。

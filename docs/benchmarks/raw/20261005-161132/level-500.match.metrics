@@ -1,0 +1,44 @@
+# HELP rgbt_match_events_total Match 的事件计数，按事件类型分组
+# TYPE rgbt_match_events_total counter
+rgbt_match_events_total{event="canceled"} 0
+rgbt_match_events_total{event="enqueued"} 1000
+rgbt_match_events_total{event="paired"} 208
+rgbt_match_events_total{event="rejected"} 500
+# HELP rgbt_match_queue_length Match 队列当前等待配对的玩家数
+# TYPE rgbt_match_queue_length gauge
+rgbt_match_queue_length 0
+# HELP rgbt_match_queue_snapshot_lag_ms 队列快照待写滞后（毫秒）
+# TYPE rgbt_match_queue_snapshot_lag_ms gauge
+rgbt_match_queue_snapshot_lag_ms 0
+# HELP rgbt_match_queue_snapshot_merged_total 被合并掉的队列快照变化数（窗口内多次变化只写一份）
+# TYPE rgbt_match_queue_snapshot_merged_total gauge
+rgbt_match_queue_snapshot_merged_total 498
+# HELP rgbt_match_queue_snapshot_pending 是否有未落地的队列快照变化（0/1）
+# TYPE rgbt_match_queue_snapshot_pending gauge
+rgbt_match_queue_snapshot_pending 0
+# HELP rgbt_match_queue_snapshot_ticks_total 队列快照刷写（Tick）被调用的次数：驱动循环的存活证据
+# TYPE rgbt_match_queue_snapshot_ticks_total gauge
+rgbt_match_queue_snapshot_ticks_total 3351
+# HELP rgbt_match_queue_snapshot_write_ms 最近一次队列快照写入耗时（毫秒）
+# TYPE rgbt_match_queue_snapshot_write_ms gauge
+rgbt_match_queue_snapshot_write_ms 1
+# HELP rgbt_match_room_allocate_max_ms 房间分配耗时的最大值（毫秒）
+# TYPE rgbt_match_room_allocate_max_ms gauge
+rgbt_match_room_allocate_max_ms 71
+# HELP rgbt_match_room_allocate_ms 最近一次房间分配耗时（毫秒）
+# TYPE rgbt_match_room_allocate_ms gauge
+rgbt_match_room_allocate_ms 0
+# HELP rgbt_match_room_allocate_total Match→Room 房间分配次数，按结果分组
+# TYPE rgbt_match_room_allocate_total gauge
+rgbt_match_room_allocate_total{outcome="failed"} 0
+rgbt_match_room_allocate_total{outcome="ok"} 250
+# HELP rgbt_match_stage_max_ms Match 请求处理分段的最大耗时（毫秒）
+# TYPE rgbt_match_stage_max_ms gauge
+rgbt_match_stage_max_ms{op="enqueue",stage="pairing"} 71
+rgbt_match_stage_max_ms{op="enqueue",stage="total"} 74
+rgbt_match_stage_max_ms{op="get_status",stage="pairing"} 6
+rgbt_match_stage_max_ms{op="get_status",stage="total"} 8
+# HELP rgbt_queue_snapshot_total Match 队列快照写入次数，按结果分组
+# TYPE rgbt_queue_snapshot_total gauge
+rgbt_queue_snapshot_total{outcome="failed"} 0
+rgbt_queue_snapshot_total{outcome="ok"} 2

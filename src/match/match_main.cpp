@@ -112,6 +112,9 @@ int main(int argc, char* argv[]) {
     // TASK-028：快照合并窗口由开关决定（默认 100 ms）。
     queue.SetSnapshotMergeIntervalMs(FLAGS_snapshot_merge_interval_ms);
 
+    // TASK-035：把 Match→Room 的房间分配移出请求线程（依据见 match_queue.hpp）。
+    queue.StartAllocationWorker();
+
     // 恢复必须在**开始接受请求之前**完成：否则一个刚入队的玩家要与一个
     // 尚未恢复的队列竞争，队列里可能已经有他的旧记录。
     const rgbt::match::MatchRestoreReport restore = queue.Restore(NowMs());
@@ -205,6 +208,10 @@ int main(int argc, char* argv[]) {
         queue.Tick(rgbt::common::NowUs() / 1000);
     }
     rgbt::common::LogInfo("drain_finished", {{"grace_ms", std::to_string(grace_ms)}});
+
+    // TASK-035：先停 worker 并 join，再刷最终快照——否则可能出现"worker 正在提交、
+    // 快照已经写完"的窗口，让最后一次变化落在快照之外。
+    queue.StopAllocationWorker();
 
     // TASK-028：关机前的**最终刷写**。放在宽限期之后、server.Stop 之前——
     // 排空返回时"最后一次变化已落盘"这句话必须真的成立，否则异步写入会把

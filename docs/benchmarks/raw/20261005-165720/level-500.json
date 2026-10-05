@@ -1,0 +1,96 @@
+{
+  "started_at_epoch": 1791190653.786,
+  "finished_at_epoch": 1791190714.778,
+  "wall_seconds": 60.991,
+  "players": 500,
+  "counters": {
+    "attacks_failed": 85,
+    "attacks_ok": 1762,
+    "attacks_sent": 1847,
+    "enqueue_failed": 38,
+    "enqueue_ok": 739,
+    "games_aborted": 1,
+    "games_finished": 182,
+    "join_failed": 57,
+    "join_ok": 183,
+    "login_ok": 500,
+    "pair_timeout": 499,
+    "paired": 240,
+    "rooms_entered": 183,
+    "stale_result_skipped": 22050,
+    "stream_opened": 183
+  },
+  "stream_events": {
+    "room.finished": 183,
+    "room.state": 18508,
+    "session.ready": 183
+  },
+  "stream_resets": {},
+  "finish_reasons": {
+    "aborted": 1,
+    "hp_zero": 182
+  },
+  "attack_rejections": {
+    "room_already_finished": 2,
+    "room_not_playing": 83
+  },
+  "http_status": {
+    "/api/v1/login:200": 500,
+    "/api/v1/matches/current:200": 22290,
+    "/api/v1/matches/current:503": 14757,
+    "/api/v1/matches:200": 739,
+    "/api/v1/matches:503": 38,
+    "/api/v1/rooms/input:200": 1762,
+    "/api/v1/rooms/input:400": 83,
+    "/api/v1/rooms/input:409": 2,
+    "/api/v1/rooms/join:200": 183,
+    "/api/v1/rooms/join:409": 57
+  },
+  "exceptions": {},
+  "latency_ms": {
+    "attack": {
+      "count": 1847,
+      "min": 0.809,
+      "p50": 1.813,
+      "p90": 5.325,
+      "p95": 10.106,
+      "p99": 22.592,
+      "max": 37.184,
+      "mean": 3.15
+    },
+    "login": {
+      "count": 500,
+      "min": 104.339,
+      "p50": 349.35,
+      "p90": 558.541,
+      "p95": 586.811,
+      "p99": 606.404,
+      "max": 610.232,
+      "mean": 349.765
+    },
+    "match_poll": {
+      "count": 37047,
+      "min": 0.7,
+      "p50": 2.893,
+      "p90": 501.97,
+      "p95": 502.839,
+      "p99": 509.666,
+      "max": 545.202,
+      "mean": 205.096
+    }
+  },
+  "label": "players-500",
+  "config": {
+    "players": 500,
+    "gateway": "127.0.0.1:8080",
+    "duration": 60.0,
+    "attack_interval": 2.0,
+    "poll_interval": 0.5,
+    "timeout": 10.0,
+    "connections_per_bot": 2,
+    "recycle": true,
+    "recycle_gap": 1.0,
+    "hostname": "Archer",
+    "python": "3.14.4"
+  }
+}

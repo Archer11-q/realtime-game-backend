@@ -1,0 +1,6 @@
+  rgbt_http_request_seconds{path=/api/v1/login}  count=500  p50=17.38ms  p90=23.50ms  p95=24.27ms  p99=24.88ms  sum=8.552s
+  rgbt_http_request_seconds{path=/api/v1/matches}  count=1000  p50=35.58ms  p90=209.46ms  p95=229.73ms  p99=245.95ms  sum=70.475s
+  rgbt_http_request_seconds{path=/api/v1/matches/current}  count=39097  p50=1.48ms  p90=4.17ms  p95=6.08ms  p99=24.16ms  sum=85.704s
+  rgbt_http_request_seconds{path=/api/v1/rooms/input}  count=5030  p50=1.63ms  p90=12.06ms  p95=20.56ms  p99=39.52ms  sum=20.155s
+  rgbt_http_request_seconds{path=/api/v1/rooms/join}  count=500  p50=22.56ms  p90=45.44ms  p95=48.52ms  p99=83.33ms  sum=11.490s
+  rgbt_http_request_seconds{path=/api/v1/stream}  count=500  p50=41.42ms  p90=81.62ms  p95=90.81ms  p99=98.16ms  sum=21.032s
