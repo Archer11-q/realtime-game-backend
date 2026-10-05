@@ -293,6 +293,11 @@ inline constexpr const char* kMetricMatchRoomAllocateTotal = "rgbt_match_room_al
 inline constexpr const char* kMetricMatchRoomAllocateMs = "rgbt_match_room_allocate_ms";
 inline constexpr const char* kMetricMatchRoomAllocateMaxMs = "rgbt_match_room_allocate_max_ms";
 
+/// TASK-035：Match 请求处理的分段最大耗时（毫秒）。标签：`op`（enqueue/get_status）、
+/// `stage`（total/pairing）。用途是把"Match 内部处理"与"Gateway 侧看到的耗时"直接比：
+/// 内部小、外部大 => 慢在 brpc 与排队；内部大 => 慢在 Match 的逻辑。
+inline constexpr const char* kMetricMatchStageMaxMs = "rgbt_match_stage_max_ms";
+
 }  // namespace rgbt::common
 
 #endif  // RGBT_COMMON_METRICS_HPP

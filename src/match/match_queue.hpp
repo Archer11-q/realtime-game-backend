@@ -217,6 +217,36 @@ public:
     [[nodiscard]] std::uint64_t SnapshotWriteMs() const;
     /// TASK-028：`Tick` 被调用的次数（驱动循环的存活证据）。
     [[nodiscard]] std::uint64_t SnapshotTickCount() const;
+    /// TASK-035：请求处理的分段。只用于观测——用来回答"入队 p95 的 230 ms 花在哪"。
+    ///
+    /// 为什么必须分段：TASK-028 的教训是"看起来像瓶颈的地方一测就不是它"。
+    /// 分段之后，"Match 内部处理"与"Gateway 侧看到的耗时"可以直接比：
+    /// 内部很小而外部很大 => 慢在 brpc / 排队；内部就很大 => 慢在 Match 的处理逻辑。
+    enum Stage : int {
+        kStageEnqueueTotal = 0,
+        kStageEnqueuePairing,
+        kStageGetStatusTotal,
+        kStageGetStatusPairing,
+        kStageCount,
+    };
+
+    /// 分段计时器（RAII）：析构时把本段耗时记进最大值。覆盖所有 return 路径。
+    class StageTimer {
+    public:
+        StageTimer(MatchQueue* queue, int stage);
+        ~StageTimer();
+        StageTimer(const StageTimer&) = delete;
+        StageTimer& operator=(const StageTimer&) = delete;
+
+    private:
+        MatchQueue* queue_;
+        int stage_;
+        std::int64_t begin_us_;
+    };
+
+    /// 某一段的最大耗时（毫秒）。用最大值而不是平均值：SLO 看的是尾部。
+    [[nodiscard]] std::uint64_t StageMaxMs(int stage) const;
+
     /// TASK-028 收尾诊断：房间分配的次数、失败次数、最近一次与最大耗时（毫秒）。
     [[nodiscard]] std::uint64_t RoomAllocateCount() const;
     [[nodiscard]] std::uint64_t RoomAllocateFailedCount() const;
@@ -356,6 +386,8 @@ private:
     std::atomic<std::uint64_t> room_allocate_failed_count_{0};
     std::atomic<std::uint64_t> room_allocate_ms_{0};
     std::atomic<std::uint64_t> room_allocate_max_ms_{0};
+    /// TASK-035：各分段的最大耗时（毫秒）。
+    std::atomic<std::uint64_t> stage_max_ms_[kStageCount]{};
     /// FIFO 顺序的 player_id。只保存仍在排队中的玩家（分配中的不在其中）。
     std::deque<std::string> queue_;
     /// 玩家 -> 状态。**以 player_id 为键**，这是「同一玩家不会重复出现在两个有效

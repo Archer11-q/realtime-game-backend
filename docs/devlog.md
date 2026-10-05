@@ -4201,3 +4201,47 @@ TASK-028 已经把**快照写入**这条路径改完（实测：整轮 2 次写�
 它的第一条要求是"**先建分段耗时证据，没有分段数据不许改代码**"——
 这正是 TASK-028 学到的：看起来像瓶颈的地方（当时的快照写）一测就不是它。
 Phase 5 的 TASK-033（最终容量报告）依赖 TASK-028 与 TASK-035 两者的数字。
+
+## TASK-035 第一步：分段耗时证据（2026-10-05）
+
+任务单要求"**先建分段耗时证据，没有分段数据不许改代码**"。本轮只加观测、不改行为：
+`MatchQueue::StageTimer`（RAII，覆盖所有 return 路径）给 `Enqueue` / `GetStatus`
+各记两段——total 与 pairing（含 Match→Room 的 `CreateRoom` 调用），暴露为
+`rgbt_match_stage_max_ms{op,stage}`（用**最大值**而不是平均值：SLO 看尾部）。
+
+### 实测（500 档位 / 60 s，同机同命令）
+
+| 视角 | 入队耗时 |
+|---|---|
+| **Gateway 侧**（`rgbt_http_request_seconds{path=/api/v1/matches}`） | p50 28.41 / p90 207.87 / **p95 228.93** ms |
+| **Match 内部**（`stage_max_ms{op=enqueue,stage=total}`） | **最大 74 ms** |
+| Match 内部 · 配对段（`stage=pairing`） | 最大 **71 ms** |
+| Match 内部 · 轮询（`stage=get_status,total`） | 最大 **8 ms** |
+| 房间分配 `CreateRoom` | 250 次、最大 **71 ms**、0 失败 |
+
+原始数据：`docs/benchmarks/raw/20261005-161132/`。
+
+### 结论：慢的不是 Match 的处理逻辑，而是"进不来"
+
+**Match 自己的处理函数从不超过 74 ms**（这是整轮的最大值，不是 p95），而 Gateway
+看到的 p95 是 **228.93 ms**。差额约 **155 ms 落在 Match 的 brpc 分发队列里**——
+分段计时从 handler 内部起算，**看不见排队**，所以这部分对 Match 的指标是不可见的。
+
+最可能的机制（下一步要证实）：**Match 的 brpc worker 线程会被 Room 分配调用阻塞**
+（实测单次最长 71 ms）。配对高峰时若若干 worker 都在等 Room，新到的入队请求就在
+分发队列里排队——`Enqueue` 尤其吃亏，因为它**必然**触发一轮配对（`RunPairingRound`），
+而轮询只在少数情况下才走 `RetryPairingIfNeeded`（这解释了为什么轮询 p95 只有
+7.96 ms、而入队 228.93 ms）。
+
+### 下一步（仍未改代码）
+
+1. 在 **Gateway 侧**分段：handler 进入 → brpc 调用 → 组装响应，确认那 ~155 ms
+   确实落在 brpc 调用里（而不是 Gateway 自己的 JSON/日志）。
+2. 取 **Match 的 brpc 服务端排队证据**：brpc 自带的
+   `bvar` 指标（如 `rpc_server_..._latency`、队列长度）或服务端线程数；
+   若队列长度与入队 p95 同步上涨，机制就确认了。
+3. 机制确认后再改，候选（**未测先改一律不做**）：
+   · 让 Match 的配对不阻塞 worker（把 Room 调用挪出请求线程，或改用异步/协程）；
+   · 调 brpc 服务端并发与连接池（Gateway 侧 Match 客户端目前是**单连接**，
+     见 `brpc_match_client.cpp` 的注释"Phase 1 只有 Gateway 一个调用方，不需要连接池"）；
+   · 让入队不再"每次必然跑一轮配对"（只在下一次轮到该玩家时配对）。

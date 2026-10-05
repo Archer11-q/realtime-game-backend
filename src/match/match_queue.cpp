@@ -318,6 +318,31 @@ std::uint64_t MatchQueue::SnapshotTickCount() const {
     return snapshot_tick_count_.load(std::memory_order_relaxed);
 }
 
+MatchQueue::StageTimer::StageTimer(MatchQueue* queue, int stage)
+    : queue_(queue), stage_(stage), begin_us_(rgbt::common::NowUs()) {}
+
+MatchQueue::StageTimer::~StageTimer() {
+    if (queue_ == nullptr || stage_ < 0 || stage_ >= kStageCount) {
+        return;
+    }
+    const std::int64_t elapsed_ms = (rgbt::common::NowUs() - begin_us_) / 1000;
+    if (elapsed_ms <= 0) {
+        return;
+    }
+    const auto value = static_cast<std::uint64_t>(elapsed_ms);
+    std::uint64_t prev = queue_->stage_max_ms_[stage_].load(std::memory_order_relaxed);
+    while (value > prev && !queue_->stage_max_ms_[stage_].compare_exchange_weak(
+                               prev, value, std::memory_order_relaxed)) {
+    }
+}
+
+std::uint64_t MatchQueue::StageMaxMs(int stage) const {
+    if (stage < 0 || stage >= kStageCount) {
+        return 0;
+    }
+    return stage_max_ms_[stage].load(std::memory_order_relaxed);
+}
+
 std::uint64_t MatchQueue::RoomAllocateCount() const {
     return room_allocate_count_.load(std::memory_order_relaxed);
 }
@@ -344,6 +369,8 @@ std::uint64_t MatchQueue::SnapshotFailureCount() const {
 
 EnqueueOutcome MatchQueue::Enqueue(const std::string& player_id, const std::string& request_id,
                                    std::int64_t now_ms) {
+    // TASK-035：整段计时（RAII，因此连"幂等/拒绝"这些提前 return 的路径也会被量到）。
+    const StageTimer total_timer(this, kStageEnqueueTotal);
     if (player_id.empty() || player_id.size() > kMaxPlayerIdLength || request_id.empty() ||
         request_id.size() > kMaxRequestIdLength) {
         return EnqueueOutcome::kInvalidArgument;
@@ -404,7 +431,12 @@ EnqueueOutcome MatchQueue::Enqueue(const std::string& player_id, const std::stri
 
     // 阶段一（锁内取人）-> 阶段二（锁外分配）-> 阶段三（锁内提交），见
     // RunPairingRound 的注释。
-    const bool paired = RunPairingRound(now_ms);
+    bool paired = false;
+    {
+        // 这一段包含 Match→Room 的房间分配调用，是"RPC 慢"与"排队长"最容易混淆的地方。
+        const StageTimer pairing_timer(this, kStageEnqueuePairing);
+        paired = RunPairingRound(now_ms);
+    }
 
     // 一次标记覆盖本轮的全部变化（入队 / 清算 / 配对）；真正的写入由 Tick 合并执行。
     if (state_changed || paired) {
@@ -507,6 +539,7 @@ bool MatchQueue::Cancel(const std::string& player_id, std::int64_t now_ms) {
 }
 
 MatchStatusSnapshot MatchQueue::GetStatus(const std::string& player_id, std::int64_t now_ms) {
+    const StageTimer total_timer(this, kStageGetStatusTotal);
     MatchStatusSnapshot snapshot;
     bool state_changed = false;
     {
@@ -521,7 +554,11 @@ MatchStatusSnapshot MatchQueue::GetStatus(const std::string& player_id, std::int
     // 返回的是重试**之前**的快照：这一次调用可能把玩家从 queued 变成 matched，
     // 但那是本次调用产生的新事实，下一次轮询才应该看到。假装它已经发生会让调用方
     // 拿到一个与本次请求无关的状态。
-    const bool paired = RetryPairingIfNeeded(now_ms);
+    bool paired = false;
+    {
+        const StageTimer pairing_timer(this, kStageGetStatusPairing);
+        paired = RetryPairingIfNeeded(now_ms);
+    }
 
     // 清算（超时淘汰、结果过期）与配对都会改变状态，因此这两条路径都要标记待写。
     // 反过来说：仅仅"查了一次状态"不会产生变化，轮询不会变成写放大。

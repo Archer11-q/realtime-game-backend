@@ -92,6 +92,33 @@ MatchServiceImpl::MatchServiceImpl(MatchQueue* queue, std::function<std::int64_t
     rgbt::common::Metrics().Gauge(
         rgbt::common::kMetricQueueSnapshotWriteMs, "最近一次队列快照写入耗时（毫秒）",
         [this]() -> std::uint64_t { return queue_ == nullptr ? 0 : queue_->SnapshotWriteMs(); });
+    // TASK-035：分段最大耗时（毫秒）。用最大值而不是平均值——SLO 看的是尾部。
+    // 用途：把"Match 内部处理"与"Gateway 侧看到的耗时"直接比。内部小、外部大 =>
+    // 慢在 brpc 与排队；内部大 => 慢在 Match 的逻辑。
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricMatchStageMaxMs, "Match 请求处理分段的最大耗时（毫秒）",
+        [this]() -> std::uint64_t {
+            return queue_ == nullptr ? 0 : queue_->StageMaxMs(MatchQueue::kStageEnqueueTotal);
+        },
+        {{"op", "enqueue"}, {"stage", "total"}});
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricMatchStageMaxMs, "Match 请求处理分段的最大耗时（毫秒）",
+        [this]() -> std::uint64_t {
+            return queue_ == nullptr ? 0 : queue_->StageMaxMs(MatchQueue::kStageEnqueuePairing);
+        },
+        {{"op", "enqueue"}, {"stage", "pairing"}});
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricMatchStageMaxMs, "Match 请求处理分段的最大耗时（毫秒）",
+        [this]() -> std::uint64_t {
+            return queue_ == nullptr ? 0 : queue_->StageMaxMs(MatchQueue::kStageGetStatusTotal);
+        },
+        {{"op", "get_status"}, {"stage", "total"}});
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricMatchStageMaxMs, "Match 请求处理分段的最大耗时（毫秒）",
+        [this]() -> std::uint64_t {
+            return queue_ == nullptr ? 0 : queue_->StageMaxMs(MatchQueue::kStageGetStatusPairing);
+        },
+        {{"op", "get_status"}, {"stage", "pairing"}});
     rgbt::common::Metrics().Gauge(
         rgbt::common::kMetricMatchRoomAllocateTotal, "Match→Room 房间分配次数，按结果分组",
         [this]() -> std::uint64_t { return queue_ == nullptr ? 0 : queue_->RoomAllocateCount(); },
