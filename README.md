@@ -120,9 +120,13 @@ MySQL：players（Gateway 拥有）、match_results（Room/Battle 拥有）
 
 ## 当前状态
 
-**Phase 0 ~ Phase 3 已完成并合并到 `main`**（Phase 3 于 2026-10-04 完成，
-merge commit `94b0393`）。**Phase 4（故障注入与可靠性验证）已拆分任务单，
-等待项目所有者逐个确认后开工**；开工前不写实现代码。
+**Phase 0 ~ Phase 4 的任务已全部交付、实测并合并到 `main`**（Phase 4 于
+2026-10-04 完成：TASK-023 ~ TASK-027 五个故障注入与可靠性任务，外加随后立项并
+完成的 TASK-029——它修掉了长稳实测发现的 SSE 订阅泄漏）。
+
+**Phase 4 的退出判定与是否推进 Phase 5（工程收口）待项目所有者裁决**：
+逐条对照表见 `docs/devlog.md`，推进评估见 `docs/02-roadmap.md` 第 7.1 节。
+另有一个独立任务 TASK-028（把匹配队列快照写入移出请求路径）已立项、待确认开工。
 
 已完成的能力：
 
