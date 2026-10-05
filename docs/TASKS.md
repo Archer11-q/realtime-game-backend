@@ -1,8 +1,9 @@
 # 当前任务
 
-> 状态：**Phase 1 ~ Phase 5 的任务已全部完成并实测通过**。Phase 5（工程收口）的
-> TASK-030 ~ TASK-034 于 2026-10-05/06 完成（TASK-030/031 已合入 `main`；
-> TASK-032/033/034 在 `feat/phase-5` 上待项目所有者验收合并）。
+> 状态：**Phase 1 ~ Phase 5 的任务已全部完成并实测通过，且已全部合入 `main`**。
+> TASK-030 ~ TASK-034 于 2026-10-05/06 完成，2026-10-06 经项目所有者确认合入
+> （TASK-030 `4823487`、TASK-031 `5f5f47f`、TASK-032 `9e02b66`、TASK-033 `2415013`、
+> TASK-034 `04d405e`，README 同步 `7391e0e`，均为 `--no-ff` 真合并）。
 > Phase 5 的退出标准逐条对照见本文档「Phase 5 验收结果」一节。
 > `main` 已包含 **TASK-000 ~ TASK-017**：TASK-013 ~ TASK-016 分别经
 > PR #10 ~ #13 合并；**TASK-017 经 PR #15 合并（merge commit `a61495a7`，
@@ -2624,17 +2625,18 @@ Phase 4 已交付完毕，本任务是它**实测结论的直接后续**：TASK-
 
 | 任务 | 交付物 | 执行者实测 | 项目所有者验收 |
 |---|---|---|---|
-| TASK-030 | Gateway 错误路径补结构化日志（`event=request_failed`，503 可查） | 通过（`ctest` 301/301、`chaos/verify-dependency-down.sh` 通过、日志查得到 503） | 待验收 |
-| TASK-031 | `scripts/demo.sh` 15 分钟演示（实测 7/7、321 s）+ 空闲快路径修复（`6d5f359`） | 通过（`demo.sh` 7/7、`verify-all.sh` 9/9、`verify-chaos.sh` 5/5、`ctest` 301/301） | 待验收 |
-| TASK-032 | `docs/09-runbook.md` 故障处置与排查手册 | 通过（`verify-chaos.sh --only dependency-down,process-crash` 2/2、849 s） | 待验收 |
-| TASK-033 | 最终容量报告 + V3 全档复跑（`raw/20261005-235802/`）+ 可追溯性核对表 | 通过（`bench.sh` 6 档、`verify-all.sh` 9/9、`verify-chaos.sh` 5/5） | 待验收 |
-| TASK-034 | README / 架构图 / ADR 回顾 + `scripts/check-docs.sh` | 通过（`check-docs.sh` 退出码 0 且能抓到坏状态、`verify-all.sh` 9/9） | 待验收 |
+| TASK-030 | Gateway 错误路径补结构化日志（`event=request_failed`，503 可查） | 通过（`ctest` 301/301、`chaos/verify-dependency-down.sh` 通过、日志查得到 503） | **通过**（2026-10-06 项目所有者确认并合入 `main`） |
+| TASK-031 | `scripts/demo.sh` 15 分钟演示（实测 7/7、321 s）+ 空闲快路径修复（`6d5f359`） | 通过（`demo.sh` 7/7、`verify-all.sh` 9/9、`verify-chaos.sh` 5/5、`ctest` 301/301） | **通过**（2026-10-06 项目所有者确认并合入 `main`） |
+| TASK-032 | `docs/09-runbook.md` 故障处置与排查手册 | 通过（`verify-chaos.sh --only dependency-down,process-crash` 2/2、849 s） | **通过**（2026-10-06 项目所有者确认并合入 `main`） |
+| TASK-033 | 最终容量报告 + V3 全档复跑（`raw/20261005-235802/`）+ 可追溯性核对表 | 通过（`bench.sh` 6 档、`verify-all.sh` 9/9、`verify-chaos.sh` 5/5） | **通过**（2026-10-06 项目所有者确认并合入 `main`） |
+| TASK-034 | README / 架构图 / ADR 回顾 + `scripts/check-docs.sh` | 通过（`check-docs.sh` 退出码 0 且能抓到坏状态、`verify-all.sh` 9/9） | **通过**（2026-10-06 项目所有者确认并合入 `main`） |
 
 Phase 5 的四条退出标准逐条对照见 `docs/02-roadmap.md` 第 8 节。
 
-**与 main 的关系**：TASK-030（merge `4823487`）、TASK-031（merge `5f5f47f`）
-已合入 `main`；TASK-032（`ca86e41`）、TASK-033（`820a0c5`）、TASK-034（本文档所在
-提交）在 `feat/phase-5` 上，待项目所有者逐条验收后按阶段纪律合入 `main`。
+**与 main 的关系**：全部已合入 `main`——TASK-030（merge `4823487`）、TASK-031
+（merge `5f5f47f`）、TASK-032（merge `9e02b66`）、TASK-033（merge `2415013`）、
+TASK-034（merge `04d405e`）、README 同步（merge `7391e0e`）。均为 `--no-ff` 真合并，
+没有 squash。
 
 ## Backlog：后续待办
 
