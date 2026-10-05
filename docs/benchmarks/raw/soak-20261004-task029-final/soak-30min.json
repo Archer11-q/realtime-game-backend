@@ -1,0 +1,27 @@
+{
+  "players": 50,
+  "index_start": 0,
+  "duration_seconds": 1800.0,
+  "churn_every_seconds": 60.0,
+  "churn_fraction": 0.2,
+  "cycles": 29,
+  "closed_total": 290,
+  "connected_at_end": 50,
+  "streams_opened": 1786,
+  "requeued": 1450,
+  "reconnected": 286,
+  "open_failed": 0,
+  "pair_failed": 0,
+  "login_failed": 0,
+  "events_total": 638054,
+  "end_reasons": {
+    "finished": 1276,
+    "eof": 286,
+    "aborted": 174
+  },
+  "finish_reasons": {
+    "timeout": 1066,
+    "aborted": 174,
+    "disconnect": 210
+  }
+}

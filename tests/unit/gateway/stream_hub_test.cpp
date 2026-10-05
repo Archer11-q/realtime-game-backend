@@ -43,6 +43,9 @@ using rgbt::gateway::StreamHubOptions;
 
 constexpr std::int64_t kT0 = 1'000'000;
 
+/// 与 `SubscribeOptions::heartbeat_interval_ms` 的默认值一致。
+constexpr std::int64_t kHeartbeatIntervalMs = 15 * 1000;
+
 /// 记录某个出口收到过什么。生命周期独立于 EventSink。
 struct SinkLog {
     std::vector<std::string> writes;
@@ -810,6 +813,41 @@ TEST(StreamHubTest, BackfillFailureKeepsSubscriptionOpen) {
     const std::size_t quiet_baseline = sub.log->writes.size();
     hub.Tick(kT0 + 300);
     EXPECT_EQ(sub.log->writes.size(), quiet_baseline);
+}
+
+TEST(StreamHubTest, PendingBackfillStillGetsHeartbeatSoDeadPeersAreDetected) {
+    // TASK-029：补发一直做不成（房间状态取不到）时，这条订阅**仍然必须定期被写一次**。
+    //
+    // 为什么这条用例是"订阅泄漏"的锁：SSE 下服务端收不到显式的断开通知，只能靠
+    // **写失败**发现对端已经走了。如果一条订阅长期停在补发 pending、而每个 Tick 又
+    // 什么都不写，它就永远发现不了对端关闭——订阅连同它的 socket 一起永久留下。
+    // 长稳实测的症状正是如此：30 分钟里订阅数 50 -> 160、Gateway fd 114 -> 254，
+    // 客户端全部离开 60 秒后仍残留 150 条订阅。
+    FakeRoomClient room;
+    room.rooms["r-1"] = PlayingRoom("r-1", 5);
+    room.ranges["r-1"] = RangeOf("r-1", 3, 5);
+    room.fail_snapshots = true;  // 补发一直失败 -> 一直 pending
+    StreamHub hub(&room);
+
+    const Subscribed sub = SubscribeSince(&hub, "p-0001", "r-1", 2);
+    hub.Tick(kT0);
+
+    // 刚建立、还没到心跳时刻：这一轮确实一次写都没有，计数要如实反映出来。
+    EXPECT_EQ(hub.ConnectionCount(), 1U);
+    EXPECT_EQ(sub.log->writes.size(), 0U);
+    EXPECT_EQ(hub.SkippedNoWriteSubscriptions(), 1U);
+
+    // 到了心跳间隔：**必须写一次**。少了这一步，下面对端断连就永远发现不了。
+    hub.Tick(kT0 + kHeartbeatIntervalMs);
+    EXPECT_GT(sub.log->writes.size(), 0U);
+
+    // 对端其实已经断了：下一次心跳写失败 -> 订阅被回收、socket 被释放。
+    ASSERT_NE(sub.sink, nullptr);
+    sub.sink->fail = true;
+    hub.Tick(kT0 + 2 * kHeartbeatIntervalMs);
+    EXPECT_EQ(hub.ConnectionCount(), 0U);
+    EXPECT_TRUE(sub.log->closed);
+    EXPECT_EQ(hub.SubscriptionsClosedByWriteFailure(), 1U);
 }
 
 TEST(StreamHubTest, BackfillWriteFailureRemovesSubscription) {

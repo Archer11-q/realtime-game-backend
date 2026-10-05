@@ -92,9 +92,24 @@ async def async_main(args):
         "events": 0,
     }
     end_reasons = {}
+    finish_reasons = {}
 
-    async def on_event(_name, _data):
+    async def on_event(name, data):
         counters["events"] += 1
+        if name == "room.finished":
+            # 对局结束。**必须在这里结束读取并换一局**：服务端发完 room.finished 就会
+            # 关掉这条订阅；客户端要是只把它当成一个普通事件、继续等下去，就会抱着
+            # 一条再也不会有任何事件的连接（实测：50 个客户端"自以为连着"、
+            # 服务端订阅数为 0，整段压载空转——正是 TASK-029 里被新判定抓到的退化）。
+            # `bench/loadgen.py` 的 `_handle_stream_event` 就是这么做的，这里保持一致。
+            reason = "missing_reason"
+            try:
+                payload = (json.loads(data) or {}).get("payload") or {}
+                reason = str(payload.get("finish_reason") or "missing_reason")
+            except Exception:  # noqa: BLE001
+                pass
+            finish_reasons[reason] = finish_reasons.get(reason, 0) + 1
+            return "aborted" if reason == "aborted" else "finished"
         return None
 
     async def ensure_room(bot, deadline):
@@ -256,6 +271,7 @@ async def async_main(args):
         "login_failed": counters["login_failed"],
         "events_total": counters["events"],
         "end_reasons": end_reasons,
+        "finish_reasons": finish_reasons,
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.out:

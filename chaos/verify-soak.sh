@@ -190,6 +190,34 @@ start_services() {
 # 采样
 # ---------------------------------------------------------------------------
 fd_count() { [ -d "/proc/$1/fd" ] && ls "/proc/$1/fd" 2>/dev/null | wc -l | tr -d ' ' || echo "-"; }
+
+# TASK-029：压载端（探针进程）自己持有的 fd 数。
+#
+# 为什么要采它：区分实验的核心就是"服务端订阅数增长时，客户端 socket 数有没有同步
+# 增长"。只服务端涨 = Gateway 没回收订阅；两边同涨 = 压载端泄漏了 socket
+# （那样服务端保留订阅是**正确**的）。没有这一列，两种可能无法区分。
+# 探针自报的"当前连着几条流"（读它日志里最后一条 `connected=N`）。
+#
+# 为什么要这一列：`sse` 是**服务端**认为还活着的订阅数，探针的 connected 是
+# **客户端**认为还连着的流数。两者本该接近；长期对不上就说明有一侧在空转
+# （TASK-029 实测到：客户端 50 条、服务端 0 条——服务端关闭了订阅但客户端收不到
+# FIN，压载已经没在压任何东西，而旧判定照样报"通过"）。
+probe_connected() {
+  if [ -f "$soak_log" ]; then
+    local value
+    value="$(grep -oE '(^| )connected=[0-9]+' "$soak_log" 2>/dev/null | tail -n 1 | cut -d= -f2)"
+    [ -n "$value" ] && { echo "$value"; return; }
+  fi
+  echo "0"
+}
+
+client_fd_count() {
+  if [ -n "$soak_pid" ] && [ -d "/proc/$soak_pid/fd" ]; then
+    fd_count "$soak_pid"
+  else
+    echo "-"
+  fi
+}
 proc_field() { # <pid> <字段名>
   awk -v key="$2" '$1 == key { print $2 }' "/proc/$1/status" 2>/dev/null
 }
@@ -229,20 +257,25 @@ sample_once() { # <阶段标记>
   done
   row+=$'\t'"$(metric_sum "$gateway_port" rgbt_sse_connections)"
   row+=$'\t'"$(metric_sum "$room_port" rgbt_rooms)"
+  row+=$'\t'"$(client_fd_count)"
+  # TASK-029：订阅生命周期（skipped 累计 / 最老订阅年龄）——定位泄漏用。
+  row+=$'\t'"$(metric_sum "$gateway_port" rgbt_sse_subscriptions_skipped_no_write_total)"
+  row+=$'\t'"$(metric_sum "$gateway_port" rgbt_sse_oldest_subscription_age_ms)"
+  row+=$'\t'"$(probe_connected)"
   printf '%s\n' "$row" >>"$samples_tsv"
   printf '%s\n' "$row"
 }
 
 print_samples_header() {
-  printf '%-9s %-8s %s\n' "阶段" "时间" "Gateway(fd/线程/RSSkB) | Match | Room | SSE连接 | 房间数"
+  printf '%-9s %-8s %s\n' "阶段" "时间" "Gateway(fd/线程/RSSkB) | Match | Room | SSE连接 | 房间数 | 客户端fd | 跳过写 | 最老订阅ms | 探针connected"
 }
 
 print_sample_row() { # 与 sample_once 的输出字段一一对应
   local ts="$1" phase="$2"
   shift 2
   local elapsed_s=$(( ($(now_ms) - soak_started_ms) / 1000 ))
-  printf '%-9s %-8s gw=%s/%s/%s | match=%s/%s/%s | room=%s/%s/%s | sse=%s rooms=%s\n' \
-    "$phase" "${elapsed_s}s" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}"
+  printf '%-9s %-8s gw=%s/%s/%s | match=%s/%s/%s | room=%s/%s/%s | sse=%s rooms=%s client_fd=%s skipped=%s oldest_ms=%s connected=%s\n' \
+    "$phase" "${elapsed_s}s" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}"
 }
 
 provision_bench_accounts() { # <数量>
@@ -419,8 +452,11 @@ rows = []
 with open(path, encoding="utf-8") as handle:
     for line in handle:
         parts = line.rstrip("\n").split("\t")
-        # 一行 13 列：ts + phase + 三个服务各 (fd, 线程, RSS) + SSE 连接数 + 房间数
-        if len(parts) < 13:
+        # 一行 14 列：ts + phase + 三个服务各 (fd, 线程, RSS) + SSE 连接数 + 房间数
+        #            + 客户端(压载端) fd 数（TASK-029 加的区分实验列）
+        #            + 探针自报 connected + 服务端 skipped/oldest（TASK-029）
+        #            实际上共 16 列：再加最老订阅年龄与探针 connected
+        if len(parts) < 14:
             continue
         rows.append(parts)
 
@@ -503,6 +539,63 @@ elif settle_sse:
           % settle_sse[-1])
 else:
     print("VERDICT|fail|静默期没有采到样本，无法判定连接是否回落")
+
+# TASK-029：压载有效性。客户端说连着，服务端就必须也有订阅。
+#
+# 这一条是补上的漏洞：修复订阅泄漏之后暴露出第二个缺陷——对局 60 秒结束时服务端
+# 关闭订阅，但客户端收不到 FIN，于是 50 个客户端一直"自以为连着"（探针 connected
+# 始终 50、客户端 fd 不变），服务端订阅数却是 0。此时压载**已经空转**，
+# 而"没有累积 + 静默期回落到 0"这两条判定反而都会通过。
+probe_vals = [num(r[16]) for r in rows if len(r) > 16]
+probe_vals = [v for v in probe_vals if v is not None]
+sse_by_ts = {}
+for r in rows:
+    if len(r) > 11:
+        v = num(r[11])
+        if v is not None:
+            sse_by_ts[r[0]] = v
+if probe_vals:
+    soak_pairs = [(r, num(r[16])) for r in rows if len(r) > 16 and r[1] == "soak"]
+    soak_pairs = [(r, p) for r, p in soak_pairs if p is not None]
+    if soak_pairs:
+        mismatched = [(r, p) for r, p in soak_pairs
+                      if p >= 10 and sse_by_ts.get(r[0], 0) < p / 2]
+        total = len(soak_pairs)
+        print("压载有效性：压载期采样 %d 个，其中「客户端说连着、服务端订阅不足其一半」的有 %d 个"
+              % (total, len(mismatched)))
+        if len(mismatched) > total * 0.3:
+            print("VERDICT|fail|压载已退化：%d/%d 个采样里客户端仍持有连接但服务端订阅数不足"
+                  "其一半——订阅被关闭而客户端收不到 FIN，此时压载没有在压任何东西"
+                  % (len(mismatched), total))
+        else:
+            print("VERDICT|ok|压载有效：客户端连接数与服务端订阅数全程基本一致")
+    else:
+        print("INFO|压载期没有可用样本，压载有效性未判定")
+else:
+    print("INFO|没有采到探针 connected，压载有效性未判定")
+
+# TASK-029：区分实验的判定。服务端订阅数增长到底是谁的问题。
+client_fd_values = [num(r[13]) for r in rows if len(r) > 13 and r[13] != "-"]
+client_fd_values = [v for v in client_fd_values if v is not None]
+if client_fd_values and sse_values:
+    half = max(1, len(sse_values) // 2)
+    server_growth = sse_values[-1] - sse_values[half - 1] if len(sse_values) >= half else 0
+    client_half = max(1, len(client_fd_values) // 2)
+    client_growth = (client_fd_values[-1] - client_fd_values[client_half - 1]
+                     if len(client_fd_values) >= client_half else 0)
+    print("区分实验：后半段服务端订阅数增长 %+.0f，客户端 fd 增长 %+.0f（末值 服务端=%d 客户端=%d）"
+          % (server_growth, client_growth, sse_values[-1], client_fd_values[-1]))
+    if server_growth > 20 and client_growth < 5:
+        print("VERDICT|fail|服务端订阅数增长 %+.0f 而客户端 fd 只增长 %+.0f："
+              "**订阅没有被 Gateway 回收**（缺陷在产品侧）" % (server_growth, client_growth))
+    elif server_growth > 20 and client_growth >= 5:
+        print("VERDICT|fail|客户端 fd 也增长了 %+.0f：**压载端泄漏了 socket**"
+              "（缺陷在夹具，服务端保留订阅是正确的）" % client_growth)
+    else:
+        print("VERDICT|ok|后半段服务端订阅数没有明显增长（%+.0f），区分实验本轮不适用"
+              % server_growth)
+else:
+    print("INFO|本轮没有采到客户端 fd（--settle 期间探针已退出属正常），区分实验无法判定")
 
 for name, (mono, rate) in fd_monotonic.items():
     if mono:

@@ -146,6 +146,14 @@ struct LastEventIdHeader {
     std::int64_t value = 0;
     /// 头存在，但解析不成合法的非负整数。
     bool malformed = false;
+    /// TASK-029：这个头**是否出现过**。
+    ///
+    /// 为什么必须单独记它：`optional` 的 engage 状态是这里唯一能区分
+    /// 「第一次订阅」与「客户端说自己停在帧 0」的信息。此前把 `value`（缺头时为 0）
+    /// 直接赋给 optional，等于把"没有头"当成了"从帧 0 补发"——于是每个新订阅都走上
+    /// 补发路径；而在取不到房间状态的房间上，补发会**永远 pending**，那条订阅此后
+    /// 一次写都没有，对端断连再也发现不了（长稳实测的订阅泄漏就是这个）。
+    bool present = false;
 };
 
 /// 从 HTTP 请求中取出 SSE 的 `Last-Event-ID` 头（TASK-017）。
@@ -171,8 +179,9 @@ LastEventIdHeader ParseLastEventId(::google::protobuf::RpcController* controller
     }
     const std::string* raw = cntl->http_request().GetHeader("Last-Event-ID");
     if (raw == nullptr) {
-        return result;
+        return result;  // present 保持 false：这是"第一次订阅"，不是"从 0 补发"。
     }
+    result.present = true;
     if (raw->empty() || raw->size() > 18) {  // 18 位十进制足够表达任何 int64 帧号
         result.malformed = true;
         return result;
@@ -464,6 +473,38 @@ GatewayServiceImpl::GatewayServiceImpl(SessionStore* sessions, PlayerDirectory* 
         rgbt::common::kMetricSseConnections, "当前 SSE 连接数", [this]() -> std::uint64_t {
             return stream_ == nullptr ? 0 : static_cast<std::uint64_t>(stream_->ConnectionCount());
         });
+
+    // TASK-029：订阅生命周期计数。**同样用回调读 StreamHub 自己维护的累计量**，
+    // 不在 Gateway 侧再记一份（与上面 `rgbt_sse_connections` 同一个理由）。
+    rgbt::common::Metrics().Gauge(rgbt::common::kMetricSseSubscriptionsCreatedTotal,
+                                  "累计建立的 SSE 订阅数", [this]() -> std::uint64_t {
+                                      return stream_ == nullptr ? 0
+                                                                : stream_->SubscriptionsCreated();
+                                  });
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricSseClosedWriteFailedTotal, "因写失败回收的 SSE 订阅数",
+        [this]() -> std::uint64_t {
+            return stream_ == nullptr ? 0 : stream_->SubscriptionsClosedByWriteFailure();
+        });
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricSseClosedOtherTotal, "因显式取消等原因回收的 SSE 订阅数",
+        [this]() -> std::uint64_t {
+            return stream_ == nullptr ? 0 : stream_->SubscriptionsClosedOtherwise();
+        });
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricSseSkippedNoWriteTotal, "某一轮里一次写都没有尝试过的订阅数（累计）",
+        [this]() -> std::uint64_t {
+            return stream_ == nullptr ? 0 : stream_->SkippedNoWriteSubscriptions();
+        });
+    rgbt::common::Metrics().Gauge(rgbt::common::kMetricSseOldestSubscriptionAgeMs,
+                                  "最老 SSE 订阅的年龄（毫秒）", [this]() -> std::uint64_t {
+                                      if (stream_ == nullptr) {
+                                          return 0;
+                                      }
+                                      const std::int64_t age = stream_->OldestSubscriptionAgeMs(
+                                          (rgbt::common::NowUs() / 1000));
+                                      return age > 0 ? static_cast<std::uint64_t>(age) : 0;
+                                  });
 
     // 名字里不带 `_total`：它按惯例表示 counter，而这里读的是别人维护的累计量，
     // 类型上仍声明为 gauge。宁可名字朴素，也不制造第二份计数。
@@ -1372,7 +1413,11 @@ void GatewayServiceImpl::StreamEvents(::google::protobuf::RpcController* control
     const LastEventIdHeader last_event_id = ParseLastEventId(controller);
 
     SubscribeOptions subscribe_options;
-    subscribe_options.last_event_id = last_event_id.value;
+    // TASK-029：**只有头真的出现过**才 engage `optional`。
+    // 直接把 `value`（缺头时为 0）赋进去会让每个首次订阅都被当成"从帧 0 补发"，
+    // 进而在房间状态取不到时永久停在补发 pending（见 LastEventIdHeader::present）。
+    subscribe_options.last_event_id =
+        last_event_id.present ? std::optional<std::int64_t>(last_event_id.value) : std::nullopt;
     subscribe_options.last_event_id_malformed = last_event_id.malformed;
     // TASK-018：把本次 HTTP 请求的 request_id 交给订阅表，让这条连接引发的所有
     // Room 调用（上报 presence、轮询状态、补发历史）都带同一个关联键。
