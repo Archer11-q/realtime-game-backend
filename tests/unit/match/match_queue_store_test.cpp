@@ -489,6 +489,33 @@ TEST_F(MatchQueueRestoreTest, SnapshotLagReportsHowLongAChangeHasWaited) {
     EXPECT_EQ(queue_->SnapshotLagMs(kT0 + 1030), 0U);
 }
 
+TEST_F(MatchQueueRestoreTest, AllocationWorkerPairsWithoutBlockingCallers) {
+    // TASK-035：worker 启动后，请求路径只把待分配组交给 worker；分配与提交发生在
+    // worker 线程上，请求线程不再阻塞在 Room 调用里。
+    queue_->StartAllocationWorker();
+
+    ASSERT_EQ(queue_->Enqueue("p-0001", "req-1", kT0), EnqueueOutcome::kQueued);
+    ASSERT_EQ(queue_->Enqueue("p-0002", "req-2", kT0), EnqueueOutcome::kQueued);
+    queue_->WaitForIdleAllocations();  // 等 worker 提交（不用固定 sleep）
+
+    const MatchStatusSnapshot status = queue_->GetStatus("p-0001", kT0 + 10);
+    EXPECT_EQ(status.state, MatchStatusSnapshot::State::kMatched);
+    ASSERT_EQ(status.player_ids.size(), 2U);
+    EXPECT_FALSE(status.room_id.empty());
+
+    queue_->StopAllocationWorker();
+}
+
+TEST_F(MatchQueueRestoreTest, AllocationWorkerStopsCleanlyAndKeepsSnapshotContract) {
+    // 停机契约：worker 停掉之后，最后一次变化仍要能通过最终刷写落盘。
+    queue_->StartAllocationWorker();
+    ASSERT_EQ(queue_->Enqueue("p-0001", "req-1", kT0), EnqueueOutcome::kQueued);
+    queue_->StopAllocationWorker();
+
+    EXPECT_TRUE(queue_->FlushSnapshotNow(kT0 + 1));
+    EXPECT_TRUE(store_.LastSnapshotHasQueued("p-0001"));
+}
+
 TEST_F(MatchQueueRestoreTest, NoStoreMeansNoRestoreAndNoWrite) {
     MatchQueue plain(&allocator_, []() { return std::string("m-fixed"); }, 1000, 5000);
     const MatchRestoreReport report = plain.Restore(kT0);

@@ -41,12 +41,14 @@
 #define RGBT_MATCH_MATCH_QUEUE_HPP
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -276,6 +278,27 @@ public:
     /// @brief 设置合并窗口（毫秒）。0 表示不合并（每次 Tick 都写）。
     void SetSnapshotMergeIntervalMs(std::int64_t merge_interval_ms);
 
+    /// @brief 启动**分配 worker**：把 Match→Room 的 `CreateRoom` 从请求线程挪走。
+    ///
+    /// TASK-035 实测依据：入队端到端 p95 229.86 ms，其中 Gateway→Match RPC 段最大
+    /// 240 ms，而 **Match 处理函数内部最大只有 80 ms**；同期 brpc 的
+    /// `event_dispatcher_read_latency` p80 就是 74.8 ms 而进程 CPU 仅 0.2%
+    /// —— 是"事件循环被阻塞的 bthread 拖住"，阻塞源就是配对时同步等 Room。
+    ///
+    /// 容量检查必须在**取人之前**（见 RunPairingRound）：第一版放在取人之后，
+    /// 满了要走"退回 + 置重试"，与 `RetryPairingIfNeeded` 形成正反馈，
+    /// 实测把 Room 压垮（配对 500 → 240、CreateRoom 最大 11.9 s），已回退。
+    void StartAllocationWorker();
+
+    /// @brief 停止分配 worker 并等待它退出。**必须在最终快照刷写之前调用。**
+    void StopAllocationWorker();
+
+    /// @brief 等待分配队列空。仅供测试与排障。
+    void WaitForIdleAllocations();
+
+    /// @brief 待分配组数（背压是否生效的直接证据）。
+    [[nodiscard]] std::size_t PendingAllocationCount() const;
+
     /// @brief 当前处于房间分配中的人数。仅供测试与可观测性使用。
     [[nodiscard]] std::size_t AllocatingCount();
 
@@ -388,6 +411,23 @@ private:
     std::atomic<std::uint64_t> room_allocate_max_ms_{0};
     /// TASK-035：各分段的最大耗时（毫秒）。
     std::atomic<std::uint64_t> stage_max_ms_[kStageCount]{};
+
+    /// TASK-035：分配 worker。单个 worker 足够（`CreateRoom` 通常几毫秒），
+    /// 而且**天然保持分配顺序**。
+    void AllocationWorkerLoop();
+    /// 把整批待分配组交给 worker。**不持有 mutex_**。
+    void HandOffToWorker(const std::vector<PendingGroup>& groups, std::int64_t now_ms);
+    /// 分配一个房间并记账。**不持有 mutex_**（阻塞的远程调用）。
+    [[nodiscard]] std::string AllocateRoomFor(const PendingGroup& group);
+
+    mutable std::mutex allocation_mutex_;
+    std::condition_variable allocation_cv_;
+    std::deque<std::pair<PendingGroup, std::int64_t>> allocation_queue_;
+    std::thread allocation_worker_;
+    bool allocation_worker_running_ = false;
+    bool allocation_stop_ = false;
+    /// 待分配队列上限。**满了就不取人**（在取人之前判断）。
+    std::size_t max_pending_allocations_ = 256;
     /// FIFO 顺序的 player_id。只保存仍在排队中的玩家（分配中的不在其中）。
     std::deque<std::string> queue_;
     /// 玩家 -> 状态。**以 player_id 为键**，这是「同一玩家不会重复出现在两个有效
