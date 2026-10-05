@@ -577,7 +577,31 @@ std::int32_t GatewayServiceImpl::FillError(rgbt::gateway::v1::Error* error,
         error->set_message(message);
         error->set_request_id(request_id);
     }
-    return rgbt::gateway::HttpStatusOf(code);
+    const std::int32_t status = rgbt::gateway::HttpStatusOf(code);
+
+    // TASK-030：**错误路径也要写结构化日志**。
+    //
+    // 背景（TASK-023 实测）：依赖不可用时本服务返回 503，但日志里查不到——因为所有
+    // 错误都经由本函数收敛，而它只填 response、不写日志。排障时"服务返回了 503"
+    // 在日志里没有任何痕迹，只能靠复现。
+    //
+    // 为什么记在这里而不是每个调用点：本函数是**唯一收敛点**，记一次就覆盖全部
+    // 错误路径（当前 57 处调用），且天然不会重复计数。`request_done` 依然按原样
+    // 记录每个请求的结果，两者用 request_id / trace 关联。
+    //
+    // 不含 `op`：本函数拿不到它（要传就得改 57 个调用点）。需要 op 时，用同一个
+    // request_id 去查相邻的那条 `request_done`——这是本任务里**有意的偏离**，
+    // 已记录在任务单的实施结果里。
+    //
+    // 字段里只有服务端自己生成的内容（错误码、原因、中文说明、request_id），
+    // **不含 token / 密码等敏感字段**（TASK-018 的脱敏约定）。
+    rgbt::common::LogWarn("request_failed", request_id,
+                          {{"http_status", std::to_string(status)},
+                           {"error_code", std::to_string(static_cast<int>(code))},
+                           {"reason", reason},
+                           {"message", message},
+                           {"policy", "错误路径必须可见；与 request_done 用 request_id 关联"}});
+    return status;
 }
 
 void GatewayServiceImpl::Login(::google::protobuf::RpcController* controller,
