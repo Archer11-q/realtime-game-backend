@@ -4475,3 +4475,50 @@ CPU 与运行队列，用**同一命令**重测 500 档位。
    并考虑给压载端限核或分离部署。
 
 三轮改动的教训已经很清楚：**先测量、再改**；三次里两次"看起来像"的假设都被数据否掉了。
+
+## TASK-035 第五步：分发器/线程数假设被否证（2026-10-05）
+
+第四步之后剩下的解释是"brpc 事件分发器吞吐不够"。先确认开关存在：
+
+```text
+-event_dispatcher_num (Number of event dispatcher) type: int32 default: 1
+-bthread_concurrency (Number of pthread workers) type: int32 default: 9
+```
+
+两个默认值在 500 并发下都值得怀疑（16 核机器上只有 9 个 pthread worker、只有 1 个
+事件分发器）。于是临时给 **Match 与 Gateway 都加**
+`-event_dispatcher_num=4 -bthread_concurrency=16`，用同一命令复测，然后恢复 `bench.sh`。
+
+### 结果：**更差**
+
+| 指标 | 基线（默认 1 / 9） | dispatcher=4, bthread=16 |
+|---|---|---|
+| 入队 p95 | 229.86 / 230.52 / 230.77 / 232.01 ms | **244.62 ms** |
+| 入队 p99 | 245.79 ~ 246.40 ms | **439.02 ms** |
+| Gateway→Match RPC 段最大 | 240 / 146 / 145 | 265 ms |
+| Match `enqueue total` 最大 | 80 / 7 / 6 / 9 | 6 ms |
+| 压载端 | 500/500 全成功 | 500/500 全成功 |
+
+原始数据：`docs/benchmarks/raw/20261005-204622/`。`bench.sh` 已恢复原样，工作树干净。
+
+### 至此已否证四个假设
+
+| # | 假设 | 验证方式 | 结果 |
+|---|---|---|---|
+| 1 | Match 处理路径慢（同步等 Room 拖住事件循环） | 方案 A：分配移出请求线程 | ❌ handler 80 → 6 ms，端到端不动 |
+| 2 | 宿主机 CPU 竞争 | vmstat 采样 | ❌ 80% 空闲、运行队列 1.3 |
+| 3 | 监控栈抢占资源 | 停 Prometheus/Grafana 后复测 | ❌ p95 232.01 不变 |
+| 4 | brpc 分发器/线程数不足 | dispatcher 1→4、bthread 9→16 | ❌ p95 244.62（更差），已回滚 |
+
+### 下一步：把剩下的"未解释区间"量出来
+
+目前有一个明确的**未解释区间**：Gatewa 的入队 handler 端到端 p95 = 230 ms，
+而它内部唯一的大头——Gateway→Match RPC 段——**最大只有 145 ms**。
+也就是说，**约 85 ms 花在 handler 内、RPC 之外**。
+
+这条路径上 handler 还做了：会话解析（**Redis 查询**）、请求校验、响应组装。
+而 Redis 是共享的（Match 的快照合并写 ~230/s、Room 快照 ~237/s、Gateway 自己的
+会话查询 ~700/s）。因此下一个候选是 **Redis 路径的延迟**，验证方式（都很便宜）：
+1. 压载期间跑 `redis-cli --latency`（以及 `INFO stats` 的
+   `latency_percentiles_usec_*`）看 P95/P99；
+2. 给 Gateway 的请求路径加分段：**会话解析** / RPC / 响应组装，与 Match 侧同一手法。
