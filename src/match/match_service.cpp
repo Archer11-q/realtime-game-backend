@@ -72,6 +72,47 @@ MatchServiceImpl::MatchServiceImpl(MatchQueue* queue, std::function<std::int64_t
                                       return queue_ == nullptr ? 0 : queue_->SnapshotFailureCount();
                                   },
                                   {{"outcome", "failed"}});
+    // TASK-028：合并刷写的可观测性。前两个是"合并有没有生效"，
+    // 后两个是"有没有变化一直没落地 / 单次写有多贵"。
+    rgbt::common::Metrics().Gauge(rgbt::common::kMetricQueueSnapshotMergedTotal,
+                                  "被合并掉的队列快照变化数（窗口内多次变化只写一份）",
+                                  [this]() -> std::uint64_t {
+                                      return queue_ == nullptr ? 0 : queue_->SnapshotMergedCount();
+                                  });
+    rgbt::common::Metrics().Gauge(rgbt::common::kMetricQueueSnapshotPending,
+                                  "是否有未落地的队列快照变化（0/1）", [this]() -> std::uint64_t {
+                                      return (queue_ != nullptr && queue_->SnapshotPending()) ? 1U
+                                                                                              : 0U;
+                                  });
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricQueueSnapshotLagMs, "队列快照待写滞后（毫秒）",
+        [this]() -> std::uint64_t {
+            return queue_ == nullptr ? 0 : queue_->SnapshotLagMs(rgbt::common::NowUs() / 1000);
+        });
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricQueueSnapshotWriteMs, "最近一次队列快照写入耗时（毫秒）",
+        [this]() -> std::uint64_t { return queue_ == nullptr ? 0 : queue_->SnapshotWriteMs(); });
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricMatchRoomAllocateTotal, "Match→Room 房间分配次数，按结果分组",
+        [this]() -> std::uint64_t { return queue_ == nullptr ? 0 : queue_->RoomAllocateCount(); },
+        {{"outcome", "ok"}});
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricMatchRoomAllocateTotal, "Match→Room 房间分配次数，按结果分组",
+        [this]() -> std::uint64_t {
+            return queue_ == nullptr ? 0 : queue_->RoomAllocateFailedCount();
+        },
+        {{"outcome", "failed"}});
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricMatchRoomAllocateMs, "最近一次房间分配耗时（毫秒）",
+        [this]() -> std::uint64_t { return queue_ == nullptr ? 0 : queue_->RoomAllocateMs(); });
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricMatchRoomAllocateMaxMs, "房间分配耗时的最大值（毫秒）",
+        [this]() -> std::uint64_t { return queue_ == nullptr ? 0 : queue_->RoomAllocateMaxMs(); });
+    rgbt::common::Metrics().Gauge(
+        rgbt::common::kMetricQueueSnapshotTicksTotal,
+        "队列快照刷写（Tick）被调用的次数：驱动循环的存活证据",
+        [this]() -> std::uint64_t { return queue_ == nullptr ? 0 : queue_->SnapshotTickCount(); });
+
     metrics_ready_ = true;
 }
 

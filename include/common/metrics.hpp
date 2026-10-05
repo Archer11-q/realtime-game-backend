@@ -271,6 +271,28 @@ inline constexpr const char* kMetricSnapshotWriteTotal = "rgbt_snapshot_write_to
 /// 队列快照（Match）写入尝试。标签：`outcome`（ok/failed）。
 inline constexpr const char* kMetricQueueSnapshotTotal = "rgbt_queue_snapshot_total";
 
+/// TASK-028：队列快照的合并与滞后。
+///
+/// 改异步之后，`..._total` 只能看到"写了几次"，看不到"该写而没写"。
+/// 这四个量一起看才能回答：合并有没有生效（`_merged_total`）、
+/// 有没有变化一直没落地（`_pending` / `_lag_ms`）、单次写本身有多贵（`_write_ms`）。
+inline constexpr const char* kMetricQueueSnapshotMergedTotal =
+    "rgbt_match_queue_snapshot_merged_total";
+inline constexpr const char* kMetricQueueSnapshotPending = "rgbt_match_queue_snapshot_pending";
+inline constexpr const char* kMetricQueueSnapshotLagMs = "rgbt_match_queue_snapshot_lag_ms";
+inline constexpr const char* kMetricQueueSnapshotWriteMs = "rgbt_match_queue_snapshot_write_ms";
+inline constexpr const char* kMetricQueueSnapshotTicksTotal =
+    "rgbt_match_queue_snapshot_ticks_total";
+
+/// TASK-028 收尾诊断：Match→Room 的房间分配（CreateRoom）延迟与失败。
+///
+/// 为什么需要它：把快照写入移出请求路径之后，入队 p95 从 840 ms 降到 229 ms，
+/// 但还没到 SLO（< 100 ms）。要判断"剩下的在不在房间分配这一步"必须有这个量——
+/// 否则只能猜。它同时也是 Phase 5 收口时"数字可回溯"的一部分。
+inline constexpr const char* kMetricMatchRoomAllocateTotal = "rgbt_match_room_allocate_total";
+inline constexpr const char* kMetricMatchRoomAllocateMs = "rgbt_match_room_allocate_ms";
+inline constexpr const char* kMetricMatchRoomAllocateMaxMs = "rgbt_match_room_allocate_max_ms";
+
 }  // namespace rgbt::common
 
 #endif  // RGBT_COMMON_METRICS_HPP

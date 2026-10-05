@@ -210,32 +210,128 @@ MatchQueueSnapshot MatchQueue::MakeSnapshotLocked() const {
     return snapshot;
 }
 
-void MatchQueue::PersistSnapshot() {
+void MatchQueue::MarkSnapshotDirty(std::int64_t now_ms) {
+    if (store_ == nullptr) {
+        return;  // 没配存储：连标志都不必维护。
+    }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (snapshot_dirty_) {
+        // 已经被合并掉了：这次变化不会单独产生一次写入。
+        snapshot_merged_count_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    snapshot_dirty_ = true;
+    snapshot_dirty_since_ms_ = now_ms;
+}
+
+void MatchQueue::SetSnapshotMergeIntervalMs(std::int64_t merge_interval_ms) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_merge_interval_ms_ = merge_interval_ms > 0 ? merge_interval_ms : 0;
+}
+
+void MatchQueue::Tick(std::int64_t now_ms) {
+    snapshot_tick_count_.fetch_add(1, std::memory_order_relaxed);
     if (store_ == nullptr) {
         return;
     }
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (!snapshot_dirty_) {
+            return;  // 没有变化：一个字节都不写。
+        }
+        if (snapshot_merge_interval_ms_ > 0) {
+            const std::int64_t last = last_snapshot_write_ms_.load(std::memory_order_relaxed);
+            if (last > 0 && now_ms - last < snapshot_merge_interval_ms_) {
+                return;  // 还在合并窗口里：把这次变化并进下一次写入。
+            }
+        }
+    }
+    FlushSnapshotNow(now_ms);
+}
 
-    // 锁序：snapshot_order_mutex_ -> mutex_。先拿前者，让"取快照 + 写快照"成为一个
-    // 整体，从而保证写入顺序与快照的新旧顺序一致（见头文件的说明）。
-    const std::lock_guard<std::mutex> order_lock(snapshot_order_mutex_);
+bool MatchQueue::FlushSnapshotNow(std::int64_t now_ms) {
+    if (store_ == nullptr) {
+        return false;
+    }
+
     MatchQueueSnapshot snapshot;
     {
         // 只在取副本时持队列锁，**不持锁做 I/O**。
+        //
+        // TASK-028：写者只有本函数与 `Tick`（后者也调用本函数），而两者都由
+        // Match 主线程或单元测试线程调用，因此"两个线程各取一份快照、旧的后写"
+        // 在**结构上**不可能——原来的 `snapshot_order_mutex_` 因此删掉了。
         const std::lock_guard<std::mutex> lock(mutex_);
+        if (!snapshot_dirty_) {
+            return false;
+        }
         snapshot = MakeSnapshotLocked();
+        snapshot_dirty_ = false;
+        snapshot_dirty_since_ms_ = 0;
     }
 
-    if (!store_->Save(snapshot)) {
+    const std::int64_t started_us = rgbt::common::NowUs();
+    const bool ok = store_->Save(snapshot);
+    const std::int64_t elapsed_ms = (rgbt::common::NowUs() - started_us) / 1000;
+    snapshot_write_ms_.store(static_cast<std::uint64_t>(elapsed_ms > 0 ? elapsed_ms : 0),
+                             std::memory_order_relaxed);
+    last_snapshot_write_ms_.store(now_ms, std::memory_order_relaxed);
+
+    if (!ok) {
         // 快照可以丢弃：不重试、不阻塞。Redis 不可用时匹配照常工作，
         // 只是失去"重启可恢复"——这是项目所有者确认过的降级策略。
         snapshot_failure_count_.fetch_add(1, std::memory_order_relaxed);
         rgbt::common::LogWarn("queue_snapshot_write_failed",
                               {{"queued", std::to_string(snapshot.queued.size())},
                                {"matched", std::to_string(snapshot.matched.size())},
+                               {"write_ms", std::to_string(elapsed_ms)},
                                {"policy", "可丢弃、不重试，当前降级为纯内存"}});
-        return;
+        return true;
     }
     snapshot_write_count_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+std::uint64_t MatchQueue::SnapshotMergedCount() const {
+    return snapshot_merged_count_.load(std::memory_order_relaxed);
+}
+
+bool MatchQueue::SnapshotPending() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return snapshot_dirty_;
+}
+
+std::uint64_t MatchQueue::SnapshotLagMs(std::int64_t now_ms) const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!snapshot_dirty_ || snapshot_dirty_since_ms_ <= 0) {
+        return 0;
+    }
+    const std::int64_t lag = now_ms - snapshot_dirty_since_ms_;
+    return lag > 0 ? static_cast<std::uint64_t>(lag) : 0;
+}
+
+std::uint64_t MatchQueue::SnapshotWriteMs() const {
+    return snapshot_write_ms_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MatchQueue::SnapshotTickCount() const {
+    return snapshot_tick_count_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MatchQueue::RoomAllocateCount() const {
+    return room_allocate_count_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MatchQueue::RoomAllocateFailedCount() const {
+    return room_allocate_failed_count_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MatchQueue::RoomAllocateMs() const {
+    return room_allocate_ms_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MatchQueue::RoomAllocateMaxMs() const {
+    return room_allocate_max_ms_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t MatchQueue::SnapshotWriteCount() const {
@@ -310,9 +406,9 @@ EnqueueOutcome MatchQueue::Enqueue(const std::string& player_id, const std::stri
     // RunPairingRound 的注释。
     const bool paired = RunPairingRound(now_ms);
 
-    // 一次写入覆盖本轮的全部变化（入队 / 清算 / 配对），避免同一请求写多份快照。
+    // 一次标记覆盖本轮的全部变化（入队 / 清算 / 配对）；真正的写入由 Tick 合并执行。
     if (state_changed || paired) {
-        PersistSnapshot();
+        MarkSnapshotDirty(now_ms);
     }
     return outcome;
 }
@@ -340,7 +436,25 @@ bool MatchQueue::RunPairingRound(std::int64_t now_ms) {
     for (const PendingGroup& group : groups) {
         std::string room_id;
         if (allocator_ != nullptr) {
+            // TASK-028 收尾诊断：把"分配房间"这一步单独计时。
+            // 为什么需要：把快照写入移出请求路径之后，入队 p95 从 840 ms 降到 229 ms，
+            // 但还没到 SLO。要判断剩下的在不在这一步，只能量它——否则就是猜。
+            const std::int64_t allocate_started_us = rgbt::common::NowUs();
             room_id = allocator_->Allocate(group.match_id, group.player_ids, group.request_id);
+            const std::int64_t allocate_elapsed_ms =
+                (rgbt::common::NowUs() - allocate_started_us) / 1000;
+            const std::uint64_t allocate_ms =
+                static_cast<std::uint64_t>(allocate_elapsed_ms > 0 ? allocate_elapsed_ms : 0);
+            room_allocate_count_.fetch_add(1, std::memory_order_relaxed);
+            room_allocate_ms_.store(allocate_ms, std::memory_order_relaxed);
+            std::uint64_t prev_max = room_allocate_max_ms_.load(std::memory_order_relaxed);
+            while (allocate_ms > prev_max &&
+                   !room_allocate_max_ms_.compare_exchange_weak(prev_max, allocate_ms,
+                                                                std::memory_order_relaxed)) {
+            }
+            if (room_id.empty()) {
+                room_allocate_failed_count_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         const std::lock_guard<std::mutex> lock(mutex_);
         CommitGroupLocked(group, room_id, now_ms);
@@ -387,7 +501,7 @@ bool MatchQueue::Cancel(const std::string& player_id, std::int64_t now_ms) {
     }
 
     if (state_changed) {
-        PersistSnapshot();
+        MarkSnapshotDirty(now_ms);
     }
     return removed;
 }
@@ -409,10 +523,10 @@ MatchStatusSnapshot MatchQueue::GetStatus(const std::string& player_id, std::int
     // 拿到一个与本次请求无关的状态。
     const bool paired = RetryPairingIfNeeded(now_ms);
 
-    // 清算（超时淘汰、结果过期）与配对都会改变状态，因此这两条路径都要写快照。
-    // 反过来说：仅仅"查了一次状态"不会产生写入，轮询不会变成写放大。
+    // 清算（超时淘汰、结果过期）与配对都会改变状态，因此这两条路径都要标记待写。
+    // 反过来说：仅仅"查了一次状态"不会产生变化，轮询不会变成写放大。
     if (state_changed || paired) {
-        PersistSnapshot();
+        MarkSnapshotDirty(now_ms);
     }
     return snapshot;
 }
