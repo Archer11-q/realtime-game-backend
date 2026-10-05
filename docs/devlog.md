@@ -4714,3 +4714,19 @@ x  room_id 不一致：alice=[r-9mFL9o_vJIFBrk-3NEO2SCTH] bob=[]
    与 TASK-035 之前完全一致，同时保留高负载下的收益。
 
 无论选哪条，TASK-031 都不能在此之前算完成。
+
+### 快路径修复的重跑结论（2026-10-05）
+
+空闲快路径修好之后，把 TASK-035 合并时欠下的两条重跑命令补齐：
+
+| 命令 | 结果 |
+|---|---|
+| `bash scripts/demo.sh` | **7/7 自动环节通过，总耗时 321s**（< 15 分钟上限） |
+| `bash scripts/verify-all.sh` | **9/9 通过**（230s） |
+| `bash scripts/verify-chaos.sh` | **5/5 通过**（1301s：依赖不可用 / 进程崩溃 / 排空 / 连接风暴 / 断线重连） |
+| `ctest` | **301/301** |
+
+`scripts/verify-match.sh` 从"连续两轮失败"变为通过——可见行为（入队后立即 matched）
+已恢复到与 TASK-035 之前一致，同时保留高负载下"分配不阻塞请求线程"的收益。
+
+原始输出：`.run/demo-run3.log`、`.run/va-after-fp.log`、`.run/vc-after-fp.log`
